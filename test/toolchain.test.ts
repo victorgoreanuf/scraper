@@ -25,6 +25,7 @@ type PackageManifest = {
   };
   dependencies: Record<string, string>;
   devDependencies: Record<string, string>;
+  scripts: Record<string, string>;
 };
 
 type LockedPackage = {
@@ -145,4 +146,30 @@ test("keeps the repository private, ESM, and GPL-3.0-only", () => {
   assert.equal(manifest.private, true);
   assert.equal(manifest.type, "module");
   assert.equal(manifest.license, "GPL-3.0-only");
+});
+
+test("builds only application source into dist", () => {
+  const manifest = readManifest();
+  const buildConfig = readJson<{
+    extends: string;
+    compilerOptions: { rootDir: string; outDir: string };
+    include: string[];
+    exclude: string[];
+  }>("tsconfig.build.json");
+
+  assert.equal(
+    manifest.scripts.clean,
+    "node --input-type=module --eval \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true });\"",
+  );
+  assert.equal(
+    manifest.scripts.build,
+    "npm run clean && tsc --project tsconfig.build.json",
+  );
+  assert.equal(buildConfig.extends, "./tsconfig.json");
+  assert.deepEqual(buildConfig.compilerOptions, {
+    rootDir: "src",
+    outDir: "dist",
+  });
+  assert.deepEqual(buildConfig.include, ["src/**/*.ts"]);
+  assert.ok(buildConfig.exclude.includes("test"));
 });
