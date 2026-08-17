@@ -16,6 +16,7 @@ const PHASE_MATCHING = 3;
 
 export interface DetectorCandidate {
   readonly id: string;
+  readonly kind: "presence" | "value";
   readonly source: EvidenceSource;
   readonly key: string | null;
   readonly value: string;
@@ -442,7 +443,11 @@ class DetectorPoolImplementation implements DetectorPool {
     for (const ordinal of index.patternLocator) {
       ordinals.add(ordinal);
     }
-    return [...ordinals].sort((left, right) => left - right);
+    return [...ordinals]
+      .filter((ordinal) =>
+        candidate.kind === "value"
+        || this.catalog.rules[ordinal]?.matchMode === "presence")
+      .sort((left, right) => left - right);
   }
 
   #executionCost(rule: CompiledFingerprintRule): number {

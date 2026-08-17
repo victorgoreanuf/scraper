@@ -299,6 +299,22 @@ test("accepts the direct, inferred, redacted, partial, and failed shapes", () =>
   const dnsEvidence = makeDnsResult();
   expectValid(dnsEvidence);
 
+  const networkUrlEvidence = makeResult();
+  const networkTechnology = firstTechnology(networkUrlEvidence);
+  networkTechnology.version = null;
+  const networkEvidence = firstEvidence(networkUrlEvidence);
+  networkEvidence.collector = "browser";
+  networkEvidence.source = "network_url";
+  networkEvidence.key = null;
+  networkEvidence.match = {
+    kind: "value",
+    value: "https://api.vendor.tld/umbraco/api/status",
+    truncated: false,
+  };
+  networkEvidence.pattern = "/umbraco/api/";
+  networkEvidence.version = null;
+  expectValid(networkUrlEvidence);
+
   const redactedTxtEvidence = structuredClone(dnsEvidence);
   const txtEvidence = firstEvidence(redactedTxtEvidence);
   txtEvidence.key = "TXT";

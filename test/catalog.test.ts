@@ -259,9 +259,16 @@ test("loads the exact pinned baseline as immutable plain data", () => {
     relationshipCount: catalog.relationshipCount,
     regexSourceCount: catalog.regexSourceCount,
     regexSourceCodeUnits: catalog.regexSourceCodeUnits,
-    domSelectors: catalog.inspectionPlan.domSelectors.length,
-    javascriptPaths: catalog.inspectionPlan.javascriptPaths.length,
+    domSelectors: catalog.inspectionPlan.dom.length,
+    domFacts: catalog.inspectionPlan.dom.reduce(
+      (total, inspection) => total + inspection.facts.length,
+      0,
+    ),
+    javascriptPaths: catalog.inspectionPlan.javascript.length,
     probePaths: catalog.inspectionPlan.probePaths.length,
+    networkUrlRules: catalog.rules.filter(
+      (rule) => rule.source === "network_url",
+    ).length,
     indexes: catalog.indexes.length,
   }, {
     categories: 109,
@@ -272,12 +279,200 @@ test("loads the exact pinned baseline as immutable plain data", () => {
     regexSourceCount: 8_541,
     regexSourceCodeUnits: 200_325,
     domSelectors: 1_769,
+    domFacts: 1_780,
     javascriptPaths: 5_570,
     probePaths: 3,
+    networkUrlRules: 113,
     indexes: 16,
   });
   assertDeepFrozenPlainData(catalog);
   assert.deepEqual(structuredClone(catalog), catalog);
+});
+
+test("compiles exact DOM facts and JavaScript segments with matching demand", () => {
+  const path = ".__NEXT_DATA__.items.0.value-with-space ";
+  const doubleLeadingPath = "..double.leading";
+  const catalog = compile([
+    {
+      Alpha: technology({
+        dom: {
+          "#app": {
+            exists: "",
+            text: "",
+            attributes: {
+              class: "",
+              title: "^Alpha$",
+            },
+            properties: {
+              __k: "",
+            },
+          },
+        },
+        js: {
+          [path]: "",
+          [doubleLeadingPath]: "",
+        },
+      }),
+    },
+    {
+      Beta: technology({
+        dom: {
+          "#app": {
+            text: "^Alpha$",
+            attributes: { class: "^app$" },
+          },
+        },
+        js: { [path]: "^Alpha$" },
+      }),
+    },
+  ]);
+  const locator = (
+    kind: "exists" | "text" | "attributes" | "properties",
+    name: string | null,
+  ): string => JSON.stringify(["#app", kind, name]);
+
+  assert.deepEqual(catalog.inspectionPlan.dom, [{
+    selector: "#app",
+    facts: [
+      {
+        kind: "exists",
+        name: null,
+        locator: locator("exists", null),
+        demand: { presence: true, value: false },
+      },
+      {
+        kind: "text",
+        name: null,
+        locator: locator("text", null),
+        demand: { presence: true, value: true },
+      },
+      {
+        kind: "attribute",
+        name: "class",
+        locator: locator("attributes", "class"),
+        demand: { presence: true, value: true },
+      },
+      {
+        kind: "attribute",
+        name: "title",
+        locator: locator("attributes", "title"),
+        demand: { presence: false, value: true },
+      },
+      {
+        kind: "property",
+        name: "__k",
+        locator: locator("properties", "__k"),
+        demand: { presence: true, value: false },
+      },
+    ],
+  }]);
+  assert.deepEqual(catalog.inspectionPlan.javascript, [
+    {
+      path: doubleLeadingPath,
+      segments: ["", "double", "leading"],
+      demand: { presence: true, value: false },
+    },
+    {
+      path,
+      segments: ["__NEXT_DATA__", "items", "0", "value-with-space "],
+      demand: { presence: true, value: true },
+    },
+  ]);
+});
+
+test("compiles XHR patterns against complete browser request URLs", () => {
+  const catalog = compile([{
+    Alpha: technology({
+      xhr: ["/umbraco/api/", "api\\.vendor\\.tld/v1/"],
+    }),
+  }]);
+
+  assert.deepEqual(
+    catalog.rules.map((rule) => [rule.source, rule.pattern]),
+    [
+      ["network_url", "api\\.vendor\\.tld/v1/"],
+      ["network_url", "/umbraco/api/"],
+    ],
+  );
+  assert.equal(
+    catalog.indexes.some((index) => index.source === "network_hostname"),
+    false,
+  );
+});
+
+test("preserves the pinned inspection-plan fact mix and unusual JavaScript paths", () => {
+  const catalog = baseline();
+  const domFacts = catalog.inspectionPlan.dom.flatMap(
+    (inspection) => inspection.facts,
+  );
+  const summarize = <T extends { readonly demand: {
+    readonly presence: boolean;
+    readonly value: boolean;
+  } }>(items: readonly T[]): {
+    readonly presenceOnly: number;
+    readonly valueOnly: number;
+    readonly both: number;
+  } => ({
+    presenceOnly: items.filter(
+      (item) => item.demand.presence && !item.demand.value,
+    ).length,
+    valueOnly: items.filter(
+      (item) => !item.demand.presence && item.demand.value,
+    ).length,
+    both: items.filter(
+      (item) => item.demand.presence && item.demand.value,
+    ).length,
+  });
+
+  assert.deepEqual(
+    Object.fromEntries(
+      (["exists", "text", "attribute", "property"] as const).map((kind) => [
+        kind,
+        summarize(domFacts.filter((fact) => fact.kind === kind)),
+      ]),
+    ),
+    {
+      exists: { presenceOnly: 1_549, valueOnly: 0, both: 0 },
+      text: { presenceOnly: 19, valueOnly: 36, both: 0 },
+      attribute: { presenceOnly: 35, valueOnly: 139, both: 0 },
+      property: { presenceOnly: 2, valueOnly: 0, both: 0 },
+    },
+  );
+  assert.deepEqual(summarize(catalog.inspectionPlan.javascript), {
+    presenceOnly: 5_022,
+    valueOnly: 547,
+    both: 1,
+  });
+
+  const byPath = new Map(
+    catalog.inspectionPlan.javascript.map((inspection) => [
+      inspection.path,
+      inspection,
+    ]),
+  );
+  assert.deepEqual(byPath.get(".__NEXT_DATA__.gsp")?.segments, [
+    "__NEXT_DATA__",
+    "gsp",
+  ]);
+  assert.deepEqual(
+    byPath.get("__core-js_shared__.versions.0.version")?.segments,
+    ["__core-js_shared__", "versions", "0", "version"],
+  );
+  assert.deepEqual(byPath.get("HUCKABUY NAMESPACE.sd")?.segments, [
+    "HUCKABUY NAMESPACE",
+    "sd",
+  ]);
+  assert.deepEqual(byPath.get("flb.botId ")?.segments, ["flb", "botId "]);
+  assert.deepEqual(
+    byPath.get("Magewire.connection-author")?.segments,
+    ["Magewire", "connection-author"],
+  );
+  for (const inspection of catalog.inspectionPlan.javascript) {
+    const traversalPath = inspection.path.startsWith(".")
+      ? inspection.path.slice(1)
+      : inspection.path;
+    assert.deepEqual(inspection.segments, traversalPath.split("."));
+  }
 });
 
 test("derives catalog semantics only from bounded bytes and the fixed schema", () => {
@@ -771,17 +966,26 @@ test("preserves reviewed Progress and PublishPress catalog behavior", () => {
     },
   );
 
-  const publishSelector = catalog.inspectionPlan.domSelectors.find((selector) =>
-    selector.includes("advanced-gutenberg/assets/css/blocks.css"),
+  const publishInspection = catalog.inspectionPlan.dom.find((inspection) =>
+    inspection.selector.includes("advanced-gutenberg/assets/css/blocks.css"),
   );
-  assert.notEqual(publishSelector, undefined);
-  assert.equal(publishSelector?.includes("\\;version:\\1"), true);
+  assert.notEqual(publishInspection, undefined);
+  assert.equal(publishInspection?.selector.includes("\\;version:\\1"), true);
   const publishRule = catalog.rules.find(
     (rule) => rule.technology === "PublishPress Blocks" && rule.source === "dom",
   );
-  assert.equal(publishRule?.locator, JSON.stringify([publishSelector, "exists", null]));
+  assert.equal(
+    publishRule?.locator,
+    JSON.stringify([publishInspection?.selector, "exists", null]),
+  );
   assert.equal(publishRule?.matchMode, "presence");
   assert.equal(publishRule?.versionTemplate, null);
+  assert.deepEqual(publishInspection?.facts, [{
+    kind: "exists",
+    name: null,
+    locator: publishRule?.locator,
+    demand: { presence: true, value: false },
+  }]);
 });
 
 test("enforces catalog, pattern, relationship, and inspection-plan limits", () => {
@@ -853,6 +1057,19 @@ test("enforces catalog, pattern, relationship, and inspection-plan limits", () =
       configWith([[ ["limits", "inspection", "domSelectors"], 1 ]]),
     ),
     "CATALOG_LIMIT_EXCEEDED",
+  );
+  expectCatalogError(
+    () => compile([{
+      Alpha: technology({
+        dom: {
+          [`#${"a".repeat(1_023)}`]: {
+            attributes: { ["b".repeat(1_024)]: "" },
+          },
+        },
+      }),
+    }]),
+    "CATALOG_LIMIT_EXCEEDED",
+    /evidence-key limit/u,
   );
   expectCatalogError(
     () => compile(

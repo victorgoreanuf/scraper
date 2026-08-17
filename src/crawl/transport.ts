@@ -1,11 +1,15 @@
+import { randomBytes } from "node:crypto";
 import { lookup as lookupAddress } from "node:dns/promises";
 import { once } from "node:events";
 import {
   Agent,
+  createServer as createHttpServer,
   request as makeHttpRequest,
   type ClientRequestArgs,
   type IncomingHttpHeaders,
   type IncomingMessage,
+  type Server as HttpServer,
+  type ServerResponse,
 } from "node:http";
 import {
   createConnection,
@@ -26,7 +30,7 @@ import {
 } from "node:zlib";
 
 import type { ScanConfig } from "../config.ts";
-import type { ErrorCode, ErrorStage } from "../model.ts";
+import type { ErrorCode, ErrorStage, PageId } from "../model.ts";
 import {
   TARGET_POLICY_ERROR_CODES,
   TargetPolicyError,
@@ -103,6 +107,8 @@ const TRANSPORT_MESSAGES = {
   TLS_CONNECTION_FAILED: "The TLS connection failed.",
   TLS_CERTIFICATE_INVALID: "The TLS certificate could not be verified.",
   TLS_TIMEOUT: "The TLS handshake exceeded its deadline.",
+  BROWSER_LIMIT_EXCEEDED: "Browser collection exceeded a safety limit.",
+  BROWSER_PROXY_FAILED: "The protected browser proxy failed.",
   DOMAIN_DEADLINE_EXCEEDED: "The active domain deadline was exceeded.",
 } as const;
 
@@ -136,6 +142,38 @@ export interface ProtectedTransportUsage {
   readonly httpRequests: number;
   readonly retries: number;
   readonly staticTransferredBytes: number;
+}
+
+export interface ProtectedBrowserProxyUsage {
+  readonly browserRequests: number;
+  readonly browserTransferredBytes: number;
+}
+
+export interface BrowserProxyRequestAttempt {
+  readonly pageId: PageId;
+  readonly url: string;
+  readonly forward: boolean;
+}
+
+export interface ProtectedBrowserProxyCanary {
+  readonly targetUrl: string;
+  readonly chromiumHostResolverArg: string;
+  verify(): void;
+  close(): Promise<void>;
+}
+
+export interface ProtectedBrowserProxy {
+  readonly server: string;
+  activateDomain(signal?: AbortSignal): void;
+  startPage(pageId: PageId): void;
+  recordRequestAttempt(attempt: BrowserProxyRequestAttempt): void;
+  finishPage(pageId: PageId): Promise<void>;
+  finishDomain(): Promise<void>;
+  getUsage(): ProtectedBrowserProxyUsage;
+  getFailure(): ProtectedTransportError | null;
+  getFailureSignal(): AbortSignal;
+  prepareCanary(): Promise<ProtectedBrowserProxyCanary>;
+  close(): Promise<void>;
 }
 
 export interface ProtectedTransportHeader {
@@ -179,6 +217,7 @@ export interface ProtectedHttpTransport {
   createSession(
     options?: ProtectedTransportSessionOptions,
   ): ProtectedTransportSession;
+  createBrowserProxy(): Promise<ProtectedBrowserProxy>;
 }
 
 export class ProtectedTransportError extends Error {
@@ -303,6 +342,111 @@ class ConcurrencyScheduler {
   }
 }
 
+class DestinationResolver {
+  private readonly config: ScanConfig;
+  private readonly dnsScheduler: ConcurrencyScheduler;
+  private readonly ipv4Records = new Set<string>();
+  private readonly ipv6Records = new Set<string>();
+
+  constructor(config: ScanConfig, dnsScheduler: ConcurrencyScheduler) {
+    this.config = config;
+    this.dnsScheduler = dnsScheduler;
+  }
+
+  reset(): void {
+    this.ipv4Records.clear();
+    this.ipv6Records.clear();
+  }
+
+  async resolve(
+    parsed: ParsedNetworkUrl,
+    signal: AbortSignal,
+    fixedAnswers?: readonly ValidatedAddressAnswer[],
+  ): Promise<ValidatedAddressAnswer> {
+    let answers: unknown;
+
+    if (fixedAnswers !== undefined) {
+      answers = fixedAnswers;
+    } else if (parsed.addressFamily === 4 || parsed.addressFamily === 6) {
+      answers = [{
+        address: parsed.logicalHostname,
+        family: parsed.addressFamily,
+      }];
+    } else {
+      const releaseLookup = await this.dnsScheduler.acquire("dns", signal);
+
+      if (signal.aborted) {
+        releaseLookup();
+        throw signal.reason;
+      }
+
+      const operation = Promise.resolve().then(() =>
+        lookupAddress(parsed.logicalHostname, LOOKUP_OPTIONS),
+      );
+      void operation.then(releaseLookup, releaseLookup);
+      answers = await raceWithSignal(() => operation, signal);
+    }
+
+    const validated = validateAddressAnswers(
+      answers,
+      parsed.addressFamily === 0 || fixedAnswers !== undefined
+        ? MAX_RAW_DNS_ANSWERS_PER_LOOKUP
+        : undefined,
+    );
+
+    if (
+      fixedAnswers === undefined
+      && (parsed.addressFamily === 4 || parsed.addressFamily === 6)
+    ) {
+      const selected = validated[0];
+      if (selected === undefined) {
+        throw transportError("DNS_NO_ADDRESS", "dns", true);
+      }
+      return selected;
+    }
+
+    const nextIpv4 = new Set(this.ipv4Records);
+    const nextIpv6 = new Set(this.ipv6Records);
+
+    for (const answer of validated) {
+      const canonical = canonicalIpAddress(answer.address);
+
+      if (canonical === undefined) {
+        throw transportError("DNS_LOOKUP_FAILED", "dns", true);
+      }
+
+      if (answer.family === 4) {
+        nextIpv4.add(canonical);
+      } else {
+        nextIpv6.add(canonical);
+      }
+    }
+
+    if (
+      nextIpv4.size > this.config.limits.dns.recordsPerType
+      || nextIpv6.size > this.config.limits.dns.recordsPerType
+      || nextIpv4.size + nextIpv6.size > this.config.limits.dns.recordsPerDomain
+    ) {
+      throw transportError("DNS_LIMIT_EXCEEDED", "dns", false);
+    }
+
+    this.ipv4Records.clear();
+    this.ipv6Records.clear();
+    for (const address of nextIpv4) {
+      this.ipv4Records.add(address);
+    }
+    for (const address of nextIpv6) {
+      this.ipv6Records.add(address);
+    }
+
+    const selected = validated[0];
+    if (selected === undefined) {
+      throw transportError("DNS_NO_ADDRESS", "dns", true);
+    }
+    return selected;
+  }
+}
+
 class PinnedSocketAgent extends Agent {
   private socket: Socket | TLSSocket | undefined;
 
@@ -409,6 +553,24 @@ function sameIpAddress(left: string, right: string): boolean {
   const canonicalRight = canonicalIpAddress(right);
 
   return canonicalLeft !== undefined && canonicalLeft === canonicalRight;
+}
+
+function verifyConnectedAddress(
+  selected: ValidatedAddressAnswer,
+  socket: Socket,
+  stage: "http" | "browser",
+): void {
+  const remoteAddress = socket.remoteAddress;
+  const remoteFamily = remoteAddress === undefined ? 0 : isIP(remoteAddress);
+
+  if (
+    remoteFamily !== selected.family
+    || remoteAddress === undefined
+    || !sameIpAddress(remoteAddress, selected.address)
+  ) {
+    socket.destroy();
+    throw transportError("SSRF_REMOTE_ADDRESS_MISMATCH", stage, false);
+  }
 }
 
 function rawAuthorityHostname(input: string): string | undefined {
@@ -837,6 +999,1121 @@ function isRedirect(statusCode: number): boolean {
   return REDIRECT_STATUS_CODES.has(statusCode);
 }
 
+const PROXY_HOP_BY_HOP_HEADERS = new Set([
+  "connection",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "proxy-connection",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+]);
+
+interface BrowserProxyCanaryState {
+  readonly hostname: string;
+  targetUrl: string;
+  readonly server: HttpServer;
+  connections: number;
+  proxyRejected: boolean;
+  closed: boolean;
+}
+
+interface PinnedProxySocket {
+  readonly socket: Socket;
+  readonly release: () => void;
+  readonly signal: AbortSignal;
+}
+
+class BrowserProxyPageFinished extends Error {
+  constructor() {
+    super("The protected browser proxy page finished.");
+    this.name = "BrowserProxyPageFinished";
+  }
+}
+
+function proxyError(retryable = false): ProtectedTransportError {
+  return transportError("BROWSER_PROXY_FAILED", "browser", retryable);
+}
+
+function proxyLimitError(): ProtectedTransportError {
+  return transportError("BROWSER_LIMIT_EXCEEDED", "browser", false);
+}
+
+function assertProxyHeaderBudget(
+  rawHeaders: readonly string[],
+  config: ScanConfig,
+): void {
+  const metrics = rawHeaderMetrics(rawHeaders, undefined);
+  if (
+    rawHeaders.length % 2 !== 0
+    || metrics.fields > config.limits.http.headerFields
+    || metrics.bytes > config.limits.http.headerBytes
+  ) {
+    throw proxyLimitError();
+  }
+}
+
+function rawProxyHeaderValues(
+  rawHeaders: readonly string[],
+  targetName: string,
+): readonly string[] {
+  return rawHeaderValues(rawHeaders, targetName.toLowerCase());
+}
+
+function connectionHeaderNames(rawHeaders: readonly string[]): Set<string> {
+  const names = new Set<string>();
+  for (const value of rawProxyHeaderValues(rawHeaders, "connection")) {
+    for (const token of value.split(",")) {
+      const normalized = token.trim().toLowerCase();
+      if (normalized !== "") {
+        names.add(normalized);
+      }
+    }
+  }
+  return names;
+}
+
+function filteredProxyRequestHeaders(
+  rawHeaders: readonly string[],
+  url: URL,
+  userAgent: string,
+): string[] {
+  const blocked = connectionHeaderNames(rawHeaders);
+  for (const name of PROXY_HOP_BY_HOP_HEADERS) {
+    blocked.add(name);
+  }
+  blocked.add("host");
+  blocked.add("user-agent");
+
+  const headers: string[] = [];
+  for (let index = 0; index < rawHeaders.length; index += 2) {
+    const name = rawHeaders[index];
+    const value = rawHeaders[index + 1];
+    if (
+      name !== undefined
+      && value !== undefined
+      && !blocked.has(name.toLowerCase())
+    ) {
+      headers.push(name, value);
+    }
+  }
+  headers.push("Host", url.host, "User-Agent", userAgent, "Connection", "close");
+  return headers;
+}
+
+function filteredProxyResponseHeaders(
+  rawHeaders: readonly string[],
+): string[] {
+  const blocked = connectionHeaderNames(rawHeaders);
+  for (const name of PROXY_HOP_BY_HOP_HEADERS) {
+    blocked.add(name);
+  }
+
+  const headers: string[] = [];
+  for (let index = 0; index < rawHeaders.length; index += 2) {
+    const name = rawHeaders[index];
+    const value = rawHeaders[index + 1];
+    if (
+      name !== undefined
+      && value !== undefined
+      && !blocked.has(name.toLowerCase())
+    ) {
+      headers.push(name, value);
+    }
+  }
+  headers.push("Connection", "close");
+  return headers;
+}
+
+function assertNoProxyRequestBody(request: IncomingMessage): void {
+  const transferEncoding = rawProxyHeaderValues(
+    request.rawHeaders,
+    "transfer-encoding",
+  );
+  const contentLength = rawProxyHeaderValues(request.rawHeaders, "content-length");
+  if (
+    transferEncoding.length > 0
+    || contentLength.length > 1
+    || (contentLength.length === 1 && contentLength[0] !== "0")
+  ) {
+    throw proxyError();
+  }
+}
+
+function parseProxyHttpTarget(
+  input: string,
+  config: ScanConfig,
+  canary: BrowserProxyCanaryState | null,
+): ParsedNetworkUrl {
+  if (canary !== null && input === canary.targetUrl) {
+    const url = new URL(input);
+    return {
+      url,
+      logicalHostname: canary.hostname,
+      addressFamily: 0,
+    };
+  }
+
+  try {
+    if (input.includes("#")) {
+      throw proxyError();
+    }
+    const parsed = parseNetworkUrl(input, config.limits.url.codeUnits);
+    if (parsed.url.protocol !== "http:") {
+      throw proxyError();
+    }
+    return parsed;
+  } catch (error) {
+    if (error instanceof ProtectedTransportError && error.code === "BROWSER_PROXY_FAILED") {
+      throw error;
+    }
+    throw proxyError();
+  }
+}
+
+function parseProxyConnectTarget(
+  input: string,
+  config: ScanConfig,
+): ParsedNetworkUrl {
+  if (
+    input.length === 0
+    || input.length > config.limits.url.codeUnits
+    || !input.isWellFormed()
+    || /[\s\p{Cc}]/u.test(input)
+    || input.includes("\\")
+    || !input.endsWith(":443")
+  ) {
+    throw proxyError();
+  }
+
+  const authority = input.slice(0, -4);
+  if (
+    authority.length === 0
+    || authority.includes("@")
+    || authority.includes("/")
+    || authority.includes("?")
+    || authority.includes("#")
+  ) {
+    throw proxyError();
+  }
+
+  try {
+    const parsed = parseNetworkUrl(
+      `https://${authority}:443/`,
+      config.limits.url.codeUnits,
+    );
+    if (parsed.url.protocol !== "https:") {
+      throw proxyError();
+    }
+    return parsed;
+  } catch (error) {
+    if (error instanceof ProtectedTransportError && error.code === "BROWSER_PROXY_FAILED") {
+      throw error;
+    }
+    throw proxyError();
+  }
+}
+
+function assertProxyHost(
+  request: IncomingMessage,
+  parsed: ParsedNetworkUrl,
+  connect: boolean,
+): void {
+  const values = rawProxyHeaderValues(request.rawHeaders, "host");
+  if (values.length !== 1) {
+    throw proxyError();
+  }
+  const value = values[0];
+  if (value === undefined) {
+    throw proxyError();
+  }
+  if (connect && !value.endsWith(":443")) {
+    throw proxyError();
+  }
+
+  let hostUrl: URL;
+  try {
+    hostUrl = new URL(`${connect ? "https" : "http"}://${value}/`);
+  } catch {
+    throw proxyError();
+  }
+  if (
+    hostUrl.username !== ""
+    || hostUrl.password !== ""
+    || hostUrl.hash !== ""
+    || hostUrl.search !== ""
+    || hostUrl.host !== parsed.url.host
+  ) {
+    throw proxyError();
+  }
+}
+
+function writeProxyHttpFailure(response: ServerResponse): void {
+  if (!response.headersSent) {
+    response.writeHead(502, {
+      Connection: "close",
+      "Content-Length": "0",
+    });
+  }
+  response.end();
+}
+
+function writeProxyConnectFailure(socket: Socket): void {
+  if (!socket.destroyed && socket.writable) {
+    socket.end(
+      "HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+    );
+  } else {
+    socket.destroy();
+  }
+}
+
+async function closeSockets(sockets: ReadonlySet<Socket>): Promise<void> {
+  const closing: Promise<void>[] = [];
+  for (const socket of sockets) {
+    if (!socket.destroyed) {
+      closing.push(
+        once(socket, "close").then(() => undefined, () => undefined),
+      );
+      socket.destroy();
+    }
+  }
+  await Promise.all(closing);
+}
+
+class ProtectedBrowserProxyImpl implements ProtectedBrowserProxy {
+  readonly server: string;
+  private readonly config: ScanConfig;
+  private readonly scheduler: ConcurrencyScheduler;
+  private readonly destinationResolver: DestinationResolver;
+  private readonly httpServer: HttpServer;
+  private readonly serverSockets = new Set<Socket>();
+  private readonly pageClientSockets = new Set<Socket>();
+  private readonly pageUpstreamSockets = new Set<Socket>();
+  private authorizedHttpsOrigins = new Set<string>();
+  private httpOriginGrants = new Map<string, number>();
+  private failureController = new AbortController();
+  private failure: ProtectedTransportError | null = null;
+  private domainCloseController: AbortController | null = null;
+  private domainTimeoutController: AbortController | null = null;
+  private domainTimeoutTimer: NodeJS.Timeout | null = null;
+  private domainSignal: AbortSignal | null = null;
+  private domainAbortListener: (() => void) | null = null;
+  private pageCloseController: AbortController | null = null;
+  private pageSignal: AbortSignal | null = null;
+  private pageGeneration = 0;
+  private activePage: PageId | null = null;
+  private pageRequests = 0;
+  private pageTransferredBytes = 0;
+  private browserRequests = 0;
+  private browserTransferredBytes = 0;
+  private canary: BrowserProxyCanaryState | null = null;
+  private finishing = false;
+  private closed = false;
+
+  private constructor(
+    config: ScanConfig,
+    scheduler: ConcurrencyScheduler,
+    dnsScheduler: ConcurrencyScheduler,
+    httpServer: HttpServer,
+    server: string,
+  ) {
+    this.config = config;
+    this.scheduler = scheduler;
+    this.destinationResolver = new DestinationResolver(config, dnsScheduler);
+    this.httpServer = httpServer;
+    this.server = server;
+
+    httpServer.on("connection", (socket) => {
+      this.serverSockets.add(socket);
+      if (this.activePage !== null) {
+        this.pageClientSockets.add(socket);
+      }
+      socket.once("close", () => {
+        this.serverSockets.delete(socket);
+        this.pageClientSockets.delete(socket);
+      });
+    });
+    httpServer.on("request", (request, response) => {
+      void this.handleHttp(request, response).catch((error: unknown) => {
+        this.handleProxyFailure(error);
+        writeProxyHttpFailure(response);
+      });
+    });
+    httpServer.on("connect", (request, socket, head) => {
+      const client = socket as Socket;
+      void this.handleConnect(request, client, head).catch((error: unknown) => {
+        this.handleProxyFailure(error);
+        writeProxyConnectFailure(client);
+      });
+    });
+    httpServer.on("checkContinue", (_request, response) => {
+      this.latchFailure(proxyError());
+      writeProxyHttpFailure(response);
+    });
+    httpServer.on("checkExpectation", (_request, response) => {
+      this.latchFailure(proxyError());
+      writeProxyHttpFailure(response);
+    });
+    httpServer.on("dropRequest", (_request, socket) => {
+      this.latchFailure(proxyError());
+      socket.destroy();
+    });
+    httpServer.on("upgrade", (_request, socket) => {
+      this.latchFailure(proxyError());
+      socket.destroy();
+    });
+    httpServer.on("clientError", (_error, socket) => {
+      if (this.domainSignal !== null && !this.finishing) {
+        this.latchFailure(proxyError());
+      }
+      socket.destroy();
+    });
+  }
+
+  static async create(
+    config: ScanConfig,
+    scheduler: ConcurrencyScheduler,
+    dnsScheduler: ConcurrencyScheduler,
+  ): Promise<ProtectedBrowserProxyImpl> {
+    const httpServer = createHttpServer({
+      headersTimeout: config.limits.timeMs.httpRequest,
+      requestTimeout: config.limits.timeMs.browserPage,
+      keepAliveTimeout: 1_000,
+      keepAliveTimeoutBuffer: 250,
+      insecureHTTPParser: false,
+      joinDuplicateHeaders: false,
+      maxHeaderSize: config.limits.http.headerBytes,
+      requireHostHeader: true,
+    });
+    httpServer.maxHeadersCount = config.limits.http.headerFields + 1;
+    httpServer.maxRequestsPerSocket = 1;
+    httpServer.listen({ host: "127.0.0.1", port: 0, exclusive: true });
+
+    try {
+      await once(httpServer, "listening");
+    } catch (error) {
+      httpServer.close();
+      throw proxyError(isTransientNetworkError(error));
+    }
+
+    const address = httpServer.address();
+    if (address === null || typeof address === "string") {
+      httpServer.close();
+      throw proxyError();
+    }
+    return new ProtectedBrowserProxyImpl(
+      config,
+      scheduler,
+      dnsScheduler,
+      httpServer,
+      `http://127.0.0.1:${address.port}`,
+    );
+  }
+
+  activateDomain(signal?: AbortSignal): void {
+    if (this.closed || this.domainSignal !== null) {
+      throw proxyError();
+    }
+    if (signal?.aborted === true) {
+      throw abortError(signal.reason);
+    }
+
+    this.destinationResolver.reset();
+    this.failure = null;
+    this.failureController = new AbortController();
+    this.domainCloseController = new AbortController();
+    const timeout = delayAbortController(
+      this.config.limits.timeMs.activeDomain,
+      new AbortMarker("domain-timeout"),
+    );
+    this.domainTimeoutController = timeout.controller;
+    this.domainTimeoutTimer = timeout.timer;
+    const signals = [
+      this.domainCloseController.signal,
+      this.domainTimeoutController.signal,
+      ...(signal === undefined ? [] : [signal]),
+    ];
+    this.domainSignal = AbortSignal.any(signals);
+    this.domainAbortListener = (): void => {
+      const timeoutReason = this.domainTimeoutController?.signal.reason;
+      if (
+        timeoutReason instanceof AbortMarker
+        && timeoutReason.kind === "domain-timeout"
+      ) {
+        this.latchFailure(
+          transportError("DOMAIN_DEADLINE_EXCEEDED", "browser", true),
+        );
+      }
+      this.destroyPageSockets();
+    };
+    this.domainSignal.addEventListener("abort", this.domainAbortListener, {
+      once: true,
+    });
+    this.activePage = null;
+    this.authorizedHttpsOrigins.clear();
+    this.httpOriginGrants.clear();
+    this.pageRequests = 0;
+    this.pageTransferredBytes = 0;
+    this.browserRequests = 0;
+    this.browserTransferredBytes = 0;
+  }
+
+  startPage(pageId: PageId): void {
+    this.assertActiveDomain();
+    if (this.activePage !== null || this.failure !== null) {
+      throw this.failure ?? proxyError();
+    }
+    const domainSignal = this.domainSignal;
+    if (domainSignal === null) {
+      throw proxyError();
+    }
+    this.pageCloseController = new AbortController();
+    this.pageSignal = AbortSignal.any([
+      domainSignal,
+      this.pageCloseController.signal,
+    ]);
+    this.pageGeneration += 1;
+    this.activePage = pageId;
+    this.authorizedHttpsOrigins = new Set<string>();
+    this.httpOriginGrants = new Map<string, number>();
+    this.pageRequests = 0;
+    this.pageTransferredBytes = 0;
+  }
+
+  recordRequestAttempt(attempt: BrowserProxyRequestAttempt): void {
+    this.assertActivePage(attempt.pageId);
+    if (
+      this.pageRequests >= this.config.limits.browser.requestsPerPage
+      || this.browserRequests >= this.config.limits.browser.requestsPerDomain
+    ) {
+      const error = proxyLimitError();
+      this.latchFailure(error);
+      throw error;
+    }
+
+    this.pageRequests += 1;
+    this.browserRequests += 1;
+    if (attempt.forward !== true) {
+      return;
+    }
+
+    let parsed: ParsedNetworkUrl;
+    try {
+      parsed = parseNetworkUrl(attempt.url, this.config.limits.url.codeUnits);
+    } catch {
+      const error = proxyError();
+      this.latchFailure(error);
+      throw error;
+    }
+    if (parsed.url.protocol === "http:") {
+      this.httpOriginGrants.set(
+        parsed.url.origin,
+        (this.httpOriginGrants.get(parsed.url.origin) ?? 0) + 1,
+      );
+    } else {
+      this.authorizedHttpsOrigins.add(parsed.url.origin);
+    }
+  }
+
+  async finishPage(pageId: PageId): Promise<void> {
+    this.assertActivePage(pageId, true);
+    this.finishing = true;
+    const pageCloseController = this.pageCloseController;
+    this.activePage = null;
+    this.authorizedHttpsOrigins.clear();
+    this.httpOriginGrants.clear();
+    pageCloseController?.abort(new BrowserProxyPageFinished());
+    try {
+      await this.closePageSockets();
+    } finally {
+      if (this.pageCloseController === pageCloseController) {
+        this.pageCloseController = null;
+        this.pageSignal = null;
+      }
+      this.pageRequests = 0;
+      this.pageTransferredBytes = 0;
+      this.finishing = false;
+    }
+  }
+
+  async finishDomain(): Promise<void> {
+    if (this.domainSignal === null) {
+      return;
+    }
+    this.finishing = true;
+    const pageId = this.activePage;
+    const pageCloseController = this.pageCloseController;
+    this.activePage = null;
+    this.authorizedHttpsOrigins.clear();
+    this.httpOriginGrants.clear();
+    pageCloseController?.abort(new BrowserProxyPageFinished());
+    this.domainCloseController?.abort(
+      new DOMException("The browser proxy domain finished.", "AbortError"),
+    );
+    if (this.domainTimeoutTimer !== null) {
+      clearTimeout(this.domainTimeoutTimer);
+    }
+    try {
+      await this.closePageSockets();
+      await closeSockets(this.serverSockets);
+    } finally {
+      if (pageId !== null) {
+        this.pageRequests = 0;
+        this.pageTransferredBytes = 0;
+      }
+      if (this.pageCloseController === pageCloseController) {
+        this.pageCloseController = null;
+        this.pageSignal = null;
+      }
+      this.domainSignal = null;
+      this.domainAbortListener = null;
+      this.domainCloseController = null;
+      this.domainTimeoutController = null;
+      this.domainTimeoutTimer = null;
+      this.finishing = false;
+    }
+  }
+
+  getUsage(): ProtectedBrowserProxyUsage {
+    return Object.freeze({
+      browserRequests: this.browserRequests,
+      browserTransferredBytes: this.browserTransferredBytes,
+    });
+  }
+
+  getFailure(): ProtectedTransportError | null {
+    return this.failure;
+  }
+
+  getFailureSignal(): AbortSignal {
+    return this.failureController.signal;
+  }
+
+  async prepareCanary(): Promise<ProtectedBrowserProxyCanary> {
+    if (this.closed || this.domainSignal !== null || this.canary !== null) {
+      throw proxyError();
+    }
+
+    const hostname = `canary-${randomBytes(16).toString("hex")}.example.com`;
+    const canaryServer = createHttpServer((_request, response) => {
+      response.writeHead(204, { Connection: "close" });
+      response.end();
+    });
+    const state: BrowserProxyCanaryState = {
+      hostname,
+      targetUrl: "",
+      server: canaryServer,
+      connections: 0,
+      proxyRejected: false,
+      closed: false,
+    };
+    canaryServer.on("connection", (socket) => {
+      state.connections += 1;
+      socket.once("error", () => undefined);
+    });
+    canaryServer.listen({ host: "127.0.0.1", port: 0, exclusive: true });
+
+    try {
+      await once(canaryServer, "listening");
+      const address = canaryServer.address();
+      if (address === null || typeof address === "string") {
+        throw proxyError();
+      }
+      state.targetUrl = `http://${hostname}:${address.port}/`;
+      this.canary = state;
+      this.activateCanaryDomain();
+    } catch (error) {
+      canaryServer.close();
+      this.canary = null;
+      throw error instanceof ProtectedTransportError ? error : proxyError();
+    }
+
+    let closed = false;
+    return Object.freeze({
+      targetUrl: state.targetUrl,
+      chromiumHostResolverArg:
+        `--host-resolver-rules=MAP ${hostname} 127.0.0.1`,
+      verify: (): void => {
+        if (closed || state.closed) {
+          throw proxyError();
+        }
+        if (!state.proxyRejected || state.connections !== 0) {
+          throw proxyError();
+        }
+      },
+      close: async (): Promise<void> => {
+        if (closed) {
+          return;
+        }
+        closed = true;
+        state.closed = true;
+        await this.finishDomain();
+        if (canaryServer.listening) {
+          await new Promise<void>((resolve) => canaryServer.close(() => resolve()));
+        }
+        if (this.canary === state) {
+          this.canary = null;
+        }
+      },
+    });
+  }
+
+  async close(): Promise<void> {
+    if (this.closed) {
+      return;
+    }
+    this.closed = true;
+    const canary = this.canary;
+    if (canary !== null) {
+      canary.closed = true;
+    }
+    await this.finishDomain();
+    await closeSockets(this.serverSockets);
+    if (this.httpServer.listening) {
+      await new Promise<void>((resolve) => this.httpServer.close(() => resolve()));
+    }
+    if (canary?.server.listening === true) {
+      await new Promise<void>((resolve) => canary.server.close(() => resolve()));
+    }
+    this.canary = null;
+  }
+
+  private activateCanaryDomain(): void {
+    const canary = this.canary;
+    if (canary === null || this.domainSignal !== null) {
+      throw proxyError();
+    }
+    this.activateDomain();
+    this.startPage("p1");
+    this.httpOriginGrants.set(new URL(canary.targetUrl).origin, 1);
+  }
+
+  private assertActiveDomain(allowFailure = false): void {
+    if (
+      this.closed
+      || this.finishing
+      || this.domainSignal === null
+      || (!allowFailure
+        && (this.domainSignal.aborted || this.failure !== null))
+    ) {
+      if (this.failure !== null) {
+        throw this.failure;
+      }
+      throw proxyError();
+    }
+  }
+
+  private assertActivePage(pageId: PageId, allowFailure = false): void {
+    this.assertActiveDomain(allowFailure);
+    if (this.activePage !== pageId || (!allowFailure && this.failure !== null)) {
+      throw this.failure ?? proxyError();
+    }
+  }
+
+  private latchFailure(error: ProtectedTransportError): void {
+    if (this.failure !== null || this.finishing || this.domainSignal === null) {
+      return;
+    }
+    this.failure = error;
+    this.pageCloseController?.abort(error);
+    this.failureController.abort(error);
+    this.destroyPageSockets();
+  }
+
+  private handleProxyFailure(error: unknown): void {
+    if (
+      error instanceof BrowserProxyPageFinished
+      || this.finishing
+      || this.domainSignal?.aborted === true
+    ) {
+      return;
+    }
+    if (error instanceof ProtectedTransportError) {
+      this.latchFailure(error);
+      return;
+    }
+    this.latchFailure(proxyError(isTransientNetworkError(error)));
+  }
+
+  private consumeBrowserBytes(byteLength: number): void {
+    if (
+      !Number.isSafeInteger(byteLength)
+      || byteLength < 0
+      || this.activePage === null
+    ) {
+      throw proxyError();
+    }
+    if (
+      this.pageTransferredBytes + byteLength
+        > this.config.limits.browser.transferBytesPerPage
+      || this.browserTransferredBytes + byteLength
+        > this.config.limits.browser.transferBytesPerDomain
+    ) {
+      const error = proxyLimitError();
+      this.latchFailure(error);
+      throw error;
+    }
+    this.pageTransferredBytes += byteLength;
+    this.browserTransferredBytes += byteLength;
+  }
+
+  private downstreamCounter(): Transform {
+    return new Transform({
+      transform: (chunk: Buffer, _encoding, callback): void => {
+        try {
+          this.consumeBrowserBytes(chunk.byteLength);
+          callback(null, chunk);
+        } catch (error) {
+          callback(error as Error);
+        }
+      },
+    });
+  }
+
+  private destroyPageSockets(): void {
+    for (const socket of this.pageClientSockets) {
+      socket.destroy();
+    }
+    for (const socket of this.pageUpstreamSockets) {
+      socket.destroy();
+    }
+  }
+
+  private async closePageSockets(): Promise<void> {
+    await Promise.all([
+      closeSockets(this.pageClientSockets),
+      closeSockets(this.pageUpstreamSockets),
+    ]);
+    this.pageClientSockets.clear();
+    this.pageUpstreamSockets.clear();
+  }
+
+  private consumeHttpGrant(parsed: ParsedNetworkUrl): void {
+    const grants = this.httpOriginGrants.get(parsed.url.origin) ?? 0;
+    if (this.activePage === null || grants === 0) {
+      throw proxyError();
+    }
+    if (grants === 1) {
+      this.httpOriginGrants.delete(parsed.url.origin);
+    } else {
+      this.httpOriginGrants.set(parsed.url.origin, grants - 1);
+    }
+  }
+
+  private assertHttpsAuthorized(parsed: ParsedNetworkUrl): void {
+    if (
+      this.activePage === null
+      || !this.authorizedHttpsOrigins.has(parsed.url.origin)
+    ) {
+      throw proxyError();
+    }
+  }
+
+  private canaryAnswers(
+    parsed: ParsedNetworkUrl,
+  ): readonly ValidatedAddressAnswer[] | undefined {
+    const canary = this.canary;
+    if (
+      canary !== null
+      && parsed.logicalHostname === canary.hostname
+      && parsed.url.href === canary.targetUrl
+    ) {
+      return [{ address: "127.0.0.1", family: 4 }];
+    }
+    return undefined;
+  }
+
+  private expectedCanaryRejection(
+    parsed: ParsedNetworkUrl,
+    error: unknown,
+  ): boolean {
+    const canary = this.canary;
+    if (
+      canary !== null
+      && parsed.url.href === canary.targetUrl
+      && error instanceof ProtectedTransportError
+      && error.code === "SSRF_NON_PUBLIC_ADDRESS"
+    ) {
+      canary.proxyRejected = true;
+      return true;
+    }
+    return false;
+  }
+
+  private async openPinnedProxySocket(
+    parsed: ParsedNetworkUrl,
+    pageGeneration: number,
+  ): Promise<PinnedProxySocket> {
+    const signal = this.pageSignal;
+    if (signal === null || this.pageGeneration !== pageGeneration) {
+      throw proxyError();
+    }
+
+    let selected: ValidatedAddressAnswer;
+    try {
+      selected = await this.destinationResolver.resolve(
+        parsed,
+        signal,
+        this.canaryAnswers(parsed),
+      );
+    } catch (error) {
+      if (error instanceof ProtectedTransportError) {
+        throw error;
+      }
+      if (error instanceof TargetPolicyError) {
+        throw mapPolicyError(error);
+      }
+      if (signal.aborted) {
+        throw abortError(signal.reason);
+      }
+      throw mapPhaseError(error, "dns");
+    }
+
+    this.assertPageGeneration(pageGeneration, signal);
+
+    const release = await this.scheduler.acquire(parsed.url.origin, signal);
+    try {
+      this.assertPageGeneration(pageGeneration, signal);
+      const port = parsed.url.protocol === "https:" ? 443 : 80;
+      const socket = await raceWithSignal(
+        () => connectSocket(selected.address, selected.family, port, signal),
+        signal,
+      );
+      verifyConnectedAddress(selected, socket, "browser");
+      this.pageUpstreamSockets.add(socket);
+      socket.once("close", () => this.pageUpstreamSockets.delete(socket));
+      return { socket, release, signal };
+    } catch (error) {
+      release();
+      if (error instanceof ProtectedTransportError) {
+        throw error;
+      }
+      if (signal.aborted) {
+        throw abortError(signal.reason);
+      }
+      throw proxyError(isTransientNetworkError(error));
+    }
+  }
+
+  private assertPageGeneration(
+    pageGeneration: number,
+    signal: AbortSignal,
+  ): void {
+    if (
+      signal.aborted
+      || this.activePage === null
+      || this.pageSignal !== signal
+      || this.pageGeneration !== pageGeneration
+    ) {
+      throw abortError(signal.reason ?? new BrowserProxyPageFinished());
+    }
+  }
+
+  private validateProxyRequest(request: IncomingMessage): void {
+    this.assertActiveDomain();
+    assertProxyHeaderBudget(request.rawHeaders, this.config);
+    if (request.httpVersion !== "1.1") {
+      throw proxyError();
+    }
+    assertNoProxyRequestBody(request);
+  }
+
+  private async handleHttp(
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): Promise<void> {
+    let parsed: ParsedNetworkUrl | undefined;
+    let pinned: PinnedProxySocket | undefined;
+    let agent: PinnedSocketAgent | undefined;
+
+    try {
+      this.validateProxyRequest(request);
+      this.pageClientSockets.add(request.socket);
+      if (
+        request.method === undefined
+        || !this.config.security.browser.allowedMethods.includes(
+          request.method as "GET" | "HEAD" | "OPTIONS",
+        )
+      ) {
+        throw proxyError();
+      }
+      parsed = parseProxyHttpTarget(request.url ?? "", this.config, this.canary);
+      assertProxyHost(request, parsed, false);
+      this.consumeHttpGrant(parsed);
+      const pageGeneration = this.pageGeneration;
+      request.resume();
+
+      pinned = await this.openPinnedProxySocket(parsed, pageGeneration);
+      agent = new PinnedSocketAgent(pinned.socket);
+      const upstream = await this.requestProxyHttpResponse(
+        request,
+        parsed.url,
+        agent,
+        pinned.signal,
+      );
+      const statusCode = upstream.statusCode;
+      if (statusCode === undefined) {
+        upstream.destroy();
+        throw proxyError();
+      }
+      assertProxyHeaderBudget(upstream.rawHeaders, this.config);
+      response.writeHead(
+        statusCode,
+        upstream.statusMessage,
+        filteredProxyResponseHeaders(upstream.rawHeaders),
+      );
+      await pipeline(upstream, this.downstreamCounter(), response, {
+        signal: pinned.signal,
+      });
+      if (!upstream.complete || upstream.rawTrailers.length !== 0) {
+        throw proxyError();
+      }
+    } catch (error) {
+      if (pinned?.signal.aborted === true) {
+        throw abortError(pinned.signal.reason);
+      }
+      if (parsed !== undefined && this.expectedCanaryRejection(parsed, error)) {
+        writeProxyHttpFailure(response);
+        return;
+      }
+      throw error;
+    } finally {
+      agent?.destroy();
+      pinned?.socket.destroy();
+      pinned?.release();
+    }
+  }
+
+  private requestProxyHttpResponse(
+    incoming: IncomingMessage,
+    url: URL,
+    agent: PinnedSocketAgent,
+    signal: AbortSignal,
+  ): Promise<IncomingMessage> {
+    return new Promise<IncomingMessage>((resolve, reject) => {
+      let settled = false;
+      const upstreamRequest = makeHttpRequest({
+        hostname: url.hostname,
+        port: 80,
+        method: incoming.method,
+        path: `${url.pathname}${url.search}`,
+        agent,
+        setHost: false,
+        insecureHTTPParser: false,
+        joinDuplicateHeaders: false,
+        maxHeaderSize: this.config.limits.http.headerBytes,
+        headers: filteredProxyRequestHeaders(
+          incoming.rawHeaders,
+          url,
+          this.config.userAgent,
+        ),
+      });
+      upstreamRequest.maxHeadersCount = this.config.limits.http.headerFields + 1;
+
+      const settle = (
+        error: unknown | null,
+        upstream?: IncomingMessage,
+      ): void => {
+        if (settled) {
+          upstream?.destroy();
+          return;
+        }
+        settled = true;
+        signal.removeEventListener("abort", onAbort);
+        if (error === null && upstream !== undefined) {
+          resolve(upstream);
+        } else {
+          reject(error ?? proxyError());
+        }
+      };
+      const onAbort = (): void => {
+        const error = abortError(signal.reason);
+        upstreamRequest.destroy(error);
+        settle(error);
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+      upstreamRequest.on("information", () => {
+        const error = proxyError();
+        upstreamRequest.destroy(error);
+        settle(error);
+      });
+      upstreamRequest.once("response", (upstream) => settle(null, upstream));
+      upstreamRequest.once("upgrade", (_upstream, socket) => {
+        socket.destroy();
+        settle(proxyError());
+      });
+      upstreamRequest.once("error", (error) => settle(error));
+      upstreamRequest.end();
+    });
+  }
+
+  private async handleConnect(
+    request: IncomingMessage,
+    client: Socket,
+    head: Buffer,
+  ): Promise<void> {
+    this.validateProxyRequest(request);
+    this.pageClientSockets.add(client);
+    if (request.method !== "CONNECT") {
+      throw proxyError();
+    }
+    const parsed = parseProxyConnectTarget(request.url ?? "", this.config);
+    assertProxyHost(request, parsed, true);
+    this.assertHttpsAuthorized(parsed);
+    const pageGeneration = this.pageGeneration;
+    const pinned = await this.openPinnedProxySocket(parsed, pageGeneration);
+    const upstream = pinned.socket;
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        let settled = false;
+        const counter = this.downstreamCounter();
+        const cleanup = (): void => {
+          client.removeListener("error", onError);
+          upstream.removeListener("error", onError);
+          client.removeListener("close", onClose);
+          upstream.removeListener("close", onClose);
+          counter.removeListener("error", onError);
+        };
+        const settle = (error?: unknown): void => {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          cleanup();
+          client.destroy();
+          upstream.destroy();
+          if (error === undefined || this.finishing) {
+            resolve();
+          } else {
+            reject(error);
+          }
+        };
+        const onError = (error: Error): void => settle(error);
+        const onClose = (): void => settle();
+        client.once("error", onError);
+        upstream.once("error", onError);
+        client.once("close", onClose);
+        upstream.once("close", onClose);
+        counter.once("error", onError);
+
+        client.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+        if (head.byteLength > 0) {
+          upstream.write(head);
+        }
+        client.pipe(upstream);
+        upstream.pipe(counter).pipe(client);
+      });
+    } finally {
+      upstream.destroy();
+      pinned.release();
+    }
+  }
+}
+
 class ProtectedHttpTransportImpl implements ProtectedHttpTransport {
   private readonly config: ScanConfig;
   private readonly scheduler: ConcurrencyScheduler;
@@ -864,12 +2141,20 @@ class ProtectedHttpTransportImpl implements ProtectedHttpTransport {
       options.signal,
     );
   }
+
+  createBrowserProxy(): Promise<ProtectedBrowserProxy> {
+    return ProtectedBrowserProxyImpl.create(
+      this.config,
+      this.scheduler,
+      this.dnsScheduler,
+    );
+  }
 }
 
 class ProtectedTransportSessionImpl implements ProtectedTransportSession {
   private readonly config: ScanConfig;
   private readonly scheduler: ConcurrencyScheduler;
-  private readonly dnsScheduler: ConcurrencyScheduler;
+  private readonly destinationResolver: DestinationResolver;
   private readonly timeoutController: AbortController;
   private readonly timeoutTimer: NodeJS.Timeout;
   private readonly signal: AbortSignal;
@@ -877,8 +2162,6 @@ class ProtectedTransportSessionImpl implements ProtectedTransportSession {
   private retries = 0;
   private staticTransferredBytes = 0;
   private staticDecompressedBytes = 0;
-  private readonly ipv4Records = new Set<string>();
-  private readonly ipv6Records = new Set<string>();
   private closed = false;
 
   constructor(
@@ -889,7 +2172,7 @@ class ProtectedTransportSessionImpl implements ProtectedTransportSession {
   ) {
     this.config = config;
     this.scheduler = scheduler;
-    this.dnsScheduler = dnsScheduler;
+    this.destinationResolver = new DestinationResolver(config, dnsScheduler);
 
     const timeout = delayAbortController(
       config.limits.timeMs.activeDomain,
@@ -933,7 +2216,7 @@ class ProtectedTransportSessionImpl implements ProtectedTransportSession {
 
       try {
         phase = "dns";
-        const selected = await this.resolveDestination(
+        const selected = await this.destinationResolver.resolve(
           parsed,
           attemptSignal,
         );
@@ -954,7 +2237,7 @@ class ProtectedTransportSessionImpl implements ProtectedTransportSession {
           ),
           attemptSignal,
         );
-        this.verifyConnectedAddress(selected, socket);
+        verifyConnectedAddress(selected, socket, "http");
 
         if (parsed.url.protocol === "https:") {
           phase = "tls";
@@ -1121,111 +2404,6 @@ class ProtectedTransportSessionImpl implements ProtectedTransportSession {
 
     if (isRetry) {
       this.retries += 1;
-    }
-  }
-
-  private async resolveDestination(
-    parsed: ParsedNetworkUrl,
-    signal: AbortSignal,
-  ): Promise<ValidatedAddressAnswer> {
-    let answers: unknown;
-
-    if (parsed.addressFamily === 4 || parsed.addressFamily === 6) {
-      answers = [
-        {
-          address: parsed.logicalHostname,
-          family: parsed.addressFamily,
-        },
-      ];
-    } else {
-      const releaseLookup = await this.dnsScheduler.acquire("dns", signal);
-
-      if (signal.aborted) {
-        releaseLookup();
-        throw signal.reason;
-      }
-
-      const operation = Promise.resolve().then(() =>
-        lookupAddress(parsed.logicalHostname, LOOKUP_OPTIONS),
-      );
-      void operation.then(releaseLookup, releaseLookup);
-      answers = await raceWithSignal(() => operation, signal);
-    }
-
-    if (parsed.addressFamily === 4 || parsed.addressFamily === 6) {
-      const validated = validateAddressAnswers(answers);
-      const selected = validated[0];
-
-      if (selected === undefined) {
-        throw transportError("DNS_NO_ADDRESS", "dns", true);
-      }
-
-      return selected;
-    }
-
-    const validated = validateAddressAnswers(
-      answers,
-      MAX_RAW_DNS_ANSWERS_PER_LOOKUP,
-    );
-    const nextIpv4 = new Set(this.ipv4Records);
-    const nextIpv6 = new Set(this.ipv6Records);
-
-    for (const answer of validated) {
-      const canonical = canonicalIpAddress(answer.address);
-
-      if (canonical === undefined) {
-        throw transportError("DNS_LOOKUP_FAILED", "dns", true);
-      }
-
-      if (answer.family === 4) {
-        nextIpv4.add(canonical);
-      } else {
-        nextIpv6.add(canonical);
-      }
-    }
-
-    if (
-      nextIpv4.size > this.config.limits.dns.recordsPerType ||
-      nextIpv6.size > this.config.limits.dns.recordsPerType ||
-      nextIpv4.size + nextIpv6.size > this.config.limits.dns.recordsPerDomain
-    ) {
-      throw transportError("DNS_LIMIT_EXCEEDED", "dns", false);
-    }
-
-    this.ipv4Records.clear();
-    this.ipv6Records.clear();
-
-    for (const address of nextIpv4) {
-      this.ipv4Records.add(address);
-    }
-
-    for (const address of nextIpv6) {
-      this.ipv6Records.add(address);
-    }
-
-    const selected = validated[0];
-
-    if (selected === undefined) {
-      throw transportError("DNS_NO_ADDRESS", "dns", true);
-    }
-
-    return selected;
-  }
-
-  private verifyConnectedAddress(
-    selected: ValidatedAddressAnswer,
-    socket: Socket,
-  ): void {
-    const remoteAddress = socket.remoteAddress;
-    const remoteFamily = remoteAddress === undefined ? 0 : isIP(remoteAddress);
-
-    if (
-      remoteFamily !== selected.family ||
-      remoteAddress === undefined ||
-      !sameIpAddress(remoteAddress, selected.address)
-    ) {
-      socket.destroy();
-      throw transportError("SSRF_REMOTE_ADDRESS_MISMATCH", "http", false);
     }
   }
 

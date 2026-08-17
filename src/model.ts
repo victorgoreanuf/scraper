@@ -21,6 +21,7 @@ export const EVIDENCE_SOURCES = [
   "script_content",
   "dom",
   "javascript",
+  "network_url",
   "network_hostname",
   "dns_record",
   "tls_issuer",
@@ -233,6 +234,82 @@ export type HttpEntryResult =
       readonly robots: readonly HttpRobotsObservation[];
       readonly errors: readonly [ScanError];
     };
+
+export type BrowserFact =
+  | {
+      readonly kind: "presence";
+    }
+  | {
+      readonly kind: "value";
+      readonly value: string;
+    };
+
+export interface CatalogFactDemand {
+  readonly presence: boolean;
+  readonly value: boolean;
+}
+
+export type CatalogDomFactKind =
+  | "exists"
+  | "text"
+  | "attribute"
+  | "property";
+
+export interface CatalogDomFact {
+  readonly kind: CatalogDomFactKind;
+  readonly name: string | null;
+  readonly locator: string;
+  readonly demand: CatalogFactDemand;
+}
+
+export interface CatalogDomInspection {
+  readonly selector: string;
+  readonly facts: readonly CatalogDomFact[];
+}
+
+export interface CatalogJavascriptInspection {
+  readonly path: string;
+  readonly segments: readonly string[];
+  readonly demand: CatalogFactDemand;
+}
+
+export interface CatalogInspectionPlan {
+  readonly dom: readonly CatalogDomInspection[];
+  readonly javascript: readonly CatalogJavascriptInspection[];
+  readonly probePaths: readonly string[];
+}
+
+export interface BrowserDomObservation {
+  readonly pageId: PageId;
+  readonly locator: string;
+  readonly fact: BrowserFact;
+}
+
+export interface BrowserJavascriptObservation {
+  readonly pageId: PageId;
+  readonly path: string;
+  readonly fact: BrowserFact;
+}
+
+export interface BrowserScriptBodyObservation {
+  readonly pageId: PageId;
+  readonly url: string;
+  readonly content: string;
+}
+
+export interface BrowserPageObservations {
+  readonly pageId: PageId;
+  readonly finalUrl: string;
+  readonly dom: readonly BrowserDomObservation[];
+  readonly javascript: readonly BrowserJavascriptObservation[];
+  readonly cookies: readonly HttpCookieObservation[];
+  readonly networkUrls: readonly string[];
+  readonly networkHostnames: readonly string[];
+  readonly scriptUrls: readonly string[];
+  readonly scriptBodies: readonly BrowserScriptBodyObservation[];
+  readonly navigationLinks: readonly string[];
+  readonly truncated: boolean;
+}
 
 export interface Timings {
   readonly totalMs: number;
@@ -719,7 +796,11 @@ export function createEvidenceValueMatch(input: EvidenceMatchInput): EvidenceMat
   });
   let candidate: string;
 
-  if (input.source === "url" || input.source === "script_url") {
+  if (
+    input.source === "url"
+    || input.source === "script_url"
+    || input.source === "network_url"
+  ) {
     try {
       candidate = sanitizeUrl(input.observedValue, limits);
     } catch {
@@ -794,7 +875,11 @@ export function createEvidenceVersion(input: EvidenceVersionInput): SafeVersion 
     return null;
   }
   const limits = sanitizationLimits(input.scanConfig);
-  if (input.source === "url" || input.source === "script_url") {
+  if (
+    input.source === "url"
+    || input.source === "script_url"
+    || input.source === "network_url"
+  ) {
     let parsed: URL;
     let sanitized: URL;
     try {
@@ -1120,7 +1205,9 @@ function validateEvidenceValue(
     issues.push(`${path}.match.value violates the configured code-point limit`);
   }
 
-  if ((evidence.source === "url" || evidence.source === "script_url")
+  if ((evidence.source === "url"
+      || evidence.source === "script_url"
+      || evidence.source === "network_url")
     && !isSanitizedCanonicalUrl(value, sanitizationLimits(config))) {
     issues.push(`${path}.match.value is not a canonical sanitized URL`);
   }

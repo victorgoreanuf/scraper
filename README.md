@@ -1,10 +1,10 @@
 # Website Technologies Scraper
 
-> Project status: application foundation, protected single-hop HTTP transport,
-> bounded fail-closed robots policy, and static HTTP observation collector are
-> implemented and tested. The pinned fingerprint catalog compiler and isolated
-> static HTTP detector are also complete; the browser collector remains the next
-> slice.
+> Project status: the application foundation, protected HTTP/browser transports,
+> fail-closed robots policy, static HTTP collector, fingerprint compiler,
+> isolated detector, and protected Playwright/Chromium collector and pool are
+> implemented and tested. DNS/TLS collection, pipeline/output integration, and
+> the runnable CLI remain separate roadmap slices.
 
 ## Goal
 
@@ -103,6 +103,8 @@ The provided benchmark contains 200 unique domains in a Snappy-compressed Parque
 │   └── scan-config.v1.schema.json
 ├── test/
 │   ├── fixtures/
+│   ├── browser-proxy.test.ts
+│   ├── browser.test.ts
 │   ├── toolchain.test.ts
 │   ├── catalog.test.ts
 │   ├── config.test.ts
@@ -436,9 +438,10 @@ effective read-only abort signal, which combines the configured active-domain
 deadline with caller cancellation; retry waits, decode, and extraction use that
 same signal. The collector owns deterministic entry-target candidates, page
 redirects, one transient retry, content admission, and static extraction. It
-neither creates nor closes the session. This slice collects only `p1`; internal
-page classification waits until the later browser collector can contribute its
-rendered links.
+neither creates nor closes the session. This collector still handles only `p1`;
+the later pipeline/page-selection slice will combine its static links with the
+rendered links now exposed by `crawl/browser.ts` before scheduling internal
+pages.
 
 Robots is evaluated before every candidate request, retry, and page redirect
 destination. A denial or unavailable policy stops target resolution;
@@ -623,11 +626,21 @@ request and byte budgets.
 
 ### Browser behavior
 
+`crawl/browser.ts` implements a bounded FIFO pool with one protected proxy and
+one reusable Chromium process per `fullScans` slot (three by default). Every
+slot is preflighted before domain work, and the pool freezes one runtime identity
+for Playwright `1.62.1`, Chromium revision `1234`, and the common runtime version
+reported by those processes. A disconnected process receives at most one
+replacement; other slots continue at reduced capacity, while loss of every slot
+latches the pool unavailable instead of spawning indefinitely.
+
 Every selected 2xx HTML page in `full` mode is rendered in a non-persistent
 Chromium context dedicated to that domain. The same context is reused
-sequentially for its maximum three pages and then destroyed; only one page is
-active at a time. Collection waits for `DOMContentLoaded` and a bounded
-two-second settle window, never unbounded `networkidle`.
+sequentially for its ordered `p1` through `p3` pages and then destroyed; only
+one page is active at a time, all pages use the exact selected origin, and an
+aborted waiter cannot consume a pool slot. Collection waits for
+`DOMContentLoaded` and a bounded two-second settle window, never unbounded
+`networkidle`.
 
 The browser keeps its sandbox and CSP, has no permissions, blocks service
 workers, disables downloads, and never clicks, scrolls, submits forms, accepts
@@ -635,30 +648,48 @@ consent, authenticates, or bypasses access controls. `GET`, `HEAD`, and
 `OPTIONS` may continue. Other methods and WebSockets are recorded only as
 attempted requests, contribute only a hostname observation, and are then
 aborted; images, fonts, and media contribute their URL/hostname observations
-and are aborted to conserve the budget. Context-wide routing rejects every
-popup and every main-frame request or redirect outside the exact selected
-origin before network access; same-origin top-level redirects must still pass
-robots. Up to 20 bounded script bodies are collected from responses the browser
-already fetched, rather than downloaded a second time. Eligible script URLs are
-deduplicated and ranked by same-origin first, then page ID and normalized URL in
-UTF-16 code-unit order; the fixed top 20 are used, and an unavailable response
-is not replaced based on completion timing.
+and are aborted to conserve the budget. Popups are closed.
+
+Context-wide Playwright routing owns initial-request method, resource, origin,
+robots, observation, and logical-request accounting. A Chromium DevTools
+Protocol `Fetch` gate additionally pauses both response and request stages for
+automatic redirects. At the response stage it validates exactly one usable
+`Location`, the URL/method/resource policy, loop and depth limits, and, for a
+top-level document, the exact selected origin plus a synchronous
+`allowTopLevelUrl(url) === true` robots decision. At the following request stage
+it requires the matching `redirectedRequestId` and expected target before it
+records and grants that hop exactly once. A mismatch, asynchronous/non-boolean
+robots decision, or denied hop fails before the redirected target reaches the
+network. The same response-stage gate admits the root document body only for an
+exact 2xx HTML/XHTML response; access-denial and non-HTML bodies are stopped
+before their scripts can run. Once that document is admitted, further
+top-level navigations are blocked during settle and inspection so observations
+cannot be attributed to a different document.
+
+Up to 20 bounded script bodies are collected from responses the browser already
+fetched, rather than downloaded a second time. Eligible script URLs are
+deduplicated and ranked by page ID first, then same-origin before cross-origin,
+then normalized URL in UTF-16 code-unit order; the fixed top 20 are used, and an
+unavailable response is not replaced based on completion timing.
 
 All browser HTTP(S) and CONNECT traffic passes through the project-owned local
-forward proxy in `crawl/transport.ts`. The proxy resolves each hostname,
-rejects mixed or non-public answers, connects only to the selected public
-address on port 80/443, and owns browser request/byte accounting. Chromium is
-configured to use the proxy without a bypass, with service workers, QUIC, and
-non-proxied WebRTC traffic disabled. Playwright interception is an additional
-navigation/method guard, not the SSRF boundary.
+forward proxy in `crawl/transport.ts`. The proxy resolves every authority,
+rejects mixed or non-public answers, pins port 80/443 connections to the
+selected public address, and verifies the connected peer. Each admitted plain
+HTTP request receives one consumable proxy grant. HTTPS remains an opaque TLS
+tunnel, so Playwright/CDP owns per-request logical admission and counting while
+the proxy authorizes the CONNECT authority, enforces egress, and counts
+downstream encrypted tunnel bytes. Chromium is configured to use the proxy
+without a destination bypass, with service workers, QUIC, and non-proxied WebRTC
+traffic disabled. Playwright/CDP interception is an additional
+navigation/method/redirect guard, not the SSRF boundary.
 
-Startup launches a loopback canary server and asks the proxied browser to reach
-it through a synthetic hostname which both test resolvers map to that canary.
-The proxy must record a policy rejection and the canary must receive zero
-connections; proxy configuration and required Chromium controls are also
-checked. Any failed preflight stops `full` mode before domain processing or
-output creation. At
-production scale, host/container egress rules also restrict Chromium to the
+For every pool slot, startup launches a loopback canary and maps one random
+synthetic hostname to it through Chromium's fixed resolver rule and the proxy's
+canary resolver. The proxy must reject the non-public answer and the listener
+must receive zero connections. Any failed launch, control, version, proxy, or
+canary preflight stops `full` mode before domain processing or output creation.
+At production scale, host/container egress rules also restrict Chromium to the
 local proxy. A proxy failure during a domain scan closes the context and yields
 a partial result.
 
@@ -674,7 +705,7 @@ Collectors produce normalized observations such as:
 - script, stylesheet, image, iframe, and link URLs;
 - rendered DOM facts requested by the fingerprint catalog;
 - selected JavaScript property paths requested by the catalog;
-- network request hostnames;
+- bounded browser request URLs and canonical public hostnames;
 - DNS records and TLS issuer.
 
 The detector consumes those observations and produces:
@@ -687,7 +718,11 @@ The detector consumes those observations and produces:
 - one or more evidence records;
 - the pages on which the technology was observed.
 
-The browser collector should receive a generic inspection plan generated from the fingerprint catalog. It should inspect only requested selectors and JavaScript paths, rather than enumerate the entire DOM or `window` object.
+The catalog compiler produces a deeply frozen generic inspection plan whose
+shared types are owned by `src/model.ts`; `crawl` therefore does not depend on
+`detect`. The browser evaluates only the requested DOM facts and safe
+JavaScript-property paths under their configured caps. It emits no serialized
+DOM and never enumerates, calls, or stringifies the complete `window` object.
 
 ## Result and evidence contract v1
 
@@ -816,7 +851,7 @@ A representative direct detection is shown below.
     "runtime": {
       "node": "24.19.0",
       "playwright": "1.62.1",
-      "chromiumRevision": "chromium-123456"
+      "chromiumRevision": "1234"
     },
     "catalog": {
       "source": "enthec/webappanalyzer",
@@ -829,8 +864,8 @@ A representative direct detection is shown below.
 ```
 
 Evidence `source` is one of `url`, `header`, `cookie`, `html`, `text`, `css`,
-`meta`, `script_url`, `script_content`, `dom`, `javascript`, `network_hostname`,
-`dns_record`, `tls_issuer`, `robots`, or `probe`. `collector` is `http`,
+`meta`, `script_url`, `script_content`, `dom`, `javascript`, `network_url`,
+`network_hostname`, `dns_record`, `tls_issuer`, `robots`, or `probe`. `collector` is `http`,
 `browser`, `dns`, or `tls`; `pageId` is `null` for non-page infrastructure
 signals and is required for every browser observation. `key` identifies the
 header, cookie, metadata name, selector, JavaScript path, DNS record type, or
@@ -1135,7 +1170,7 @@ These are starting values, not final performance claims:
 | Total static decompressed bytes | 32 MiB per domain |
 | Probe body | 256 KiB compressed / 512 KiB decompressed |
 | Script URL candidates / bodies | 80 / 20; bodies 2 MiB each / 16 MiB total |
-| Unique browser network hostnames | 200 per domain |
+| Browser request URLs / unique public hostnames | at most 300 bounded URLs / 200 hostnames per domain |
 | Browser requests | 150 per page / 300 per domain |
 | Browser transfer | 15 MiB per page / 30 MiB per domain |
 | Cookies | 100 per domain; 256-code-unit name / 4 KiB value / 64 KiB total |
@@ -1172,9 +1207,10 @@ releases resources, records a stable error, and preserves earlier observations.
 All limits live in one validated runtime configuration with explicit CLI
 overrides rather than a separate YAML system.
 
-The pinned catalog currently yields 1,769 unique DOM selectors and 5,570 unique
-JavaScript paths after deduplication, so the inspection-plan caps admit the
-entire reviewed baseline. A future effective upstream-plus-custom catalog which
+The pinned catalog currently yields 1,769 unique DOM selectors, 1,780 exact DOM
+facts, 5,570 unique JavaScript paths, and 113 browser request-URL rules after
+deduplication, so the inspection-plan and request caps admit the entire reviewed
+baseline. A future effective upstream-plus-custom catalog which
 exceeds a catalog-wide plan cap is rejected before crawling rather than silently
 dropping fingerprint rules.
 
@@ -1284,8 +1320,17 @@ The final summary should include at least:
   an external edge breaking a cycle, gate-then-exclude of a base technology,
   and pruning an inference whose only parent was suppressed.
 - Pipeline tests against a local HTTP server, not unstable public websites.
-- Browser-egress tests proving that private, link-local, loopback, metadata, and
-  mixed DNS destinations never receive a connection.
+- `browser-proxy.test.ts` covers one-use HTTP grants, CONNECT authority/port
+  policy, mixed and non-public DNS, peer pinning, late-DNS/page cleanup,
+  request/byte limits, and a zero-hit loopback canary.
+- `browser.test.ts` covers safe launch/context options, slot preflight,
+  FIFO admission and cleanup, ordered per-domain pages, synchronous robots
+  gating, dual-stage CDP redirect admission, deterministic top-20 script
+  selection, bounded process replacement, and a real Chromium page served only
+  by controlled local fixtures through the protected proxy.
+- Browser-egress tests prove that private, link-local, loopback, metadata, and
+  mixed DNS destinations never receive a connection; CI does not require a live
+  public website.
 - Resume and partial-result tests.
 - A small optional real-site smoke run that is not required in CI.
 - Deterministic sorting and output-schema checks.
@@ -1404,12 +1449,25 @@ Usage constraints keep the packages inside their intended boundaries:
 - the upstream schema is necessary but not sufficient: the catalog compiler
   must also validate supported fields, references, selectors, paths, pattern
   syntax, lengths, counts, and depth before accepting a definition;
-- Playwright is an application dependency, not a test framework. Only its
-  matching Chromium build will be provisioned in an explicit later setup step;
-  browser downloads are never hidden in `postinstall`, and the sandbox remains
-  enabled for untrusted pages. The browser binary is a separate third-party
+- Playwright is an application dependency, not a test framework. Its matching
+  Chromium build is provisioned explicitly, never through `postinstall`, and
+  the sandbox remains enabled for untrusted pages. The browser binary is a separate third-party
   artifact: it is not committed, and its licenses/notices must be preserved if
   a future distributable bundles it.
+
+The browser setup command is explicit and reproducible:
+
+```sh
+fnm exec --using 24.19.0 node_modules/.bin/playwright install chromium
+```
+
+For `playwright@1.62.1` this provisions Chromium revision `1234` (Chrome for
+Testing `151.0.7922.34`) plus its matching headless shell and FFmpeg in the
+developer-local Playwright cache. CI must run the same explicit command. No
+browser artifact is written to Git or represented as an npm dependency change.
+The TypeScript project includes the standard `DOM` declaration library only
+because Playwright's own types expose DOM names; application execution remains
+Node.js 24.
 
 Node.js 24 owns CLI parsing (`util.parseArgs`), hardened HTTP(S), URL/DNS/TLS
 handling, cancellation and timeouts, decompression, bounded worker control,
@@ -1437,10 +1495,9 @@ on 2026-08-17. The lock retains TypeScript's optional platform packages for
 Linux and macOS instead of producing a host-only compiler lock.
 
 The first local install used `npm ci --ignore-scripts` while the resolved tree
-was inspected. Playwright 1.62.1 has no install lifecycle script, so no browser
-binary was downloaded; Chromium provisioning remains the explicit later setup
-step described above. `node_modules` and compiled `dist` output remain local and
-Git-ignored.
+was inspected. Playwright 1.62.1 has no install lifecycle script, so the later
+Chromium provisioning remained an explicit separate command. `node_modules`,
+the browser cache, and compiled `dist` output remain local and Git-ignored.
 
 The available project checks are:
 
@@ -1455,7 +1512,7 @@ Tests use Node.js 24's built-in test runner and type stripping for `.test.ts`
 files. TypeScript still owns strict type checking, while the separate build
 configuration emits only `src` into `dist`.
 
-## Fingerprint compiler and static detector
+## Fingerprint compiler and detector
 
 `detect/catalog.ts` loads an exact upstream allowlist: `schema.json`,
 `categories.json`, and `technologies/{_,a..z}.json`. It rejects missing or extra
@@ -1490,15 +1547,22 @@ across a future snapshot refresh. Catalog digest paths are relative to
 `fingerprints/`, use `/`, sort by UTF-8 bytes, and retain the raw file bytes in
 the documented length-framed hash.
 
-`detect/engine.ts` maps the bounded HTTP observations without creating a new
-network or parsing path. Final and redirect URLs become `url`; response headers,
-cookies, HTML, visible text, normalized metadata, script resource URLs, and the
-retained robots body map to their matching signals. Stylesheet, image, iframe,
-generic link, navigation-link, and HTTP-status observations are deliberately
-not detector candidates in v1. HTML observations use `p1`; non-HTML response
-and robots observations use `pageId: null`. Exact candidate duplicates are
-removed and script URLs retain the configured deterministic cap before worker
-dispatch.
+`detect/engine.ts` maps the bounded HTTP and browser observations without
+creating a new network or parsing path. Final and redirect URLs become `url`;
+response headers, cookies, HTML, visible text, normalized metadata, script
+resource URLs, retained robots text, requested DOM/JavaScript facts, bounded
+script bodies, and browser request URLs map to their matching signals.
+Upstream `xhr` rules match `network_url`, not only a hostname: the reviewed
+snapshot has 113 such rules and 16 require a path or query component. Matching
+therefore uses the complete bounded in-memory request URL, while evidence emits
+only its canonical sanitized form. `network_hostname` remains a separate
+bounded observation for safe public hostnames and is not presented as complete
+XHR coverage. Stylesheet, image, iframe, generic link, navigation-link, and
+HTTP-status observations are deliberately not detector candidates in v1. HTTP
+HTML observations use `p1`; browser evidence retains its exact p1/p2/p3; a
+non-HTML response and robots use `pageId: null`. Exact candidate duplicates are
+removed and HTTP candidates rank before the additional browser tier when a
+domain work cap admits only a prefix.
 
 Workers match raw bounded candidates, while the parent materializes only
 sanitized evidence. Cookie, HTML, text, and robots matches are always redacted;
@@ -1542,10 +1606,11 @@ because every worker expression already uses `i`; the original locator remains
 part of the stable rule ID. Cookie-locator executions count toward the same
 per-domain budget.
 Unkeyed signals use the deterministic candidate caps in the resource table,
-including at most 80 script URLs, 20 script bodies, three page URLs, and 200
-browser request hostnames. They are deduplicated and ranked by page ID, then
-their source URL, hostname, or locator in UTF-16 code-unit order; script
-responses first apply the same-origin ranking defined by the browser policy.
+including at most 80 script URLs, 20 script bodies, three page URLs, 300 browser
+request URLs, and 200 browser request hostnames. They are deduplicated and
+ranked by collector, page ID, then their source URL, hostname, or locator in
+UTF-16 code-unit order. Script responses use the exact browser selection rank:
+page ID first, then same-origin before cross-origin, then URL.
 Before dispatch, the detector calculates a conservative upper bound from
 applicable rules times admitted candidates. The configured 500,000 value is
 enforced as two independent ceilings: actual `RegExp` calls and total
@@ -1653,7 +1718,8 @@ The pinned snapshot was inspected on 2026-08-17 and contains 7,575 technology
 definitions in 27 JSON files and 109 categories. Its declarative format covers
 the signals required by this project, including headers, cookies, metadata,
 DOM selectors, JavaScript properties, page and script URLs, script content,
-visible text, CSS, request hostnames, robots, bounded probes, DNS, certificate issuer,
+visible text, CSS, bounded request URLs and public hostnames, robots, bounded
+probes, DNS, certificate issuer,
 version extraction, confidence, and technology relationships.
 
 The upstream repository is licensed under
@@ -1720,8 +1786,8 @@ are recorded in `THIRD_PARTY_NOTICES.md`.
 - [x] Implement the bounded fail-closed robots policy and local adversarial
   tests.
 - [x] Implement the static HTTP observation collector.
-- [x] Implement the fingerprint catalog compiler and static HTTP detector.
-- [ ] Implement the browser collector and browser pool.
+- [x] Implement the fingerprint catalog compiler and HTTP/browser detector.
+- [x] Implement the protected browser collector and bounded Chromium pool.
 - [ ] Add DNS/TLS signals.
 - [ ] Add incremental output, resume, and summary generation.
 - [ ] Run deterministic tests and a small real-site smoke test.
@@ -1749,7 +1815,7 @@ Coding starts only after these decisions are explicit:
    JCS configuration digest, stable error registry, and completion-order JSONL
    semantics (selected).**
 
-The readiness gate, application foundation, protected single-hop HTTP
-transport, robots policy, static HTTP observation collector, fingerprint
-compiler, and isolated static detector are complete. Browser automation remains
-the next separate slice.
+The readiness gate, application foundation, protected HTTP/browser transports,
+robots policy, static and rendered observation collectors, fingerprint
+compiler, isolated detector, and bounded Chromium pool are complete. DNS/TLS,
+pipeline/output integration, and the runnable CLI remain separate slices.

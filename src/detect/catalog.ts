@@ -17,7 +17,20 @@ import { Ajv2020, type AnySchemaObject } from "ajv/dist/2020.js";
 import { load as loadHtml } from "cheerio";
 
 import type { ScanConfig } from "../config.ts";
-import type { Category, EvidenceSource } from "../model.ts";
+import type {
+  CatalogDomFactKind,
+  CatalogInspectionPlan,
+  Category,
+  EvidenceSource,
+} from "../model.ts";
+
+export type {
+  CatalogDomFact,
+  CatalogDomFactKind,
+  CatalogDomInspection,
+  CatalogInspectionPlan,
+  CatalogJavascriptInspection,
+} from "../model.ts";
 
 export const CATALOG_SOURCE = "enthec/webappanalyzer";
 export const CATALOG_REVISION =
@@ -77,7 +90,7 @@ const ruleSignals: readonly EvidenceSource[] = [
   "script_content",
   "dom",
   "javascript",
-  "network_hostname",
+  "network_url",
   "dns_record",
   "tls_issuer",
   "robots",
@@ -169,12 +182,6 @@ export interface CatalogSignalIndex {
   readonly patternLocatorRuleOrdinals: readonly number[];
 }
 
-export interface CatalogInspectionPlan {
-  readonly domSelectors: readonly string[];
-  readonly javascriptPaths: readonly string[];
-  readonly probePaths: readonly string[];
-}
-
 export interface CompiledFingerprintCatalog {
   readonly source: string;
   readonly revision: string;
@@ -206,8 +213,130 @@ interface ParsedCatalogInputFile extends CatalogInputFile {
   readonly value: unknown;
 }
 
+interface MutableFactDemand {
+  presence: boolean;
+  value: boolean;
+}
+
+interface MutableDomFact {
+  readonly kind: CatalogDomFactKind;
+  readonly name: string | null;
+  readonly locator: string;
+  readonly demand: MutableFactDemand;
+}
+
+const EVIDENCE_KEY_CODE_UNITS = 2_048;
+const domFactRank = new Map<CatalogDomFactKind, number>([
+  ["exists", 0],
+  ["text", 1],
+  ["attribute", 2],
+  ["property", 3],
+]);
+
 function compareString(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function addRuleDemand(
+  demand: MutableFactDemand,
+  matchMode: CompiledFingerprintRule["matchMode"],
+): void {
+  if (matchMode === "presence") {
+    demand.presence = true;
+  } else {
+    demand.value = true;
+  }
+}
+
+function createInspectionPlan(
+  rules: readonly CompiledFingerprintRule[],
+  probePaths: ReadonlySet<string>,
+): CatalogInspectionPlan {
+  const domBySelector = new Map<string, Map<string, MutableDomFact>>();
+  const javascriptByPath = new Map<string, MutableFactDemand>();
+
+  for (const rule of rules) {
+    if (rule.source === "dom") {
+      const locator = rule.locator;
+      if (locator === null) {
+        throw new FingerprintCatalogError(
+          "CATALOG_INVALID",
+          "Compiled DOM rule is missing its locator",
+        );
+      }
+      const [selector, rawKind, name] = JSON.parse(locator) as [
+        string,
+        "exists" | "text" | "attributes" | "properties",
+        string | null,
+      ];
+      const kind: CatalogDomFactKind = rawKind === "attributes"
+        ? "attribute"
+        : rawKind === "properties"
+          ? "property"
+          : rawKind;
+      const facts = domBySelector.get(selector) ?? new Map<string, MutableDomFact>();
+      const fact = facts.get(locator) ?? {
+        kind,
+        name,
+        locator,
+        demand: { presence: false, value: false },
+      };
+      addRuleDemand(fact.demand, rule.matchMode);
+      facts.set(locator, fact);
+      domBySelector.set(selector, facts);
+      continue;
+    }
+
+    if (rule.source === "javascript") {
+      const path = rule.locator;
+      if (path === null) {
+        throw new FingerprintCatalogError(
+          "CATALOG_INVALID",
+          "Compiled JavaScript rule is missing its path",
+        );
+      }
+      const demand = javascriptByPath.get(path) ?? {
+        presence: false,
+        value: false,
+      };
+      addRuleDemand(demand, rule.matchMode);
+      javascriptByPath.set(path, demand);
+    }
+  }
+
+  return {
+    dom: [...domBySelector]
+      .sort(([left], [right]) => compareString(left, right))
+      .map(([selector, facts]) => ({
+        selector,
+        facts: [...facts.values()]
+          .sort((left, right) =>
+            (domFactRank.get(left.kind) ?? Number.MAX_SAFE_INTEGER)
+              - (domFactRank.get(right.kind) ?? Number.MAX_SAFE_INTEGER)
+            || compareString(left.name ?? "", right.name ?? "")
+            || compareString(left.locator, right.locator))
+          .map((fact) => ({
+            kind: fact.kind,
+            name: fact.name,
+            locator: fact.locator,
+            demand: {
+              presence: fact.demand.presence,
+              value: fact.demand.value,
+            },
+          })),
+      })),
+    javascript: [...javascriptByPath]
+      .sort(([left], [right]) => compareString(left, right))
+      .map(([path, demand]) => ({
+        path,
+        segments: (path.startsWith(".") ? path.slice(1) : path).split("."),
+        demand: {
+          presence: demand.presence,
+          value: demand.value,
+        },
+      })),
+    probePaths: [...probePaths].sort(compareString),
+  };
 }
 
 function hasOnlyUnicodeScalars(value: string): boolean {
@@ -1278,6 +1407,12 @@ export function compileFingerprintCatalog(
       ? null
       : normalizeLocator(source, locatorInput);
     if (locator !== null) {
+      if (locator.length > EVIDENCE_KEY_CODE_UNITS) {
+        throw new FingerprintCatalogError(
+          "CATALOG_LIMIT_EXCEEDED",
+          `${draft.name} ${source} locator exceeds the evidence-key limit`,
+        );
+      }
       assertBoundedString(
         locator,
         `${draft.name} ${source} locator`,
@@ -1447,7 +1582,7 @@ export function compileFingerprintCatalog(
     addArrayRules(draft, "scriptSrc", "script_url");
     addArrayRules(draft, "scripts", "script_content");
     addMapRules(draft, "js", "javascript");
-    addArrayRules(draft, "xhr", "network_hostname");
+    addArrayRules(draft, "xhr", "network_url");
     addArrayRules(draft, "robots", "robots", true);
     addMapRules(draft, "probe", "probe", true);
 
@@ -1775,11 +1910,7 @@ export function compileFingerprintCatalog(
     technologies: technologyDefinitions,
     rules,
     indexes,
-    inspectionPlan: {
-      domSelectors: [...domSelectors].sort(compareString),
-      javascriptPaths: [...javascriptPaths].sort(compareString),
-      probePaths: [...probePaths].sort(compareString),
-    },
+    inspectionPlan: createInspectionPlan(rules, probePaths),
     declarationCount,
     relationshipCount,
     regexSourceCount,

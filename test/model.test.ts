@@ -789,6 +789,25 @@ test("publishes only canonical public hostname and DNS evidence", () => {
     /canonical public hostname/,
   );
 
+  const networkUrlEvidence = makeEvidence({
+    collector: "browser",
+    source: "network_url",
+    pageId: "p1",
+    key: null,
+    match: {
+      kind: "value",
+      value: "https://api.vendor.tld/umbraco/api/?access_token=secret",
+      truncated: false,
+    },
+    pattern: "/umbraco/api/",
+    version: null,
+  });
+
+  expectSemanticFailure(
+    makeResult({ technologies: [directWith(networkUrlEvidence)] }),
+    /canonical sanitized URL/,
+  );
+
   const cnameEvidence = {
     ...dnsEvidence,
     key: "CNAME",

@@ -35,6 +35,7 @@
         "script_content",
         "dom",
         "javascript",
+        "network_url",
         "network_hostname",
         "dns_record",
         "tls_issuer",
@@ -259,6 +260,7 @@
                   "header",
                   "meta",
                   "script_url",
+                  "network_url",
                   "network_hostname",
                   "dns_record",
                   "tls_issuer"
@@ -432,7 +434,7 @@
           "if": {
             "properties": {
               "source": {
-                "enum": ["dom", "javascript", "network_hostname"]
+                "enum": ["dom", "javascript", "network_url", "network_hostname"]
               }
             },
             "required": ["source"]
@@ -738,6 +740,7 @@
             "script_content",
             "dom",
             "javascript",
+            "network_url",
             "network_hostname",
             "dns_record",
             "tls_issuer",

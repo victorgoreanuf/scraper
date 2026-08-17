@@ -24,6 +24,7 @@ import type {
 } from "../src/detect/pool.ts";
 import {
   validateDomainResult,
+  type BrowserPageObservations,
   type Category,
   type DomainResult,
   type HttpEntryResult,
@@ -144,8 +145,8 @@ function catalog(
     rules,
     indexes: [],
     inspectionPlan: {
-      domSelectors: [],
-      javascriptPaths: [],
+      dom: [],
+      javascript: [],
       probePaths: [],
     },
     declarationCount: rules.length,
@@ -396,6 +397,265 @@ test("maps, normalizes, deduplicates, and ranks only supported HTTP candidates",
     observed.map((item) => item.id),
     [...observed.map((item) => item.id)].sort(),
   );
+});
+
+test("merges browser observations once and preserves every evidence page", async () => {
+  const domLocator = JSON.stringify(["#app", "exists", null]);
+  const rules = [
+    rule(1, "Rendered stack", {
+      source: "dom",
+      locator: domLocator,
+      pattern: null,
+      matchMode: "presence",
+      confidence: 25,
+    }),
+    rule(2, "Rendered stack", {
+      source: "javascript",
+      locator: "App.version",
+      pattern: "1\\.2\\.3",
+      confidence: 25,
+      versionTemplate: "\\1",
+    }),
+    rule(3, "Rendered stack", {
+      source: "script_url",
+      locator: null,
+      pattern: "shared\\.js",
+      confidence: 20,
+    }),
+    rule(4, "Rendered API", {
+      source: "network_url",
+      locator: null,
+      pattern: "/umbraco/api/",
+      confidence: 35,
+    }),
+  ];
+  const fingerprintCatalog = catalog(
+    [technology("Rendered API"), technology("Rendered stack")],
+    rules,
+  );
+  const sharedScriptUrl = "https://cdn.vendor.tld/shared.js";
+  const browserPages: readonly BrowserPageObservations[] = [{
+    pageId: "p2",
+    finalUrl: "https://shop.vendor.tld/detail",
+    dom: [{ pageId: "p2", locator: domLocator, fact: { kind: "presence" } }],
+    javascript: [{
+      pageId: "p2",
+      path: "App.version",
+      fact: { kind: "value", value: "1.2.3" },
+    }],
+    cookies: [{ name: "safe-cookie", value: "value" }],
+    networkHostnames: ["cdn.vendor.tld"],
+    scriptUrls: ["https://cdn.vendor.tld/dynamic.js"],
+    scriptBodies: [{
+      pageId: "p2",
+      url: "https://cdn.vendor.tld/dynamic.js",
+      content: "webpack runtime",
+    }],
+    navigationLinks: ["https://shop.vendor.tld/listing"],
+    networkUrls: ["https://api.vendor.tld/umbraco/api/status"],
+    truncated: false,
+  }, {
+    pageId: "p3",
+    finalUrl: "https://shop.vendor.tld/listing",
+    dom: [],
+    javascript: [],
+    cookies: [],
+    networkUrls: [],
+    networkHostnames: [],
+    scriptUrls: [sharedScriptUrl],
+    scriptBodies: [],
+    navigationLinks: [],
+    truncated: false,
+  }];
+  let observed: readonly DetectorCandidate[] = [];
+  const pool = fakePool(fingerprintCatalog, (candidates) => {
+    observed = candidates;
+    const domOrdinal = candidateOrdinal(
+      candidates,
+      (candidate) => candidate.source === "dom" && candidate.key === domLocator,
+    );
+    const javascriptOrdinal = candidateOrdinal(
+      candidates,
+      (candidate) => candidate.source === "javascript"
+        && candidate.key === "App.version",
+    );
+    const sharedOrdinals = candidates
+      .map((candidate, index) => ({ candidate, index }))
+      .filter(({ candidate }) =>
+        candidate.source === "script_url" && candidate.value === sharedScriptUrl)
+      .map(({ index }) => index);
+    const networkUrlOrdinal = candidateOrdinal(
+      candidates,
+      (candidate) => candidate.source === "network_url",
+    );
+    assert.equal(candidates[domOrdinal]?.kind, "presence");
+    assert.equal(candidates[domOrdinal]?.value, "");
+    assert.equal(candidates[javascriptOrdinal]?.kind, "value");
+    assert.equal(sharedOrdinals.length, 2);
+    return emptyMatchResult({
+      matches: [
+        {
+          ruleOrdinal: 0,
+          candidateOrdinal: domOrdinal,
+          index: 0,
+          length: 0,
+          version: null,
+        },
+        {
+          ruleOrdinal: 1,
+          candidateOrdinal: javascriptOrdinal,
+          index: 0,
+          length: 5,
+          version: "1.2.3",
+        },
+        ...sharedOrdinals.map((candidateOrdinal) => ({
+          ruleOrdinal: 2,
+          candidateOrdinal,
+          index: sharedScriptUrl.indexOf("shared.js"),
+          length: "shared.js".length,
+          version: null,
+        })),
+        {
+          ruleOrdinal: 3,
+          candidateOrdinal: networkUrlOrdinal,
+          index: candidates[networkUrlOrdinal]!.value.indexOf("/umbraco/api/"),
+          length: "/umbraco/api/".length,
+          version: null,
+        },
+      ],
+    });
+  });
+  const result = await detectHttp(htmlEntry({
+    resources: [{ kind: "script", url: sharedScriptUrl }],
+  }), {
+    catalog: fingerprintCatalog,
+    pool,
+    config: defaultConfig,
+    browserPages,
+  });
+  const byName = new Map(result.technologies.map((item) => [item.name, item]));
+  const rendered = byName.get("Rendered stack");
+  const renderedApi = byName.get("Rendered API");
+
+  assert.equal(rendered?.name, "Rendered stack");
+  assert.equal(rendered?.confidence, 70);
+  assert.equal(rendered?.version, null);
+  assert.deepEqual(rendered?.pageIds, ["p1", "p2", "p3"]);
+  assert.deepEqual(renderedApi?.pageIds, ["p2"]);
+  assert.deepEqual(renderedApi?.evidence[0], {
+    collector: "browser",
+    source: "network_url",
+    pageId: "p2",
+    key: null,
+    match: {
+      kind: "value",
+      value: "https://api.vendor.tld/umbraco/api/status",
+      truncated: false,
+    },
+    ruleId: hashId(4),
+    pattern: "/umbraco/api/",
+    confidence: 35,
+    version: null,
+  });
+  assert.deepEqual(
+    rendered?.evidence.map((item) => [item.collector, item.pageId, item.source]),
+    [
+      ["http", "p1", "script_url"],
+      ["browser", "p3", "script_url"],
+      ["browser", "p2", "dom"],
+      ["browser", "p2", "javascript"],
+    ],
+  );
+  assert.equal(
+    observed.some((candidate) => candidate.source === "script_content"),
+    true,
+  );
+  assert.equal(
+    observed.some((candidate) => candidate.source === "network_url"),
+    true,
+  );
+  assert.equal(
+    observed.some((candidate) => candidate.source === "network_hostname"),
+    true,
+  );
+  assert.deepEqual(
+    [...new Set(observed.map((candidate) =>
+      (candidate as DetectorCandidate & { readonly collector: string }).collector))],
+    ["http", "browser"],
+  );
+  assert.equal(result.completed, true);
+  assert.deepEqual(result.errors, []);
+
+  const configDigest = computeConfigDigest(defaultConfig);
+  const domainResult: DomainResult = {
+    schemaVersion: 1,
+    runId: "37937a78-f39d-49ed-a51d-6d398ae45a20",
+    domain: "shop.vendor.tld",
+    scannedAt: "2026-08-17T00:00:00.000Z",
+    status: "success",
+    finalUrl: "https://shop.vendor.tld/",
+    scanMode: "full",
+    pages: [{
+      id: "p1",
+      role: "entry",
+      url: "https://shop.vendor.tld/",
+      httpStatus: 200,
+      collectors: ["http", "browser"],
+    }, {
+      id: "p2",
+      role: "detail",
+      url: "https://shop.vendor.tld/detail",
+      httpStatus: 200,
+      collectors: ["http", "browser"],
+    }, {
+      id: "p3",
+      role: "listing",
+      url: "https://shop.vendor.tld/listing",
+      httpStatus: 200,
+      collectors: ["http", "browser"],
+    }],
+    technologies: result.technologies,
+    errors: [],
+    timings: {
+      totalMs: 1,
+      targetMs: 0,
+      robotsMs: 0,
+      httpMs: 0,
+      dnsMs: 0,
+      tlsMs: 0,
+      browserMs: 0,
+      detectMs: 0,
+    },
+    usage: {
+      httpRequests: 3,
+      browserRequests: 3,
+      retries: 0,
+      pagesVisited: 3,
+      probesIssued: 0,
+      scriptBodiesInspected: 1,
+      staticTransferredBytes: 1,
+      browserTransferredBytes: 1,
+    },
+    provenance: {
+      scannerVersion: "0.1.0",
+      runtime: {
+        node: "24.19.0",
+        playwright: "1.62.1",
+        chromiumRevision: "chromium-fixture",
+      },
+      catalog: {
+        source: fingerprintCatalog.source,
+        revision: fingerprintCatalog.revision,
+        digest: fingerprintCatalog.digest,
+      },
+      configDigest,
+    },
+  };
+  assert.equal(validateDomainResult(domainResult, {
+    scanConfig: defaultConfig,
+    expectedConfigDigest: configDigest,
+    signalAdmitted: result.signalAdmitted,
+  }), domainResult);
 });
 
 test("links HTML evidence to p1 and non-HTML and robots evidence to no page", async () => {

@@ -1,9 +1,12 @@
 import type { ScanConfig } from "../config.ts";
 import {
   EVIDENCE_SOURCES,
+  PAGE_IDS,
   createEvidenceVersion,
   createEvidenceValueMatch,
   sanitizeEvidenceKey,
+  type BrowserPageObservations,
+  type Collector,
   type Evidence,
   type EvidenceSource,
   type HttpEntryResult,
@@ -26,6 +29,7 @@ export interface DetectHttpContext {
   readonly catalog: CompiledFingerprintCatalog;
   readonly pool: DetectorPool;
   readonly config: ScanConfig;
+  readonly browserPages?: readonly BrowserPageObservations[];
   readonly signal?: AbortSignal;
 }
 
@@ -37,14 +41,17 @@ export interface DetectHttpResult {
 }
 
 interface CandidateDraft {
+  readonly collector: "http" | "browser";
+  readonly kind: "presence" | "value";
   readonly source: EvidenceSource;
-  readonly pageId: "p1" | null;
+  readonly pageId: PageId | null;
   readonly key: string | null;
   readonly value: string;
 }
 
-interface HttpDetectorCandidate extends DetectorCandidate {
-  readonly pageId: "p1" | null;
+interface CollectedDetectorCandidate extends DetectorCandidate {
+  readonly collector: "http" | "browser";
+  readonly pageId: PageId | null;
 }
 
 interface DirectDetection {
@@ -95,6 +102,11 @@ interface ImplicationQueueItem {
 const sourceRank = new Map<EvidenceSource, number>(
   EVIDENCE_SOURCES.map((source, index) => [source, index]),
 );
+const collectorRank = new Map<Collector, number>(
+  (["http", "browser", "dns", "tls"] as const).map(
+    (collector, index) => [collector, index],
+  ),
+);
 
 function compareString(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
@@ -111,7 +123,9 @@ function compareNullableString(
 }
 
 function compareEvidence(left: Evidence, right: Evidence): number {
-  return (sourceRank.get(left.source) ?? Number.MAX_SAFE_INTEGER)
+  return (collectorRank.get(left.collector) ?? Number.MAX_SAFE_INTEGER)
+      - (collectorRank.get(right.collector) ?? Number.MAX_SAFE_INTEGER)
+    || (sourceRank.get(left.source) ?? Number.MAX_SAFE_INTEGER)
       - (sourceRank.get(right.source) ?? Number.MAX_SAFE_INTEGER)
     || compareNullableString(left.pageId, right.pageId)
     || compareNullableString(left.key, right.key)
@@ -174,7 +188,10 @@ function detectorProtocolError(catalog: CompiledFingerprintCatalog): ScanError {
 }
 
 function compareCandidateDraft(left: CandidateDraft, right: CandidateDraft): number {
-  return (sourceRank.get(left.source) ?? Number.MAX_SAFE_INTEGER)
+  return (collectorRank.get(left.collector) ?? Number.MAX_SAFE_INTEGER)
+      - (collectorRank.get(right.collector) ?? Number.MAX_SAFE_INTEGER)
+    || compareString(left.kind, right.kind)
+    || (sourceRank.get(left.source) ?? Number.MAX_SAFE_INTEGER)
       - (sourceRank.get(right.source) ?? Number.MAX_SAFE_INTEGER)
     || compareNullableString(left.pageId, right.pageId)
     || compareNullableString(left.key, right.key)
@@ -183,7 +200,8 @@ function compareCandidateDraft(left: CandidateDraft, right: CandidateDraft): num
 
 function candidateIdentity(candidate: CandidateDraft): string {
   return JSON.stringify([
-    "http",
+    candidate.collector,
+    candidate.kind,
     candidate.source,
     candidate.pageId,
     candidate.key,
@@ -193,39 +211,42 @@ function candidateIdentity(candidate: CandidateDraft): string {
 
 function collectCandidates(
   input: HttpEntryResult,
+  browserPages: readonly BrowserPageObservations[],
   config: ScanConfig,
-): readonly HttpDetectorCandidate[] {
+): readonly CollectedDetectorCandidate[] {
   const candidates: CandidateDraft[] = [];
   const add = (
+    collector: "http" | "browser",
+    kind: "presence" | "value",
     source: EvidenceSource,
-    pageId: "p1" | null,
+    pageId: PageId | null,
     key: string | null,
     value: string,
   ): void => {
-    candidates.push({ source, pageId, key, value });
+    candidates.push({ collector, kind, source, pageId, key, value });
   };
   const response = input.kind === "html" ? input.page.response : input.response;
 
   if (response !== null) {
     const pageId = input.kind === "html" ? "p1" : null;
-    add("url", pageId, null, response.finalNetworkUrl);
+    add("http", "value", "url", pageId, null, response.finalNetworkUrl);
     for (const redirect of response.redirects) {
-      add("url", pageId, null, redirect.fromUrl);
-      add("url", pageId, null, redirect.toUrl);
+      add("http", "value", "url", pageId, null, redirect.fromUrl);
+      add("http", "value", "url", pageId, null, redirect.toUrl);
     }
     for (const header of response.headers) {
-      add("header", pageId, header.name.toLowerCase(), header.value);
+      add("http", "value", "header", pageId, header.name.toLowerCase(), header.value);
     }
     for (const cookie of response.cookies) {
-      add("cookie", pageId, cookie.name, cookie.value);
+      add("http", "value", "cookie", pageId, cookie.name, cookie.value);
     }
   }
 
   if (input.kind === "html") {
-    add("html", "p1", null, input.page.html);
-    add("text", "p1", null, input.page.text);
+    add("http", "value", "html", "p1", null, input.page.html);
+    add("http", "value", "text", "p1", null, input.page.text);
     for (const item of input.page.metadata) {
-      add("meta", "p1", item.key.toLowerCase(), item.value);
+      add("http", "value", "meta", "p1", item.key.toLowerCase(), item.value);
     }
     const scriptUrls = [...new Set(
       input.page.resources
@@ -233,12 +254,51 @@ function collectCandidates(
         .map((resource) => resource.url),
     )].sort(compareString).slice(0, config.limits.scripts.urlCandidatesPerDomain);
     for (const url of scriptUrls) {
-      add("script_url", "p1", "src", url);
+      add("http", "value", "script_url", "p1", "src", url);
     }
   }
 
   for (const robots of input.robots) {
-    add("robots", null, null, robots.text);
+    add("http", "value", "robots", null, null, robots.text);
+  }
+
+  for (const page of browserPages) {
+    add("browser", "value", "url", page.pageId, null, page.finalUrl);
+    for (const observation of page.dom) {
+      add(
+        "browser",
+        observation.fact.kind,
+        "dom",
+        observation.pageId,
+        observation.locator,
+        observation.fact.kind === "value" ? observation.fact.value : "",
+      );
+    }
+    for (const observation of page.javascript) {
+      add(
+        "browser",
+        observation.fact.kind,
+        "javascript",
+        observation.pageId,
+        observation.path,
+        observation.fact.kind === "value" ? observation.fact.value : "",
+      );
+    }
+    for (const cookie of page.cookies) {
+      add("browser", "value", "cookie", page.pageId, cookie.name, cookie.value);
+    }
+    for (const url of page.networkUrls) {
+      add("browser", "value", "network_url", page.pageId, null, url);
+    }
+    for (const hostname of page.networkHostnames) {
+      add("browser", "value", "network_hostname", page.pageId, "host", hostname);
+    }
+    for (const url of page.scriptUrls) {
+      add("browser", "value", "script_url", page.pageId, "src", url);
+    }
+    for (const script of page.scriptBodies) {
+      add("browser", "value", "script_content", script.pageId, null, script.content);
+    }
   }
 
   const unique = new Map<string, CandidateDraft>();
@@ -250,6 +310,8 @@ function collectCandidates(
     .sort(compareCandidateDraft)
     .map((candidate, index) => Object.freeze({
       id: `c${String(index).padStart(8, "0")}`,
+      collector: candidate.collector,
+      kind: candidate.kind,
       source: candidate.source,
       pageId: candidate.pageId,
       key: candidate.key,
@@ -259,7 +321,7 @@ function collectCandidates(
 
 function evidenceFromMatch(
   match: WorkerMatch,
-  candidates: readonly HttpDetectorCandidate[],
+  candidates: readonly CollectedDetectorCandidate[],
   catalog: CompiledFingerprintCatalog,
   config: ScanConfig,
 ): Evidence | null {
@@ -285,7 +347,7 @@ function evidenceFromMatch(
 
   if (rule.matchMode === "presence") {
     return Object.freeze({
-      collector: "http",
+      collector: candidate.collector,
       source: rule.source,
       pageId: candidate.pageId,
       key: evidenceKey,
@@ -312,7 +374,7 @@ function evidenceFromMatch(
     scanConfig: config,
   });
   return Object.freeze({
-    collector: "http",
+    collector: candidate.collector,
     source: rule.source,
     pageId: candidate.pageId,
     key: evidenceKey,
@@ -1075,7 +1137,11 @@ export async function detectHttp(
   if (context.pool.catalog !== context.catalog) {
     throw new TypeError("Detector pool and catalog must share the same instance");
   }
-  const candidates = collectCandidates(input, context.config);
+  const candidates = collectCandidates(
+    input,
+    context.browserPages ?? [],
+    context.config,
+  );
   if (candidates.length === 0) {
     return Object.freeze({
       technologies: Object.freeze([]),
@@ -1132,7 +1198,8 @@ export async function detectHttp(
       confidence: directConfidence(frozenEvidence),
       version: directVersion(frozenEvidence),
       pageIds: Object.freeze(
-        evidence.some((item) => item.pageId === "p1") ? ["p1"] : [],
+        PAGE_IDS.filter((pageId) =>
+          evidence.some((item) => item.pageId === pageId)),
       ),
     });
   }

@@ -53,6 +53,9 @@
   `ScanConfig`; configurația comportamentală folosește digest JCS + SHA-256.
 - Domeniile sunt programate în ordinea Parquet, dar liniile JSONL sunt scrise în
   ordinea finalizării; ordinea globală nu face parte din contract.
+- Colectorul browser folosește un pool FIFO bounded de procese Chromium
+  reutilizabile, fiecare cu proxy validant propriu, preflight canary obligatoriu
+  și cel mult o înlocuire după pierderea procesului.
 
 ## Structura proiectului
 
@@ -95,6 +98,8 @@ schemas/
 
 test/
 ├── fixtures/
+├── browser-proxy.test.ts
+├── browser.test.ts
 ├── toolchain.test.ts
 ├── domain-result-schema.test.ts
 └── scan-config-schema.test.ts
@@ -126,7 +131,7 @@ tehnologii + dovezi sanitizate
 JSONL incremental + summary
 ```
 
-Scanarea HTTP va colecta:
+Scanarea HTTP colectează:
 
 - URL-ul final și redirect-urile;
 - headerele;
@@ -135,12 +140,13 @@ Scanarea HTTP va colecta:
 - HTML și meta tags;
 - scripturi și alte resurse externe.
 
-Browserul va colecta:
+Browserul colectează:
 
 - numai faptele DOM cerute de planul validat al catalogului, fără serializarea
-  sau enumerarea întregului DOM;
+  întregului DOM sau returnarea unei enumerări a acestuia;
 - proprietăți JavaScript cunoscute;
-- request-uri făcute de pagină;
+- URL-uri bounded ale requesturilor făcute de pagină și hostname-uri publice
+  canonice, în canale separate;
 - semnale randate care nu apar în răspunsul HTML inițial și pot fi interpretate ulterior de detector.
 
 Fetch-ul `robots.txt` nu este el însuși condiționat de robots. Înaintea fiecărui
@@ -344,19 +350,67 @@ sunt fixe. Slotul `detail` rămâne gol dacă nu are candidat; numai slotul
 facem crawl recursiv și nu ghicim pathuri. Maximum cinci probe declarative
 validate rămân în afara numărului de pagini.
 
-În `full`, fiecare pagină HTML 2xx eligibilă primește HTTP și browser. Folosim un
-context Chromium nepersistent per domeniu, maximum o pagină activă, sandbox și
-CSP active, service workers și downloads dezactivate și fără clickuri, formulare
-sau autentificare. Metodele mutabile și WebSocket sunt observate ca tentative,
-apoi blocate. Tot traficul browserului trece fără bypass prin proxy-ul local
-validant al proiectului; acesta rezolvă și validează destinația efectivă și
-deține bugetele. Un canary de startup trebuie să demonstreze că o destinație
-nepublică nu primește conexiunea, iar producția adaugă și restricții egress la
-nivel de host/container. Interceptionarea Playwright singură nu este considerată
-protecție SSRF.
-Această acoperire este justificată de snapshotul ales: 785 tehnologii au reguli
-pentru script content, 1.609 pentru DOM, 3.326 pentru JavaScript și 109 pentru
-requesturi XHR; benchmarkul ne va spune cât lift real aduce fiecare sursă.
+În `full`, fiecare pagină HTML 2xx eligibilă primește HTTP și browser.
+`crawl/browser.ts` implementează un pool FIFO cu un proxy protejat și un proces
+Chromium reutilizabil per slot `fullScans` (trei implicit). Toate sloturile trec
+preflight înaintea domeniilor; runtime identity fixează Playwright `1.62.1`,
+revizia Chromium `1234` și aceeași versiune raportată de fiecare proces. Un
+proces pierdut primește maximum o înlocuire; pool-ul continuă degradat cât timp
+mai există un slot sănătos și devine indisponibil fără spawn loop când le pierde
+pe toate.
+
+Fiecare domeniu primește un context Chromium nepersistent, reutilizat secvențial
+pentru `p1`–`p3`, cu maximum o pagină activă și exact același origin. Sandboxul
+și CSP rămân active, service workers și downloads sunt dezactivate și nu există
+clickuri, formulare sau autentificare. Planul generic de inspecție este compilat
+din catalog, are tipurile comune deținute de `src/model.ts` și cere numai fapte
+DOM și pathuri JavaScript bounded; `crawl` nu importă `detect`, nu emite o
+enumerare a DOM-ului și nu enumeră `window` complet.
+
+Metodele mutabile și WebSocket sunt observate ca tentative, apoi blocate.
+Playwright routing decide și numără requesturile inițiale. Pentru redirecturile
+automate, un gate CDP `Fetch` oprește atât response stage, cât și următorul
+request stage: validează `Location`, URL-ul, metoda, resursa, loop/depth, originul
+top-level și decizia robots sincronă exact `true`, apoi corelează
+`redirectedRequestId` înainte să numere și să autorizeze hopul o singură dată.
+Orice rezultat robots Promise/non-boolean sau corelare invalidă eșuează înainte
+ca targetul redirectat să ajungă în rețea. Același response-stage gate permite
+body-ul documentului root numai pentru un răspuns exact 2xx HTML/XHTML; denial
+și non-HTML sunt oprite înainte de executarea scripturilor. După admiterea
+documentului, navigările top-level noi rămân blocate pe durata settle/inspection.
+
+Tot traficul browserului trece fără bypass de destinație prin proxy-ul local
+validant al proiectului; acesta rezolvă toate răspunsurile, respinge adresele
+mixte/nepublice, pin-uiește conexiunea 80/443 și verifică peer-ul. Pentru HTTP,
+fiecare request admis primește un grant consumabil o singură dată. Pentru HTTPS,
+tunelul TLS este opac: Playwright/CDP deține admiterea și contorul logic per
+request, iar proxy-ul autorizează authority-ul CONNECT, aplică egress și numără
+bytes criptate downstream. Interceptionarea Playwright/CDP rămâne strat de
+politică, nu boundary-ul SSRF.
+
+Fiecare slot trece un canary de startup cu hostname sintetic mapat la un listener
+loopback atât prin regula resolverului Chromium, cât și prin resolverul canary al
+proxy-ului. Proxy-ul trebuie să înregistreze respingerea adresei nepublice, iar
+listenerul trebuie să primească zero conexiuni. Producția adaugă și restricții
+egress la nivel de host/container.
+
+Script bodies provin numai din răspunsurile deja descărcate de browser, maximum
+20, selectate determinist după `pageId`, apoi same-origin înainte de
+cross-origin, apoi URL. Requesturile HTTP(S) produc separat URL-uri canonice
+bounded (`network_url`) și hostname-uri publicabile (`network_hostname`). Cele
+113 reguli upstream `xhr` se aplică URL-ului complet păstrat numai în memorie,
+nu doar hostname-ului: 16 cer path sau query. Dovada publică numai forma URL
+sanitizată/redactată. Această acoperire este justificată de snapshotul ales: 785
+tehnologii au reguli pentru script content, 1.609 pentru DOM, 3.326 pentru
+JavaScript și 109 tehnologii au reguli XHR; benchmarkul ne va spune cât lift
+real aduce fiecare sursă.
+
+Testele `browser-proxy.test.ts` folosesc servere și hookuri locale controlate
+pentru grants HTTP consumabile, CONNECT, DNS mixt/nepublic, peer mismatch,
+cleanup, limite și canary zero-hit. `browser.test.ts` verifică opțiunile sigure,
+preflightul de slot, coada FIFO, paginile ordonate, gate-ul robots/CDP,
+rankingul top-20, replacement/cleanup și o pagină reală Chromium care trece
+numai prin proxy-ul protejat. CI nu depinde de website-uri publice.
 
 Bugetele exacte și failure semantics sunt contractul unic din secțiunile
 [`Initial scan policy`](README.md#initial-scan-policy) și
@@ -558,9 +612,10 @@ Cele cinci dependențe runtime au câte o singură responsabilitate:
   rămâne obligatorie, deoarece schema upstream nu restrânge suficient toate
   câmpurile;
 - `playwright@1.62.1` colectează semnalele care apar numai după randare. Este
-  dependență runtime, nu `@playwright/test`; instalăm explicit doar Chromium în
-  etapa de setup și păstrăm sandboxul activ. Binarele browserului nu intră în
-  Git și vor avea licențele/notificările lor păstrate dacă le distribuim.
+  dependență runtime, nu `@playwright/test`; Chromium revision `1234` a fost
+  provisionat explicit, separat de npm lifecycle, iar sandboxul rămâne activ.
+  Binarele browserului nu intră în Git și vor avea licențele/notificările lor
+  păstrate dacă le distribuim.
 
 Pentru dezvoltare folosim numai `typescript@7.0.2` și
 `@types/node@24.13.3`. Nu adăugăm `tsx`, `ts-node`, Jest, Vitest, ESLint,
@@ -579,8 +634,10 @@ instalare, licențele și advisories: fiecare intrare registry are integrity,
 licențele declarate în arbore sunt MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause
 sau ISC, iar npm a raportat zero vulnerabilități cunoscute la 2026-08-17.
 Instalarea inițială a rulat cu lifecycle scripts dezactivate. Playwright 1.62.1
-nu are install script și Chromium nu a fost descărcat; instalarea browserului
-rămâne un pas ulterior explicit.
+nu are install script; Chromium a fost provisionat ulterior prin comanda
+explicită `fnm exec --using 24.19.0 node_modules/.bin/playwright install
+chromium`. Revizia potrivită este `1234` (Chrome for Testing `151.0.7922.34`),
+rămâne în cache-ul local Playwright și nu modifică manifestul sau lockfile-ul.
 
 Nu adăugăm `safe-regex`, RE2 sau o alternativă. Workerii nativi terminabili și
 limitele acceptate mai sus păstrează semantica catalogului și opresc o expresie
@@ -623,16 +680,21 @@ worker și incluse în bugetul regex. Rule ID-urile folosesc namespace-uri
 versionate stabile, fără commit, în timp ce provenance păstrează separat
 revizia și digestul snapshotului.
 
-Detectorul HTTP static admite numai observațiile deja limitate ale collectorului:
-URL-ul final și redirecturile, headerele, cookie-urile, HTML-ul, textul vizibil,
-metadata, URL-urile resurselor script și robots. Nu reinterpretăm statusuri,
-stylesheet-uri, imagini, iframe-uri, linkuri sau navigation links ca semnale v1.
-Matchingul regex rulează pe valoarea raw bounded în worker; parentul primește
-doar spanul și versiunea sigură și construiește dovada prin sanitizerul comun.
-URL-urile se publică numai integral și canonic, header/meta publică doar matchul
-după clasificarea întregii observații, iar cookie/HTML/text/robots rămân
-redacted. Confidence și version se calculează din rule ID-uri unice, apoi se
-aplică fixed point-ul relațiilor și excluderile deterministe deja decise.
+Detectorul admite numai observațiile deja limitate ale collectorilor HTTP și
+browser: URL final/redirecturi, headere, cookie-uri, HTML, text, metadata,
+script URLs, robots, fapte DOM/JavaScript cerute de plan, script bodies și
+request URLs. Regulile upstream `xhr` folosesc `network_url`; canalul separat
+`network_hostname` nu este prezentat drept acoperire XHR completă. Nu
+reinterpretăm statusuri, stylesheet-uri, imagini, iframe-uri, linkuri sau
+navigation links ca semnale v1. Matchingul regex rulează pe valoarea raw bounded
+în worker; parentul primește doar spanul și versiunea sigură și construiește
+dovada prin sanitizerul comun. URL-urile se publică numai integral, canonic și
+sanitizat; header/meta publică doar matchul după clasificarea întregii
+observații, iar cookie/HTML/text/robots/DOM/JavaScript/script content rămân
+redacted. Candidații HTTP au prioritate înaintea tierului browser când bugetul
+admite doar un prefix. Confidence și version se calculează din rule ID-uri
+unice, apoi se aplică fixed point-ul relațiilor și excluderile deterministe deja
+decise.
 
 ## Ce trebuie măsurat
 

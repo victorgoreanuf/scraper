@@ -43,7 +43,7 @@ function testConfig(overrides: DetectorOverrides = {}): ScanConfig {
   const { evidencePerDomain, ...detectorOverrides } = overrides;
   Object.assign(config.limits.detector, {
     workers: 1,
-    compileWatchdogMs: 1_000,
+    compileWatchdogMs: 5_000,
     ruleWatchdogMs: 20,
     watchdogPollMs: 5,
     activeMsPerDomain: 1_000,
@@ -93,8 +93,8 @@ function testCatalog(inputs: readonly RuleInput[]): CompiledFingerprintCatalog {
       patternLocatorRuleOrdinals: [],
     }],
     inspectionPlan: {
-      domSelectors: [],
-      javascriptPaths: [],
+      dom: [],
+      javascript: [],
       probePaths: [],
     },
     declarationCount: rules.length,
@@ -110,6 +110,7 @@ function testCatalog(inputs: readonly RuleInput[]): CompiledFingerprintCatalog {
 function candidate(value: string): DetectorCandidate {
   return {
     id: "0001",
+    kind: "value",
     source: "html",
     key: null,
     value,
@@ -717,6 +718,29 @@ test("last worker failure rejects queued work and latches the whole pool unavail
     assert.deepEqual(later.errors.map((error) => error.code), [
       "DETECTOR_UNAVAILABLE",
     ]);
+  } finally {
+    await pool.close();
+  }
+});
+
+test("presence candidates cannot satisfy literal or regex value rules", async () => {
+  const pool = await createDetectorPool(
+    testCatalog([
+      { pattern: null, matchMode: "presence" },
+      { pattern: "", matchMode: "literal" },
+      { pattern: "$", matchMode: "regex" },
+    ]),
+    testConfig(),
+  );
+
+  try {
+    const result = await pool.match([{
+      ...candidate(""),
+      kind: "presence",
+    }]);
+
+    assert.deepEqual(result.matches.map((item) => item.ruleOrdinal), [0]);
+    assert.equal(result.completed, true);
   } finally {
     await pool.close();
   }
