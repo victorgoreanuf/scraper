@@ -113,6 +113,7 @@ const canonicalConfig: JsonRecord = {
       topLevelPerDomain: 3,
       catalogProbesPerDomain: 5,
       extractedUrlsPerPage: 5_000,
+      metadataPerPage: 5_000,
       visibleTextBytesPerPage: 524_288,
     },
     scripts: {
@@ -384,6 +385,7 @@ test("rejects Parquet and representative scan limits above their v1 caps", () =>
     [["limits", "hostname", "inputCodeUnits"], 2_049],
     [["limits", "http", "transactionsPerDomain"], 41],
     [["limits", "pages", "topLevelPerDomain"], 4],
+    [["limits", "pages", "metadataPerPage"], 5_001],
     [["limits", "browser", "transferBytesPerDomain"], 31_457_281],
     [["limits", "detector", "workers"], 3],
     [["limits", "detector", "technologyNameCodePoints"], 257],

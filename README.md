@@ -422,7 +422,83 @@ and redirect destination is revalidated by the shared SSRF policy. A chain may
 contain at most five redirects, and a cross-origin redirect must pass the new
 origin's robots policy before the next top-level request.
 
-`401`, `403`, `407`, `451`, a CAPTCHA, or another explicit block is permanent:
+### Static HTTP collector v1
+
+`crawl/http.ts` receives the immutable configuration, the domain's protected
+transport session, and the run-scoped robots service. The session exposes its
+effective read-only abort signal, which combines the configured active-domain
+deadline with caller cancellation; retry waits, decode, and extraction use that
+same signal. The collector owns deterministic entry-target candidates, page
+redirects, one transient retry, content admission, and static extraction. It
+neither creates nor closes the session. This slice collects only `p1`; internal
+page classification waits until the later browser collector can contribute its
+rendered links.
+
+Robots is evaluated before every candidate request, retry, and page redirect
+destination. A denial or unavailable policy stops target resolution;
+an alias is never used to evade it. Only 301, 302, 303, 307, and 308 redirect,
+with exactly one valid `Location`, at most five hops, and no loop. Any other 3xx
+or a redirect without `Location` is `TARGET_REDIRECT_INVALID`. Access-denial
+statuses 401, 403, 407, and 451 stop without an alias. Status 429 receives at
+most one retry and then becomes access denied; 408, 425, 5xx, and retryable
+transport failures receive at most one retry and then move to the next
+candidate. Other 4xx responses move directly to the next candidate. Permanent
+TLS, SSRF, target-policy, and hard-limit failures stop. Retry uses the same URL,
+fresh protected transaction, `isRetry: true`, and an abortable fixed 100 ms
+backoff. A single valid `Retry-After` delta-seconds or canonical IMF-fixdate on
+429 is honored between 100 ms and the configured two-second cap; an absent,
+invalid, or duplicate value uses 100 ms. There is no jitter in deterministic
+CLI v1.
+
+A response body is admitted as HTML only when there is exactly one syntactically
+valid `Content-Type` whose ASCII-case-insensitive essence is `text/html` or
+`application/xhtml+xml`. Parameters are supported; the first syntactically
+valid `charset` is forwarded to Cheerio, where a recognized WHATWG label wins
+and an unknown label permits BOM/meta/default detection. Missing, duplicate,
+malformed, and other media types, plus 204 and 205, are terminal non-HTML
+results. MIME is never inferred from body bytes.
+
+Cheerio 1.2 `decodeStream()` receives only the already bounded transport body
+and produces the DOM. The pinned implementation is also a Transform that emits
+the same decoded source sent to its parser; a regression test guards this exact
+version-specific behavior, and an upgrade must revalidate it. `fromURL()` is
+forbidden. This keeps the decoded HTML observation without another decoder or
+dependency while making the compatibility boundary explicit.
+
+Only a selected final 2xx response contributes headers and cookies. Redirects
+contribute only canonical from/to URLs and status, and observations from soft
+candidate failures are discarded. Bounded robots text from the selected or a
+terminal candidate remains eligible as a signal; soft-candidate robots text is
+discarded. Raw observations are immutable and memory-only; sanitization and
+evidence redaction happen after matching. `Set-Cookie` extraction uses the first
+cookie-pair, a valid token name, and a valid quoted or unquoted cookie value.
+Duplicates remain ordered. The count, name, value, and cumulative byte limits
+retain a strict accepted prefix and mark it truncated on first overflow; the
+cumulative total is UTF-8 bytes of admitted names plus values.
+
+Static DOM extraction is deliberately exact: meta `name` plus `content`, or
+`property` only when `name` is absent/empty; `script[src]`; `link[href]` split
+into stylesheet or other link by the `rel` tokens; `img[src]`; `iframe[src]`;
+and `a[href]` for later page selection. Descendants of inert `template` elements
+do not contribute. Metadata pairs have their own 5,000-item prefix cap. The
+first valid HTTP(S) `base[href]` sets the resolution base. Every observed URL
+passes the shared URL policy,
+loses its fragment, remains unfetched, is deduplicated by channel and canonical
+URL, and shares the 5,000-observation prefix cap. Only final/page/redirect URLs
+map to detector source `url`, and only scripts map to `script_url`; navigation
+and other resource kinds remain distinct observations.
+
+After URL and metadata extraction, `script`, `style`, `noscript`, and
+`template` nodes are removed and body text collapses ASCII HTML whitespace.
+The 512 KiB UTF-8 limit keeps a prefix ending on a Unicode-scalar boundary.
+Cookie, metadata, URL, or text overflow preserves prior bounded observations,
+emits one `HTTP_RESPONSE_LIMIT_EXCEEDED`, and marks the page `truncated`; the
+bounded HTTP collector still completed and the page remains browser-eligible. Body,
+decode, or DOM failure marks it `failed`, keeps already bounded final-response
+signals, emits its stable transport error or non-retryable
+`HTTP_REQUEST_FAILED`, and is not treated as browser-only HTTP success.
+
+`401`, `403`, `407`, `451`, or another explicit status block is permanent:
 the scanner does not retry, open a browser, or try an alias to bypass it.
 `429` receives at most one retry with `Retry-After` capped at two seconds, then
 ends target resolution without an alias. Other non-denial `4xx` responses move
@@ -436,6 +512,9 @@ fallback, and emits terminal `http/UNSUPPORTED_CONTENT_TYPE` with
 `retryable: false`; it is therefore `partial`. HTTP fallback is a separate
 candidate for sites that genuinely serve HTTP, never a TLS validation bypass.
 Every redirect hop and retry consumes the single HTTP transaction budget.
+Version 1 deliberately has no text-based CAPTCHA classifier: a 2xx challenge
+page is collected as bounded HTML rather than guessed from vendor-specific
+phrases.
 
 ### Robots and page selection
 
@@ -461,6 +540,57 @@ shorter of the run or 24 hours and is also made available to the detector as a
 possible fingerprint signal. An explicit homepage disallow ends that candidate
 without trying an alias as an evasion. Robots controls crawler-initiated pages
 and probes; it is not treated as legal authorization.
+
+`crawl/robots.ts` is the implemented run-scoped boundary. Its caller supplies
+the same protected transport session later used for pages and probes, so robots
+requests, redirects, DNS records, bytes, and the active-domain deadline share
+one budget. The service coalesces concurrent misses and caches only successful
+2xx policies or no-rules 4xx outcomes under the canonical owner origin plus
+product token. A rejected fetch is evicted, expiry is exact, and `clear()`
+releases the run cache and its bounded raw text. A robots redirect can fetch a
+different authority, but its body remains a policy only for the original owner;
+the redirect authority requires its own `/robots.txt` lookup when crawled.
+
+The wrapper decodes 2xx bodies with fatal UTF-8, retains the original bounded
+text only as a temporary detector signal, and sends a normalized policy to
+`robots-parser`. It accepts only `User-agent`, `Allow`, and `Disallow` as
+effective directives; unknown, malformed, `Crawl-delay`, `Host`, and `Sitemap`
+lines do not change grouping or crawl behavior. A user-agent product token is
+valid only as `*` or RFC letters, underscore, and hyphen; empty, versioned, or
+otherwise malformed values are ignored. Empty rules and rules beginning with
+`/` are accepted, and v1 also accepts leading `*` for compatibility with the
+RFC example and reported ABNF erratum; other non-empty rule paths are ignored.
+Percent escapes for ASCII unreserved octets are decoded in both rules and
+checked paths, while other escapes are uppercased and remain encoded. Exact
+case-insensitive `WebsiteTechScraper` groups take precedence over `*`, including
+an exact group containing only empty rules or a final exact group with no rule.
+
+Limits are applied before synchronous package matching. Physical lines are
+counted after CRLF/CR/LF splitting, with one terminal line ending not creating
+an extra line. The 500-rule budget counts the real expanded
+`User-agent × Allow/Disallow` associations, including empty rules and duplicate
+agents; the canonical pattern is capped after percent normalization. For a
+checked URL, the wrapper rejects before matching when
+`sum(pattern.length × (path.length + 1))` for the selected group would exceed
+the configured character-state budget. It calls `isAllowed()` exactly once and
+treats the package's unexpected `undefined` result as unavailable.
+
+Version 1 does not retry a failed robots fetch inside this service: `404`, `410`,
+and other non-denial non-transient 4xx responses produce an allow-all no-rules
+policy, while `401`, `403`, `407`, `451`, `408`, `425`, `429`, other 3xx,
+5xx, invalid UTF-8, and unusable content fail closed. Protected transport
+errors retain their original DNS/TLS/SSRF/deadline diagnostics. Local robots
+limits and redirect loops/overflow use `ROBOTS_LIMIT_EXCEEDED`; other local
+policy failures use `ROBOTS_UNAVAILABLE`. A rule denial is the normal
+`allowed: false` decision so entry-page orchestration can record
+`ROBOTS_DISALLOWED`, while internal pages and probes can treat it as an
+intentional skip.
+
+The run cache is deliberately sufficient for the 200-domain challenge but has
+no independent entry/byte cap yet. Before a worker scans an unbounded partition
+at million-domain scale, the configuration must add a measured cache-entry and
+cache-byte limit or a bounded LRU; the current code must not be presented as an
+unbounded production cache.
 
 The scanner visits at most three top-level pages:
 
@@ -986,6 +1116,7 @@ These are starting values, not final performance claims:
 | robots.txt | 512 KiB; 5,000 lines; 500 rules; 512 code units per rule |
 | Robots matching work | 1,000,000 pattern-path character states per checked URL |
 | Extracted link/resource URLs | 5,000 per page |
+| Extracted metadata pairs | 5,000 per page |
 | Extracted visible text | 512 KiB per page |
 | DOM inspection | 5,000 selectors; 1,024 code units each; 20 matches per selector |
 | JavaScript inspection | 10,000 paths; 512 code units each |

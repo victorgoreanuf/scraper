@@ -243,6 +243,79 @@ identity/gzip/deflate/br și limităm streaming bytes wire, decomprimați per bo
 și decomprimați per domeniu. Retry pairing și backoff aparțin orchestratorului;
 transportul păstrează plafonul agregat compatibil cu un retry per request.
 
+## Decizia colectorului HTTP static
+
+`crawl/http.ts` colectează în acest slice numai entry page și primește aceeași
+sesiune protejată și același serviciu robots. Semnalul efectiv read-only expus
+de sesiune combină deadline-ul configurat cu anularea callerului și este folosit
+și pentru backoff/decode/extracție. Colectorul nu creează și nu închide
+transport. Aplică robots înaintea candidatului și a fiecărui redirect, păstrează
+maximum cinci hopuri și un singur retry tranzitoriu cu backoff abortable fix de
+100 ms. Pentru 429, singurul `Retry-After` valid este plafonat la două secunde;
+denial, 3xx unsupported, TLS permanent, SSRF, target invalid și hard limits
+opresc fără alias.
+
+HTML necesită exact un `Content-Type` valid cu essence `text/html` sau
+`application/xhtml+xml`; nu facem MIME sniffing. Cheerio 1.2 `decodeStream()`
+primește exclusiv body-ul deja limitat. Păstrăm DOM-ul și source-ul decodat emis
+de Transform-ul implementării pin-uite, cu test de regresie obligatoriu la
+upgrade; nu folosim `fromURL()` și nu adăugăm încă alt decoder. Numai chainul
+candidatului selectat intră în observații: redirecturile dau URL/status, iar
+headerele și cookies provin doar din finalul 2xx.
+
+Extragem exact meta name/property, script, stylesheet/link, image, iframe,
+navigation links și text static normalizat. Toate URL-urile embedded trec
+politica comună, nu sunt fetch-uite și împart capul de 5.000. Limitele cookie,
+metadata, URL și text păstrează prefixul bounded, emit o singură eroare
+`HTTP_RESPONSE_LIMIT_EXCEEDED` și marchează pagina `truncated`, dar nu blochează
+browserul. Body/decode/DOM failure este starea distinctă `failed` și nu poate fi
+prezentată ca succes HTTP browser-only. Metadata are cap separat de 5.000 și
+descendenții `template` sunt inerți. În acest slice nu există classifier CAPTCHA
+pe text, iar clasificarea/fetch-ul paginilor interne rămân amânate până când
+există și linkurile browserului.
+
+## Decizia implementării robots
+
+`crawl/robots.ts` este un serviciu per run, fără stare globală, iar callerul îi
+dă aceeași sesiune de transport protejat folosită ulterior pentru pagini și
+probe. Cache-ul folosește cheia origin canonical + product token, coalescează
+missurile concurente, păstrează numai politici 2xx și rezultate 4xx fără reguli,
+expiră conform configurației și se golește explicit la final. Erorile nu sunt
+cache-uite. Un redirect cross-authority este fetch-uit protejat, dar textul
+definește politica numai pentru originul inițial.
+
+Body-ul 2xx se decodează UTF-8 strict. Păstrăm temporar textul original bounded
+ca semnal pentru detector, dar parserul primește numai liniile normalizate
+`User-agent`, `Allow` și `Disallow`; celelalte directive nu schimbă comportamentul
+v1 și nu separă grupurile. Acceptăm numai product token RFC (`*`, litere,
+underscore, hyphen), ignorăm tokenuri goale/versionate, iar rule path poate fi
+gol sau începe cu `/`; acceptăm și `*` inițial pentru compatibilitate cu exemplul
+RFC și errata ABNF raportată. Normalizăm escape-urile percent pentru octeții
+ASCII unreserved în reguli și path, fără să decodăm escape-uri rezervate.
+Tokenul exact `WebsiteTechScraper`, case-insensitive, are prioritate față de `*`,
+inclusiv pentru un grup exact gol la final.
+
+Înainte de `robots-parser` aplicăm limite enforceable pentru bytes, linii,
+pattern canonical și lucru de matching. Plafonul de 500 reguli numără
+asocierile efective `User-agent × Allow/Disallow`, inclusiv reguli goale și agenți
+duplicați, ca expansionarea internă a pachetului să rămână bounded. Pentru un
+URL, formula conservativă este suma
+`pattern.length × (path.length + 1)` pe grupul relevant; peste plafon eșuăm
+înaintea apelului sincron. Folosim o singură evaluare `isAllowed()`.
+
+Un disallow este o decizie normală, nu o excepție: entry orchestration îl poate
+materializa ca `ROBOTS_DISALLOWED`, iar paginile interne/probele îl pot trata ca
+skip intenționat. `404`, `410` și celelalte 4xx non-denial/non-transient înseamnă
+fără reguli. Denial, `408`, `425`, `429`, alte 3xx, 5xx, UTF-8 invalid și conținut
+inutilizabil sunt fail-closed. Modulul nu face retry intern în v1; erorile
+transportului păstrează codurile DNS/TLS/SSRF/deadline, iar limitele și
+indisponibilitatea locală folosesc codurile robots stabile.
+
+Cache-ul actual este potrivit benchmarkului cu 200 domenii, dar nu are încă un
+plafon separat de entries/bytes. Înainte ca un worker să primească o partiție
+nebounded la scară de milioane vom adăuga un cap măsurat sau LRU în configurația
+digestată; nu inventăm acum o valoare fără benchmark.
+
 ## Decizia politicii inițiale de scanare
 
 Primul mod implementat este `full`, ca să obținem un baseline bun pe cele 200 de

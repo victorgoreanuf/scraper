@@ -92,6 +92,7 @@ export type ScanConfig = {
       readonly topLevelPerDomain: number;
       readonly catalogProbesPerDomain: number;
       readonly extractedUrlsPerPage: number;
+      readonly metadataPerPage: number;
       readonly visibleTextBytesPerPage: number;
     };
     readonly scripts: {
@@ -405,6 +406,7 @@ export function createDefaultScanConfig(userAgent: string): ScanConfig {
         topLevelPerDomain: 3,
         catalogProbesPerDomain: 5,
         extractedUrlsPerPage: 5_000,
+        metadataPerPage: 5_000,
         visibleTextBytesPerPage: 524_288,
       },
       scripts: {

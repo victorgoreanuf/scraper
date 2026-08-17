@@ -152,6 +152,88 @@ export interface ScanError {
   readonly catalogRevision: string | null;
 }
 
+export interface HttpHeaderObservation {
+  readonly name: string;
+  readonly value: string;
+}
+
+export interface HttpCookieObservation {
+  readonly name: string;
+  readonly value: string;
+}
+
+export interface HttpRedirectObservation {
+  readonly fromUrl: string;
+  readonly statusCode: 301 | 302 | 303 | 307 | 308;
+  readonly toUrl: string;
+}
+
+export interface HttpMetadataObservation {
+  readonly key: string;
+  readonly value: string;
+}
+
+export type HttpResourceKind =
+  | "script"
+  | "stylesheet"
+  | "image"
+  | "iframe"
+  | "link";
+
+export interface HttpResourceObservation {
+  readonly kind: HttpResourceKind;
+  readonly url: string;
+}
+
+export interface HttpRobotsObservation {
+  readonly ownerOrigin: string;
+  readonly fetchedUrl: string;
+  readonly text: string;
+}
+
+export interface HttpResponseObservations {
+  readonly finalNetworkUrl: string;
+  readonly statusCode: number;
+  readonly redirects: readonly HttpRedirectObservation[];
+  readonly headers: readonly HttpHeaderObservation[];
+  readonly cookies: readonly HttpCookieObservation[];
+  readonly cookiesTruncated: boolean;
+}
+
+export interface HttpPageObservations {
+  readonly pageId: "p1";
+  readonly response: HttpResponseObservations;
+  readonly html: string;
+  readonly text: string;
+  readonly textTruncated: boolean;
+  readonly metadata: readonly HttpMetadataObservation[];
+  readonly metadataTruncated: boolean;
+  readonly resources: readonly HttpResourceObservation[];
+  readonly navigationLinks: readonly string[];
+  readonly urlsTruncated: boolean;
+  readonly collectionState: "complete" | "truncated" | "failed";
+}
+
+export type HttpEntryResult =
+  | {
+      readonly kind: "html";
+      readonly page: HttpPageObservations;
+      readonly robots: readonly HttpRobotsObservation[];
+      readonly errors: readonly ScanError[];
+    }
+  | {
+      readonly kind: "non-html";
+      readonly response: HttpResponseObservations;
+      readonly robots: readonly HttpRobotsObservation[];
+      readonly errors: readonly ScanError[];
+    }
+  | {
+      readonly kind: "failed";
+      readonly response: HttpResponseObservations | null;
+      readonly robots: readonly HttpRobotsObservation[];
+      readonly errors: readonly [ScanError];
+    };
+
 export interface Timings {
   readonly totalMs: number;
   readonly targetMs: number | null;

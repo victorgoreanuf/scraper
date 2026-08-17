@@ -170,6 +170,7 @@ export interface ProtectedTransportSessionOptions {
 
 export interface ProtectedTransportSession {
   requestHop(request: ProtectedTransportRequest): Promise<ProtectedTransportResponse>;
+  getSignal(): AbortSignal;
   getUsage(): ProtectedTransportUsage;
   close(): void;
 }
@@ -1065,6 +1066,10 @@ class ProtectedTransportSessionImpl implements ProtectedTransportSession {
       retries: this.retries,
       staticTransferredBytes: this.staticTransferredBytes,
     });
+  }
+
+  getSignal(): AbortSignal {
+    return this.signal;
   }
 
   close(): void {
