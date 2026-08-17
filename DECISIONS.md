@@ -213,6 +213,36 @@ effective, versiunea și regulile complete sunt contractul unic din
 [`Public-address and connection contract`](README.md#public-address-and-connection-contract),
 nu date descărcate la runtime.
 
+## Decizia transportului HTTP protejat
+
+Transportul v1 execută o singură tranzacție `GET` și nu urmărește automat
+redirecturi sau retry-uri. Orchestratorul robots/HTTP decide următorul pas, iar
+fiecare apel repetă validarea URL-ului, rezolvarea DNS completă, verificarea SSRF
+pentru toate răspunsurile, pinning și verificarea peer-ului. Alegem primul IP
+valid în ordinea `verbatim`, deschidem un
+socket nou per tranzacție și păstrăm hostname-ul logic pentru Host, SNI și
+certificat. Nu există keep-alive, proxy implicit sau opțiune de producție care
+poate dezactiva aceste verificări.
+
+Rezervăm bugetul după preflight-ul URL/anulare și înainte de DNS. Rezolvarea are
+un scheduler separat, apoi destinația validată intră în coada HTTP
+global/per-origin. Deadline-ul domeniului include cozile, iar timeoutul absolut
+al requestului acoperă DNS până la trailers. Deoarece `dns.lookup()` nu poate anula operația
+libuv, rezultatele târzii sunt ignorate și un scheduler separat limitează
+lookup-urile rămase în fundal fără să țină sloturile HTTP permanent. Bugetul DNS
+cumulativ numără IP-uri canonice unice, dar fiecare lookup este limitat la 128
+de răspunsuri brute înainte de deduplicare.
+
+Blocul final de headere folosește `maxHeaderSize` nativ și plafonul nostru de
+câmpuri. În v1 respingem orice răspuns informațional și orice trailer nenul,
+deoarece API-ul high-level Node normalizează whitespace-ul și nu mai permite
+reconstrucția exactă a dimensiunii wire cumulative. Body-ul este admis numai după
+status și headere: redirecturile, non-2xx, `204` și `205` sunt distruse, iar
+apelantul poate respinge și un alt 2xx non-HTML. Acceptăm exact o codare dintre
+identity/gzip/deflate/br și limităm streaming bytes wire, decomprimați per body
+și decomprimați per domeniu. Retry pairing și backoff aparțin orchestratorului;
+transportul păstrează plafonul agregat compatibil cu un retry per request.
+
 ## Decizia politicii inițiale de scanare
 
 Primul mod implementat este `full`, ca să obținem un baseline bun pe cele 200 de

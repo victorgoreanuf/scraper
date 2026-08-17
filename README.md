@@ -365,6 +365,57 @@ retry, new socket, and redirect repeats resolution, all-answer validation, and
 pinning. The browser forward proxy uses this same contract. URL interception is
 only an additional policy layer, never the address boundary.
 
+### Protected HTTP transport v1
+
+`crawl/transport.ts` performs exactly one protected `GET` transaction. It does
+not follow redirects or hide retries: the robots and static-HTTP orchestrators
+must inspect the response, apply policy, and explicitly start the next hop or
+attempt. Every such call therefore repeats URL validation, DNS resolution,
+all-answer SSRF validation, connection pinning, and peer verification. For v1,
+the first validated answer in `verbatim` resolver order is selected and every
+transaction uses a fresh socket; there is no implicit DNS lookup, keep-alive,
+proxy environment handling, or multi-address fallback inside Node's client.
+
+After URL and already-aborted-session validation, the transaction is reserved
+before DNS. Resolution uses its own bounded scheduler; a validated destination
+then waits for the global/per-origin HTTP scheduler. This bounds queued work and
+means queued, DNS, SSRF, connect, TLS, header, and body failures still consume
+the 40-transaction domain budget. Retry pairing and backoff remain owned by the
+future orchestrator; the transport rejects a retry before an initial attempt
+and enforces that aggregate retries never exceed the configured one-per-initial
+budget. The active-domain deadline includes queue time. The per-request absolute
+deadline begins after transaction reservation and covers DNS, the HTTP
+scheduler wait, connection, TLS, headers, body, decompression, and trailers;
+slow trickle traffic cannot extend it.
+
+Node's `dns.lookup()` cannot cancel underlying libuv work. A timed-out result is
+ignored and can never open a socket, while a separate scheduler caps unresolved
+lookups at the global HTTP concurrency instead of retaining HTTP slots forever.
+The DNS domain budget counts unique canonical A/AAAA addresses; each lookup is
+also capped at 128 raw answers before deduplication. This is a bounded
+availability tradeoff, not a relaxation of the SSRF policy.
+
+Node's final response-header block is guarded by native `maxHeaderSize` plus the
+project field-count check. V1 rejects every informational response and every
+non-empty trailer block: Node's high-level API normalizes surrounding
+whitespace, so their cumulative wire size cannot be reconstructed exactly after
+parsing. Status and bounded final headers are available before body admission.
+Redirect, non-2xx, `204`, and `205` bodies are discarded, and a caller may also
+reject another 2xx body from its headers, so access denials, retryable statuses,
+and unsupported content types cannot be replaced by a body/decompression error.
+An admitted body accepts only one of `identity`,
+`gzip`, `deflate`, or `br`; wire, per-body decompressed, and per-domain
+decompressed limits are enforced while streaming. `robots.txt` uses its 512 KiB
+limit for both wire and decoded bytes in v1.
+
+Redirect `Location` values are resolved and validated lexically by the
+transport helper, including canonical public IP literals, but are not fetched
+automatically. The next explicit hop performs the authoritative DNS and socket
+checks. Local adversarial tests hook Node's DNS/socket modules only inside the
+test process before loading the production module. The hook lives under
+`test/`, is excluded from `dist`, and the built transport exports no injectable
+resolver, connector, peer metadata, or production option that disables policy.
+
 Top-level requests use `GET`; there is no preliminary `HEAD`. Every DNS answer,
 actual connection destination,
 and redirect destination is revalidated by the shared SSRF policy. A chain may
@@ -376,9 +427,10 @@ the scanner does not retry, open a browser, or try an alias to bypass it.
 `429` receives at most one retry with `Retry-After` capped at two seconds, then
 ends target resolution without an alias. Other non-denial `4xx` responses move
 to the next candidate without retry. `408`, `425`, `5xx`, DNS/connect/timeout,
-and TLS failures receive at most one retry and then move to the next candidate.
-A redirect-policy, SSRF, or invalid-target rejection is permanent for the
-domain. The first final `2xx` response selects the target. A non-HTML response
+and transient TLS transport failures receive at most one retry and then move to
+the next candidate. Certificate-validation and deterministic TLS protocol
+failures are permanent, as are redirect-policy, SSRF, and invalid-target
+rejections. The first final `2xx` response selects the target. A non-HTML response
 retains bounded safe HTTP signals, schedules no page, browser, probe, or alias
 fallback, and emits terminal `http/UNSUPPORTED_CONTENT_TYPE` with
 `retryable: false`; it is therefore `partial`. HTTP fallback is a separate
@@ -1407,7 +1459,9 @@ this decision stage.
 - [x] Implement validated configuration, shared TypeScript data contracts, and
   semantic result validation.
 - [x] Implement Parquet input and target normalization.
-- [ ] Implement the static HTTP collector.
+- [x] Implement the protected single-hop HTTP transport and local adversarial
+  tests.
+- [ ] Implement robots policy and the static HTTP observation collector.
 - [ ] Implement the fingerprint catalog compiler and detector.
 - [ ] Implement the browser collector and browser pool.
 - [ ] Add DNS/TLS signals.
@@ -1437,7 +1491,8 @@ Coding starts only after these decisions are explicit:
    JCS configuration digest, stable error registry, and completion-order JSONL
    semantics (selected).**
 
-The readiness gate and first application-foundation slice are complete. The
-next coding slice is the protected static HTTP transport/collector, including
-redirect, robots, byte-limit, timeout, and connection-pinning behavior. Browser
-automation and fingerprint detection remain separate later slices.
+The readiness gate, application foundation, and protected single-hop HTTP
+transport are complete. The next coding slice is robots policy, followed by the
+static HTTP observation collector that orchestrates candidates, redirect hops,
+retry policy, content admission, and extraction. Browser automation and
+fingerprint detection remain separate later slices.
