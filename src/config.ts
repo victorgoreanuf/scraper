@@ -141,6 +141,10 @@ export type ScanConfig = {
     };
     readonly detector: {
       readonly workers: number;
+      readonly catalogFiles: number;
+      readonly catalogFileBytes: number;
+      readonly catalogBytes: number;
+      readonly catalogJsonDepth: number;
       readonly technologiesPerCatalog: number;
       readonly technologyNameCodePoints: number;
       readonly categoryNameCodePoints: number;
@@ -455,6 +459,10 @@ export function createDefaultScanConfig(userAgent: string): ScanConfig {
       },
       detector: {
         workers: 2,
+        catalogFiles: 64,
+        catalogFileBytes: 1_048_576,
+        catalogBytes: 16_777_216,
+        catalogJsonDepth: 64,
         technologiesPerCatalog: 20_000,
         technologyNameCodePoints: 256,
         categoryNameCodePoints: 128,

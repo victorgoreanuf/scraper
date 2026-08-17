@@ -304,6 +304,24 @@ export interface SanitizationLimits {
   readonly base64UrlTokenMinCodeUnits: number;
 }
 
+export interface EvidenceMatchInput {
+  readonly source: EvidenceSource;
+  readonly key: string | null;
+  readonly observedValue: string;
+  readonly matchedValue: string;
+  readonly scanConfig: ScanConfig;
+}
+
+export interface EvidenceVersionInput {
+  readonly version: string | null;
+  readonly source: EvidenceSource;
+  readonly observedValue: string;
+  readonly matchedValue: string;
+  readonly matchIndex: number;
+  readonly matchLength: number;
+  readonly scanConfig: ScanConfig;
+}
+
 export class DomainResultValidationError extends Error {
   readonly code = "DOMAIN_RESULT_INVALID";
   readonly issues: readonly string[];
@@ -345,7 +363,16 @@ const sensitiveWords = new Set<string>([
   "token",
   "apikey",
 ]);
-const sensitiveHeaderWords = new Set<string>([...sensitiveWords, "key"]);
+const sensitiveHeaderWords = new Set<string>([
+  ...sensitiveWords,
+  "auth",
+  "authenticate",
+  "authentication",
+  "key",
+  "nonce",
+]);
+const credentialSchemePattern =
+  /(?:^|[^A-Za-z0-9_-])(?:basic|bearer|digest|negotiate|ntlm|aws4-hmac-sha256)[\t ]+/iu;
 const sensitivePathMarkers = new Set([
   "auth",
   "code",
@@ -546,6 +573,17 @@ function isSensitiveToken(
     || containsOpaqueToken(value, limits);
 }
 
+function shouldRedactPublicKey(
+  value: string,
+  limits: SanitizationLimits,
+  markers: ReadonlySet<string> = sensitiveWords,
+): boolean {
+  return !hasOnlyUnicodeScalars(value)
+    || value.length > limits.safePathSegmentCodeUnits
+    || containsSensitiveMarker(value, markers)
+    || containsOpaqueToken(value, limits);
+}
+
 function sanitizePath(pathname: string, limits: SanitizationLimits): string {
   const segments = pathname.split("/");
   const decoded = segments.map((segment) => {
@@ -624,7 +662,10 @@ export function sanitizeUrl(
 
     url.search = "";
     for (const key of keys) {
-      url.searchParams.append(key, "[redacted]");
+      const sanitizedKey = shouldRedactPublicKey(key, limits)
+        ? "[redacted]"
+        : key;
+      url.searchParams.append(sanitizedKey, "[redacted]");
     }
   }
 
@@ -635,6 +676,152 @@ export function sanitizeUrl(
   }
 
   return sanitized;
+}
+
+export function sanitizeEvidenceKey(
+  source: EvidenceSource,
+  key: string | null,
+  scanConfig: ScanConfig,
+): string | null {
+  if (
+    key === null
+    || (source !== "cookie" && source !== "header" && source !== "meta")
+  ) {
+    return key;
+  }
+
+  return shouldRedactPublicKey(
+      key,
+      sanitizationLimits(scanConfig),
+      source === "header" ? sensitiveHeaderWords : sensitiveWords,
+    )
+    ? null
+    : key;
+}
+
+function truncateCodePoints(value: string, maximum: number): {
+  readonly value: string;
+  readonly truncated: boolean;
+} {
+  const points = [...value];
+  if (points.length <= maximum) {
+    return { value, truncated: false };
+  }
+  return { value: points.slice(0, maximum).join(""), truncated: true };
+}
+
+export function createEvidenceValueMatch(input: EvidenceMatchInput): EvidenceMatch {
+  const limits = sanitizationLimits(input.scanConfig);
+  const redact = (): EvidenceMatch => ({
+    kind: "redacted",
+    value: null,
+    truncated: false,
+  });
+  let candidate: string;
+
+  if (input.source === "url" || input.source === "script_url") {
+    try {
+      candidate = sanitizeUrl(input.observedValue, limits);
+    } catch {
+      return redact();
+    }
+
+    if ([...candidate].length > input.scanConfig.limits.evidence.matchCodePoints) {
+      return redact();
+    }
+    return { kind: "value", value: candidate, truncated: false };
+  }
+
+  if (input.source === "header") {
+    const key = input.key?.toLowerCase() ?? "";
+    if (
+      containsSensitiveMarker(key, sensitiveHeaderWords)
+      || credentialSchemePattern.test(input.observedValue)
+      || isSensitiveToken(input.observedValue, limits)
+    ) {
+      return redact();
+    }
+    candidate = input.matchedValue;
+  } else if (input.source === "meta") {
+    if (
+      (input.key !== "generator" && input.key !== "application-name")
+      || credentialSchemePattern.test(input.observedValue)
+      || isSensitiveToken(input.observedValue, limits)
+    ) {
+      return redact();
+    }
+    candidate = input.matchedValue;
+  } else if (input.source === "network_hostname") {
+    candidate = input.observedValue;
+  } else if (input.source === "tls_issuer") {
+    if (isSensitiveToken(input.observedValue, limits)) {
+      return redact();
+    }
+    candidate = input.matchedValue;
+  } else {
+    return redact();
+  }
+
+  if (candidate === "" || !hasOnlyUnicodeScalars(candidate)) {
+    return redact();
+  }
+  const bounded = truncateCodePoints(
+    candidate,
+    input.scanConfig.limits.evidence.matchCodePoints,
+  );
+  return {
+    kind: "value",
+    value: bounded.value,
+    truncated: bounded.truncated,
+  };
+}
+
+export function createEvidenceVersion(input: EvidenceVersionInput): SafeVersion {
+  if (
+    input.version === null
+    || !Number.isSafeInteger(input.matchIndex)
+    || !Number.isSafeInteger(input.matchLength)
+    || input.matchIndex < 0
+    || input.matchLength < 0
+    || input.matchIndex + input.matchLength > input.observedValue.length
+    || input.observedValue.slice(
+      input.matchIndex,
+      input.matchIndex + input.matchLength,
+    ) !== input.matchedValue
+    || input.version.length > input.scanConfig.limits.evidence.versionCodeUnits
+    || !/^[A-Za-z0-9][A-Za-z0-9._+~-]{0,63}$/u.test(input.version)
+  ) {
+    return null;
+  }
+  const limits = sanitizationLimits(input.scanConfig);
+  if (input.source === "url" || input.source === "script_url") {
+    let parsed: URL;
+    let sanitized: URL;
+    try {
+      parsed = new URL(input.observedValue);
+      sanitized = new URL(sanitizeUrl(input.observedValue, limits));
+    } catch {
+      return null;
+    }
+    if (
+      parsed.username !== ""
+      || parsed.password !== ""
+      || parsed.pathname !== sanitized.pathname
+      || input.observedValue.includes("?")
+      || input.observedValue.includes("#")
+    ) {
+      return null;
+    }
+  }
+  if (
+    isSensitiveToken(input.version, limits)
+    || credentialSchemePattern.test(input.matchedValue)
+    || containsSensitiveMarker(input.matchedValue)
+    || containsOpaqueToken(input.matchedValue, limits)
+  ) {
+    return null;
+  }
+  return input.version;
 }
 
 function isSanitizedCanonicalUrl(
@@ -915,6 +1102,10 @@ function validateEvidenceValue(
   config: ScanConfig,
   issues: string[],
 ): void {
+  if (sanitizeEvidenceKey(evidence.source, evidence.key, config) !== evidence.key) {
+    issues.push(`${path}.key exposes a sensitive or opaque locator`);
+  }
+
   const value = evidence.match.value;
 
   if (evidence.match.kind !== "value" || value === null) {
@@ -946,6 +1137,7 @@ function validateEvidenceValue(
 
     if (
       containsSensitiveMarker(key, sensitiveHeaderWords)
+      || credentialSchemePattern.test(value)
       || isSensitiveToken(value, sanitizationLimits(config))
     ) {
       issues.push(`${path}.match.value exposes a sensitive header or token`);
@@ -954,7 +1146,10 @@ function validateEvidenceValue(
 
   if (
     evidence.source === "meta"
-    && isSensitiveToken(value, sanitizationLimits(config))
+    && (
+      credentialSchemePattern.test(value)
+      || isSensitiveToken(value, sanitizationLimits(config))
+    )
   ) {
     issues.push(`${path}.match.value exposes a sensitive metadata token`);
   }
@@ -987,6 +1182,10 @@ function validateTechnology(
   issues: string[],
 ): void {
   const path = `$.technologies[${index}]`;
+
+  if (technology.confidence < 1) {
+    issues.push(`${path}.confidence must be at least 1`);
+  }
 
   assertSorted(technology.categories, compareCategory, `${path}.categories`, issues);
   assertUnique(
@@ -1028,13 +1227,19 @@ function validateTechnology(
       config,
       issues,
     );
+    if (
+      evidence.version !== null
+      && isSensitiveToken(evidence.version, sanitizationLimits(config))
+    ) {
+      issues.push(`${path}.evidence[${evidenceIndex}].version may expose a token`);
+    }
   });
 
   const directRuleMetadata = new Map<string, string>();
   technology.evidence.forEach((evidence) => {
     const signature = JSON.stringify([
       evidence.source,
-      evidence.key,
+      evidence.source === "cookie" ? null : evidence.key,
       evidence.pattern,
       evidence.confidence,
     ]);
@@ -1096,61 +1301,68 @@ function validateInferenceGraph(
   issues: string[],
 ): void {
   const byName = new Map(technologies.map((technology) => [technology.name, technology]));
-  const state = new Map<string, "visiting" | "visited">();
   const depths = new Map<string, number>();
-
-  function visit(name: string): number | undefined {
-    const currentState = state.get(name);
-
-    if (currentState === "visiting") {
-      return undefined;
-    }
-
-    if (currentState === "visited") {
-      return depths.get(name);
-    }
-
-    const technology = byName.get(name);
-    if (technology === undefined) {
-      return undefined;
-    }
-
-    state.set(name, "visiting");
-    let depth = 0;
-
-    if (technology.type === "inferred") {
-      const parentDepths: number[] = [];
-
-      for (const parent of technology.inferredFrom) {
-        const parentDepth = visit(parent.technology);
-
-        if (parentDepth === undefined) {
-          return undefined;
-        }
-
-        parentDepths.push(parentDepth);
-      }
-
-      if (new Set(parentDepths).size !== 1) {
-        issues.push(
-          `$.technologies inference parents for ${technology.name} have different depths`,
-        );
-        return undefined;
-      }
-
-      depth = (parentDepths[0] ?? -1) + 1;
-    }
-
-    state.set(name, "visited");
-    depths.set(name, depth);
-    return depth;
-  }
+  const unresolvedParents = new Map<string, number>();
+  const parentNamesByChild = new Map<string, readonly string[]>();
+  const childrenByParent = new Map<string, string[]>();
+  const queue: string[] = [];
 
   for (const technology of technologies) {
-    if (visit(technology.name) === undefined) {
+    if (technology.type === "direct") {
+      depths.set(technology.name, 0);
+      queue.push(technology.name);
+      continue;
+    }
+
+    const parentNames = [...new Set(
+      technology.inferredFrom.map((inference) => inference.technology),
+    )];
+    if (
+      parentNames.length === 0
+      || parentNames.some((parentName) => !byName.has(parentName))
+    ) {
       issues.push("$.technologies contains cyclic or rootless inference provenance");
       return;
     }
+
+    parentNamesByChild.set(technology.name, parentNames);
+    unresolvedParents.set(technology.name, parentNames.length);
+    for (const parentName of parentNames) {
+      const children = childrenByParent.get(parentName) ?? [];
+      children.push(technology.name);
+      childrenByParent.set(parentName, children);
+    }
+  }
+
+  for (let queueIndex = 0; queueIndex < queue.length; queueIndex += 1) {
+    const parentName = queue[queueIndex]!;
+    for (const childName of childrenByParent.get(parentName) ?? []) {
+      const remaining = (unresolvedParents.get(childName) ?? 0) - 1;
+      unresolvedParents.set(childName, remaining);
+      if (remaining !== 0) {
+        continue;
+      }
+
+      const parentDepths = (parentNamesByChild.get(childName) ?? []).map(
+        (name) => depths.get(name),
+      );
+      if (
+        parentDepths.some((depth) => depth === undefined)
+        || new Set(parentDepths).size !== 1
+      ) {
+        issues.push(
+          `$.technologies inference parents for ${childName} have different depths`,
+        );
+        return;
+      }
+
+      depths.set(childName, parentDepths[0]! + 1);
+      queue.push(childName);
+    }
+  }
+
+  if (depths.size !== technologies.length) {
+    issues.push("$.technologies contains cyclic or rootless inference provenance");
   }
 }
 

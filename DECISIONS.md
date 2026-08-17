@@ -413,13 +413,18 @@ timpii, consumul de resurse și provenance pentru scanner, catalog și
 configurație. O detecție directă are cel puțin o dovadă; una dedusă nu pretinde
 observație și indică părintele/regula. Dacă există ambele, varianta directă are
 prioritate. Confidence-ul direct însumează o singură dată contribuția fiecărei
-reguli până la 100; repetarea pe alte pagini nu îl umflă. Confidence-ul dedus
+reguli până la 100; repetarea pe alte pagini nu îl umflă. O tehnologie directă
+trebuie însă admisă de cel puțin o regulă potrivită cu `confidence > 0`;
+regulile `confidence:0` pot furniza doar evidence/version companion după acea
+admitere și nu pot porni singure relații. Confidence-ul dedus
 folosește cea mai puternică relație validă fără însumarea căilor. O egalitate
 între versiuni diferite produce `null`, nu o alegere arbitrară.
 
 Dovada conține locatorul, regula, patternul și numai matchul exact sanitizat,
-limitat la 256 code points. Query values, segmentele URL opace, cookies și
-headere/valori sensibile sunt redactate; valorile cookie nu sunt nici hash-uite.
+limitat la 256 code points. Query values, query names sensibile/opace/oversized,
+segmentele URL opace, cookies și headere/valori sensibile sunt redactate;
+valorile cookie nu sunt nici hash-uite, iar un nume de cookie opac sau sensibil
+devine `key:null` în evidence.
 O versiune este publicată numai dintr-o sursă neredactată și dacă trece gramatica
 sigură fixată. Observațiile brute rămân în memorie doar până la detecție și nu
 intră în rezultate, cache, fixtures sau logs. Contractul complet, ordinea,
@@ -439,8 +444,11 @@ Schema fixează plafoane catalog/output: nume tehnologie 256 code points, nume
 categorie 128, ID categorie 1–1.000.000, 32 categorii per tehnologie și 1.024
 total; per domeniu maximum 20.000 tehnologii, 128 erori, 256 dovezi sau părinți
 per tehnologie și 20.000 din fiecare total. O linie JSONL are maximum 16 MiB
-UTF-8. Depășirea produce un record bounded `detect/RESULT_LIMIT_EXCEEDED`, iar
-resume respinge o linie peste cap înainte de parsarea JSON.
+UTF-8. Relațiile se rezolvă din setul complet confirmat înainte de aceste
+plafoane; depășirea elimină întreaga materializare `technologies`, nu publică un
+prefix care i-ar schimba confidence-ul sau exclusions, și produce un record
+bounded `detect/RESULT_LIMIT_EXCEEDED`. Resume respinge o linie peste cap înainte
+de parsarea JSON.
 
 Relațiile se rezolvă determinist per domeniu. `requires` și
 `requiresCategory` formează un singur gate OR care poate fi satisfăcut de o
@@ -463,6 +471,10 @@ cu propria categorie rămâne valid, dar nu se poate autosatisface. Detaliile
 implementabile sunt în
 [`Relationship resolution`](README.md#relationship-resolution).
 
+Closure-ul folosește un priority heap și traversări iterative pentru fixed point,
+SCC și provenance. Astfel limita acceptată de 20.000 tehnologii nu depinde de
+call stack și nu rescanează/sortează quadratic întreaga coadă.
+
 ## Decizia izolării regex
 
 Păstrăm `RegExp` nativ cu flagul `i`, compatibil cu specificația catalogului,
@@ -473,9 +485,12 @@ care a expirat este omisă numai pentru domeniul curent, ca rezultatul să nu
 depindă de ordinea concurentă a domeniilor.
 
 Înainte de dispatch, regulile sunt indexate după signal și locator, iar
-candidații fără locator au cap-uri și ranking determinist. Detectorul calculează
-limita superioară a execuțiilor și nu trimite un plan inițial care poate depăși
-500.000 de apeluri RegExp. Un contor cumulativ deținut de parent include apelul
+candidații fără locator au cap-uri și ranking determinist. Detectorul aplică
+independent plafonul 500.000 atât apelurilor RegExp, cât și perechilor totale
+regulă–candidat; `presence` și `literal` consumă astfel work chiar fără RegExp.
+Candidații sunt admiși atomic în ordinea stabilă, iar raw matches sunt bounded
+de capul evidence/domain, cu un singur sentinel de overflow și mesaje IPC
+chunked. Un contor cumulativ deținut de parent include apelul
 blocat și orice replay după checkpoint, supraviețuiește înlocuirii workerului și
 oprește înaintea execuției 500.001. Pragul de 50 ms este verificat de watchdog,
 nu pretins ca plafon real-time exact. După timeout sau crash încercăm o singură
@@ -484,8 +499,15 @@ domeniul parțial. Dacă întregul pool devine indisponibil, domeniile rămase n
 mai sunt crawl-uite, primesc rezultate `failed` cu `DETECTOR_UNAVAILABLE`, iar
 batchul scrie summary complet și iese cu cod nenul.
 
+Listener-ele `error`/`exit` rămân active și când workerul este idle. O pierdere
+idle pornește o singură înlocuire bounded, joburile așteaptă replacement-ul, iar
+pierderea ultimului worker viabil latches pool-ul indisponibil fără unhandled
+event sau slot `ready` stale.
+
 În auditul snapshotului fixat am separat metadata `confidence/version` și am
-găsit 8.037 surse regex ne-goale: toate compilează cu flagul `i` în Node 24.19.0,
+găsit 8.037 declarații regex de valoare ne-goale înainte de deduplicare; după
+deduplicare, worker plan-ul conține 8.033 expresii de valoare unice plus 504
+locatori regex pentru cookie. Toate compilează cu flagul `i` în Node 24.19.0,
 lungimea maximă este 1.115 code units, iar 20 folosesc lookaround. Acest audit
 confirmă compatibilitatea actuală, nu demonstrează că inputurile adversariale nu
 pot produce backtracking catastrofic.
@@ -528,9 +550,13 @@ Cele cinci dependențe runtime au câte o singură responsabilitate:
 - `robots-parser@3.0.1` aplică regulile robots pe text deja descărcat și validat.
   Are zero dependențe runtime și nu deschide o cale proprie de rețea;
 - `ajv@8.20.0`, prin varianta pentru JSON Schema 2020-12, validează catalogul cu
-  schema locală fixată și revizuită. Nu acceptă scheme sau referințe remote și
-  nu adăugăm `ajv-formats`. Validarea semantică proprie rămâne obligatorie,
-  deoarece schema upstream nu restrânge suficient toate câmpurile;
+  schema locală fixată și revizuită. Instanța exclusivă catalogului păstrează
+  `strict: true`, dar folosește `strictTypes: false`, deoarece schema upstream
+  nemodificată omite `type: object` în jurul unui bloc `required`; validatorii
+  configurației și rezultatului rămân complet stricti. Nu acceptăm scheme sau
+  referințe remote și nu adăugăm `ajv-formats`. Validarea semantică proprie
+  rămâne obligatorie, deoarece schema upstream nu restrânge suficient toate
+  câmpurile;
 - `playwright@1.62.1` colectează semnalele care apar numai după randare. Este
   dependență runtime, nu `@playwright/test`; instalăm explicit doar Chromium în
   etapa de setup și păstrăm sandboxul activ. Binarele browserului nu intră în
@@ -579,11 +605,34 @@ Repository-ul upstream declară GPLv3 și nu am găsit o licență sau excepție
 separată pentru fișierele JSON. De aceea, ca interpretare prudentă pentru un
 proiect self-contained, tratăm catalogul ca `GPL-3.0-only` și folosim aceeași
 licență pentru codul proiectului și regulile originale. Materialele terțe își
-păstrează licența și notificările proprii. Înainte de a importa catalogul am
-adăugat textul complet al licenței și
-`THIRD_PARTY_NOTICES.md`. Aceasta este o decizie de conformitate tehnică, nu
-consultanță juridică. În această etapă nu am copiat încă niciun fișier din
-catalogul terț; notice-ul va fi actualizat la import.
+păstrează licența și notificările proprii. Înainte de import am adăugat textul
+complet al licenței și `THIRD_PARTY_NOTICES.md`. La 2026-08-17 am vendorizat
+byte-for-byte numai schema, categoriile și cele 27 de fișiere cu tehnologii la
+revizia fixată, fără cod upstream, iconuri sau branding; notice-ul consemnează
+sursa, revizia, data și faptul că snapshotul este nemodificat. Aceasta este o
+decizie de conformitate tehnică, nu consultanță juridică.
+
+Compilatorul acceptă numai allowlistul upstream exact și fișiere custom regulate
+care adaugă nume noi; v1 nu definește merge sau override. Înainte de parsare se
+aplică limite de 64 fișiere, 1 MiB per fișier, 16 MiB total și adâncime JSON 64,
+iar duplicatele de membri JSON, symlinkurile și intrările neașteptate sunt
+respinse. Toate declarațiile directe, inclusiv presence și duplicatele care vor
+fi deduplicate, consumă limita de 20.000. Header/meta folosesc locatoare exacte
+lowercase; locatoarele cookie sunt regexuri whole-name ancorate, executate în
+worker și incluse în bugetul regex. Rule ID-urile folosesc namespace-uri
+versionate stabile, fără commit, în timp ce provenance păstrează separat
+revizia și digestul snapshotului.
+
+Detectorul HTTP static admite numai observațiile deja limitate ale collectorului:
+URL-ul final și redirecturile, headerele, cookie-urile, HTML-ul, textul vizibil,
+metadata, URL-urile resurselor script și robots. Nu reinterpretăm statusuri,
+stylesheet-uri, imagini, iframe-uri, linkuri sau navigation links ca semnale v1.
+Matchingul regex rulează pe valoarea raw bounded în worker; parentul primește
+doar spanul și versiunea sigură și construiește dovada prin sanitizerul comun.
+URL-urile se publică numai integral și canonic, header/meta publică doar matchul
+după clasificarea întregii observații, iar cookie/HTML/text/robots rămân
+redacted. Confidence și version se calculează din rule ID-uri unice, apoi se
+aplică fixed point-ul relațiilor și excluderile deterministe deja decise.
 
 ## Ce trebuie măsurat
 

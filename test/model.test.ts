@@ -8,6 +8,7 @@ import {
 } from "../src/config.ts";
 import {
   DomainResultValidationError,
+  sanitizeEvidenceKey,
   sanitizeUrl,
   validateDomainResult,
   type DomainResult,
@@ -160,6 +161,20 @@ test("sanitizes URLs deterministically", () => {
     sanitizeUrl("https://example.com/products/widget?variant=%5Bredacted%5D"),
     "https://example.com/products/widget?variant=%5Bredacted%5D",
   );
+  const opaqueKey = "A".repeat(24);
+  const oversizedKey = `${"x-".repeat(32)}x`;
+  const sanitizedQuery = sanitizeUrl(
+    `https://example.com/products/widget?variant=1&${opaqueKey}=2&secret-hunter2=3&${oversizedKey}=4&variant=5`,
+  );
+  assert.equal(
+    sanitizedQuery,
+    "https://example.com/products/widget?variant=%5Bredacted%5D&%5Bredacted%5D=%5Bredacted%5D&%5Bredacted%5D=%5Bredacted%5D&%5Bredacted%5D=%5Bredacted%5D&variant=%5Bredacted%5D",
+  );
+  assert.deepEqual(
+    [...new URL(sanitizedQuery).searchParams.keys()],
+    ["variant", "[redacted]", "[redacted]", "[redacted]", "variant"],
+  );
+  assert.equal(sanitizeUrl(sanitizedQuery), sanitizedQuery);
   assert.equal(
     sanitizeUrl("https://example.com/monkey"),
     "https://example.com/monkey",
@@ -174,6 +189,72 @@ test("sanitizes URLs deterministically", () => {
   assert.throws(
     () => sanitizeUrl(expandingQuery),
     /Sanitized URL exceeds the configured code-unit limit/,
+  );
+});
+
+test("accepts sanitized query names through semantic URL validation", () => {
+  const finalUrl = sanitizeUrl(
+    `https://shop.vendor.tld/?variant=1&${"A".repeat(24)}=2&secret-hunter2=3`,
+  );
+  const baseline = makeResult();
+  const result = makeResult({
+    finalUrl,
+    pages: [{ ...baseline.pages[0]!, url: finalUrl }],
+  });
+
+  assert.equal(
+    validateDomainResult(result, {
+      scanConfig,
+      expectedConfigDigest: configDigest,
+      signalAdmitted: true,
+    }),
+    result,
+  );
+});
+
+test("sanitizes evidence locator keys and rejects unsafe published keys", () => {
+  const drupalSession = `SESS${"0123456789abcdef".repeat(2)}`;
+
+  assert.equal(sanitizeEvidenceKey("cookie", drupalSession, scanConfig), null);
+  assert.equal(sanitizeEvidenceKey("cookie", "CFID", scanConfig), "CFID");
+  assert.equal(sanitizeEvidenceKey("cookie", "CFTOKEN", scanConfig), "CFTOKEN");
+  assert.equal(
+    sanitizeEvidenceKey("header", `x-${"A".repeat(24)}`, scanConfig),
+    null,
+  );
+  assert.equal(sanitizeEvidenceKey("meta", "secret-hunter2", scanConfig), null);
+
+  const unsafeCookie = makeEvidence({
+    source: "cookie",
+    key: drupalSession,
+    match: { kind: "presence", value: null, truncated: false },
+    pattern: null,
+    version: null,
+  });
+  expectSemanticFailure(
+    makeResult({
+      technologies: [makeDirectTechnology({
+        version: null,
+        evidence: [unsafeCookie],
+      })],
+    }),
+    /key exposes a sensitive or opaque locator/,
+  );
+
+  const unsafeHeader = makeEvidence({
+    source: "header",
+    key: `x-${"A".repeat(24)}`,
+    match: { kind: "redacted", value: null, truncated: false },
+    version: null,
+  });
+  expectSemanticFailure(
+    makeResult({
+      technologies: [makeDirectTechnology({
+        version: null,
+        evidence: [unsafeHeader],
+      })],
+    }),
+    /key exposes a sensitive or opaque locator/,
   );
 });
 
@@ -356,6 +437,109 @@ test("enforces technology order, evidence identity, confidence, and version", ()
   );
 });
 
+test("rejects zero-confidence technologies and accepts zero-confidence evidence", () => {
+  expectSemanticFailure(
+    makeResult({
+      technologies: [
+        makeDirectTechnology({
+          confidence: 0,
+          evidence: [makeEvidence({ confidence: 0 })],
+        }),
+      ],
+    }),
+    /wire schema/,
+  );
+
+  const inferred: Technology = {
+    name: "Platform",
+    categories: [],
+    version: null,
+    confidence: 0,
+    type: "inferred",
+    pageIds: [],
+    evidence: [],
+    inferredFrom: [
+      {
+        technology: "Example",
+        ruleId: ruleTwo,
+        confidence: 0,
+        version: null,
+      },
+    ],
+  };
+  expectSemanticFailure(
+    makeResult({ technologies: [makeDirectTechnology(), inferred] }),
+    /wire schema/,
+  );
+
+  const withCompanionEvidence = makeResult({
+    technologies: [makeDirectTechnology({
+      evidence: [
+        makeEvidence(),
+        makeEvidence({
+          ruleId: ruleTwo,
+          confidence: 0,
+          version: null,
+        }),
+      ],
+    })],
+  });
+  assert.equal(
+    validateDomainResult(withCompanionEvidence, {
+      scanConfig,
+      expectedConfigDigest: configDigest,
+      signalAdmitted: true,
+    }),
+    withCompanionEvidence,
+  );
+});
+
+test("allows one cookie-locator rule to prove multiple observed cookie names", () => {
+  const cookieEvidence = (key: string): Evidence => makeEvidence({
+    source: "cookie",
+    key,
+    match: { kind: "presence", value: null, truncated: false },
+    pattern: null,
+    confidence: 60,
+    version: null,
+  });
+  const result = makeResult({
+    technologies: [makeDirectTechnology({
+      version: null,
+      confidence: 60,
+      evidence: [cookieEvidence("CFID"), cookieEvidence("CFTOKEN")],
+    })],
+  });
+
+  assert.equal(
+    validateDomainResult(result, {
+      scanConfig,
+      expectedConfigDigest: configDigest,
+      signalAdmitted: true,
+    }),
+    result,
+  );
+
+  const headerEvidence = (key: string): Evidence => makeEvidence({
+    source: "header",
+    key,
+    match: { kind: "presence", value: null, truncated: false },
+    pattern: null,
+    confidence: 60,
+    version: null,
+  });
+  expectSemanticFailure(
+    makeResult({
+      technologies: [makeDirectTechnology({
+        version: null,
+        confidence: 60,
+        evidence: [headerEvidence("server"), headerEvidence("x-powered-by")],
+      })],
+    }),
+    /immutable rule metadata/,
+  );
+});
+
 test("validates inferred provenance and rejects cycles", () => {
   const inferred: Technology = {
     name: "Platform",
@@ -408,6 +592,45 @@ test("validates inferred provenance and rejects cycles", () => {
   expectSemanticFailure(
     makeResult({ technologies: [alpha, beta] }),
     /cyclic or rootless/,
+  );
+});
+
+test("validates deep inference provenance without recursive stack growth", () => {
+  const count = 4_600;
+  const nameAt = (index: number): string => `T${String(index).padStart(4, "0")}`;
+  const technologies: Technology[] = [makeDirectTechnology({
+    name: nameAt(0),
+    version: null,
+    confidence: 50,
+    evidence: [makeEvidence({ version: null })],
+  })];
+
+  for (let index = 1; index < count; index += 1) {
+    technologies.push({
+      name: nameAt(index),
+      categories: [],
+      version: null,
+      confidence: 50,
+      type: "inferred",
+      pageIds: [],
+      evidence: [],
+      inferredFrom: [{
+        technology: nameAt(index - 1),
+        ruleId: ruleTwo,
+        confidence: 50,
+        version: null,
+      }],
+    });
+  }
+
+  const result = makeResult({ technologies });
+  assert.equal(
+    validateDomainResult(result, {
+      scanConfig,
+      expectedConfigDigest: configDigest,
+      signalAdmitted: true,
+    }),
+    result,
   );
 });
 
@@ -597,6 +820,82 @@ test("publishes only canonical public hostname and DNS evidence", () => {
       makeResult({ technologies: [directWith(safeHeader)] }),
       { scanConfig, expectedConfigDigest: configDigest, signalAdmitted: true },
     )
+  );
+
+  const credentialHeader = makeEvidence({
+    collector: "http",
+    source: "header",
+    pageId: null,
+    key: "x-aspnet-version",
+    match: {
+      kind: "value",
+      value: "EasyEngine Basic dXNlcjpwYXNz",
+      truncated: false,
+    },
+    pattern: "(.+)",
+    version: null,
+  });
+  expectSemanticFailure(
+    makeResult({ technologies: [directWith(credentialHeader)] }),
+    /sensitive header or token/,
+  );
+
+  const shortAuthHeader = makeEvidence({
+    collector: "http",
+    source: "header",
+    pageId: null,
+    key: "x-auth",
+    match: { kind: "value", value: "hunter2", truncated: false },
+    pattern: "(.+)",
+    version: "hunter2",
+  });
+  expectSemanticFailure(
+    makeResult({
+      technologies: [makeDirectTechnology({
+        version: "hunter2",
+        pageIds: [],
+        evidence: [shortAuthHeader],
+      })],
+    }),
+    /sensitive header or token/,
+  );
+
+  const credentialMeta = makeEvidence({
+    collector: "http",
+    source: "meta",
+    pageId: "p1",
+    key: "generator",
+    match: {
+      kind: "value",
+      value: "MediaWiki Bearer hunter2",
+      truncated: false,
+    },
+    pattern: "(.+)",
+    version: null,
+  });
+  expectSemanticFailure(
+    makeResult({ technologies: [directWith(credentialMeta)] }),
+    /sensitive metadata token/,
+  );
+
+  const tokenVersionEvidence = makeEvidence({
+    collector: "http",
+    source: "header",
+    pageId: null,
+    key: "server",
+    match: { kind: "value", value: "Monkey", truncated: false },
+    pattern: "Monkey",
+    version: "token-secret",
+  });
+  expectSemanticFailure(
+    makeResult({
+      technologies: [makeDirectTechnology({
+        version: "token-secret",
+        pageIds: [],
+        evidence: [tokenVersionEvidence],
+      })],
+    }),
+    /version may expose a token/,
   );
 });
 

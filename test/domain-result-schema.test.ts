@@ -502,6 +502,42 @@ test("distinguishes direct detections from inferred detections", () => {
 
 });
 
+test("rejects zero-confidence technologies but permits companion evidence", () => {
+  const direct = makeResult();
+  firstTechnology(direct).confidence = 0;
+  firstEvidence(direct).confidence = 0;
+  expectInvalid(direct);
+
+  const inferred = makeResult();
+  asArray(inferred.technologies).push({
+    name: "Inferred Example",
+    categories: [],
+    version: null,
+    confidence: 0,
+    type: "inferred",
+    pageIds: [],
+    evidence: [],
+    inferredFrom: [
+      {
+        technology: "Example",
+        ruleId: ruleDigest,
+        confidence: 0,
+        version: null,
+      },
+    ],
+  });
+  expectInvalid(inferred);
+
+  const withCompanionEvidence = makeResult();
+  asArray(firstTechnology(withCompanionEvidence).evidence).push({
+    ...firstEvidence(withCompanionEvidence),
+    ruleId: `sha256:${"3".repeat(64)}`,
+    confidence: 0,
+    version: null,
+  });
+  expectValid(withCompanionEvidence);
+});
+
 test("enforces evidence redaction and collector-source boundaries", () => {
   const presenceValue = makeResult();
   const presenceEvidence = firstEvidence(presenceValue);

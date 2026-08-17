@@ -162,6 +162,10 @@ const canonicalConfig: JsonRecord = {
     },
     detector: {
       workers: 2,
+      catalogFiles: 64,
+      catalogFileBytes: 1_048_576,
+      catalogBytes: 16_777_216,
+      catalogJsonDepth: 64,
       technologiesPerCatalog: 20_000,
       technologyNameCodePoints: 256,
       categoryNameCodePoints: 128,
@@ -368,6 +372,13 @@ test("accepts safe lower resource limits", () => {
   setAtPath(candidate, ["limits", "scripts", "urlCandidatesPerDomain"], 0);
   setAtPath(candidate, ["limits", "scripts", "bodiesPerDomain"], 0);
   setAtPath(candidate, ["limits", "detector", "workers"], 1);
+  setAtPath(candidate, ["limits", "detector", "catalogFiles"], 29);
+  setAtPath(candidate, ["limits", "detector", "catalogFileBytes"], 524_288);
+  setAtPath(candidate, ["limits", "detector", "catalogBytes"], 4_194_304);
+  setAtPath(candidate, ["limits", "detector", "catalogJsonDepth"], 8);
+  setAtPath(candidate, ["limits", "detector", "workerOldHeapBytes"], 16_777_216);
+  setAtPath(candidate, ["limits", "detector", "workerYoungHeapBytes"], 4_194_304);
+  setAtPath(candidate, ["limits", "detector", "workerStackBytes"], 1_048_576);
   setAtPath(candidate, ["limits", "output", "jsonlRecordBytes"], 65_536);
   setAtPath(candidate, ["limits", "output", "evidencePerTechnology"], 1);
 
@@ -388,6 +399,10 @@ test("rejects Parquet and representative scan limits above their v1 caps", () =>
     [["limits", "pages", "metadataPerPage"], 5_001],
     [["limits", "browser", "transferBytesPerDomain"], 31_457_281],
     [["limits", "detector", "workers"], 3],
+    [["limits", "detector", "catalogFiles"], 65],
+    [["limits", "detector", "catalogFileBytes"], 1_048_577],
+    [["limits", "detector", "catalogBytes"], 16_777_217],
+    [["limits", "detector", "catalogJsonDepth"], 65],
     [["limits", "detector", "technologyNameCodePoints"], 257],
     [["limits", "detector", "categoriesPerCatalog"], 1_025],
     [["limits", "detector", "executionsPerDomain"], 500_001],
@@ -409,6 +424,13 @@ test("rejects negative, fractional, missing, and unknown values", () => {
     [["limits", "parquet", "rows"], 0],
     [["limits", "timeMs", "activeDomain"], -1],
     [["limits", "http", "headerFields"], 1.5],
+    [["limits", "detector", "catalogFiles"], 28],
+    [["limits", "detector", "catalogFileBytes"], 524_287],
+    [["limits", "detector", "catalogBytes"], 4_194_303],
+    [["limits", "detector", "catalogJsonDepth"], 7],
+    [["limits", "detector", "workerOldHeapBytes"], 17_000_000],
+    [["limits", "detector", "workerYoungHeapBytes"], 4_194_305],
+    [["limits", "detector", "workerStackBytes"], 1_048_577],
   ];
 
   for (const [path, value] of invalidMutations) {

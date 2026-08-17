@@ -5,7 +5,7 @@ provenance. Third-party material retains its own copyright and license.
 
 ## WebAppAnalyzer fingerprint catalog
 
-Status: approved baseline; no catalog files have been vendored yet.
+Status: pinned baseline vendored on 2026-08-17.
 
 - Source: <https://github.com/enthec/webappanalyzer>
 - Pinned revision:
@@ -15,14 +15,17 @@ Status: approved baseline; no catalog files have been vendored yet.
   this project as `GPL-3.0-only`
 - License text:
   <https://github.com/enthec/webappanalyzer/blob/5e7c47b1d441ded0bd476b252261e87634349f96/LICENSE>
-- Intended files: `schema.json`, `src/categories.json`, and
+- Vendored files: `schema.json`, `src/categories.json`, and
   `src/technologies/*.json`
 - Excluded files: upstream executable code, dependencies, icons, and branding
-- Local modifications: none; the files are not present in this repository yet
+- Retrieval date: 2026-08-17
+- Local modifications: none; the approved files are preserved byte-for-byte
+- Snapshot digest:
+  `sha256:cdcccc905a14bbc7ad35a7ea6de636a2e6e51280c6ebbe5ba14f5e55aac18c8f`
 
-When the pinned snapshot is imported, this notice must be updated with the
-retrieval date and any local modifications. Vendored files remain separate
-from original definitions in `fingerprints/custom` and are not edited in place.
+The snapshot is stored under `fingerprints/upstream/webappanalyzer`. Vendored
+files remain separate from original definitions in `fingerprints/custom` and
+are not edited in place.
 
 The current commercial Wappalyzer catalog, website, extension, npm placeholder,
 and API are not sources for this project.

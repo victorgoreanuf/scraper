@@ -1,9 +1,10 @@
 # Website Technologies Scraper
 
-> Project status: first application-foundation slice complete. Validated
-> immutable configuration, shared result types and semantic validation,
-> fail-fast Parquet input, and hostname/public-address policy are implemented
-> and tested. The network crawler and fingerprint catalog are not implemented.
+> Project status: application foundation, protected single-hop HTTP transport,
+> bounded fail-closed robots policy, and static HTTP observation collector are
+> implemented and tested. The pinned fingerprint catalog compiler and isolated
+> static HTTP detector are also complete; the browser collector remains the next
+> slice.
 
 ## Goal
 
@@ -103,13 +104,18 @@ The provided benchmark contains 200 unique domains in a Snappy-compressed Parque
 ├── test/
 │   ├── fixtures/
 │   ├── toolchain.test.ts
+│   ├── catalog.test.ts
 │   ├── config.test.ts
 │   ├── domain-result-schema.test.ts
+│   ├── engine.test.ts
+│   ├── http.test.ts
 │   ├── model.test.ts
 │   ├── parquet.test.ts
+│   ├── pool.test.ts
+│   ├── robots.test.ts
 │   ├── scan-config-schema.test.ts
 │   ├── target.test.ts
-│   ├── engine.test.ts
+│   ├── transport.test.ts
 │   └── pipeline.test.ts
 ├── input/
 │   └── domains.parquet
@@ -675,7 +681,8 @@ The detector consumes those observations and produces:
 
 - technology name and categories;
 - optional version;
-- confidence from `0` to `100`;
+- technology confidence from `1` to `100`; individual evidence and inference
+  contributions may range from `0` to `100`;
 - `direct` or `inferred` detection type;
 - one or more evidence records;
 - the pages on which the technology was observed.
@@ -856,8 +863,9 @@ integers and remain `0` when the corresponding work is skipped.
 
 A technology has exactly `name`, `categories`, `version`, `confidence`, `type`,
 `pageIds`, `evidence`, and `inferredFrom`; only its scalar `version` is
-nullable. A direct detection has at least one evidence item and an empty
-`inferredFrom` array. An inferred detection has no evidence or page IDs and
+nullable, and its confidence is always at least `1`. A direct detection has at
+least one evidence item and an empty `inferredFrom` array. An inferred
+detection has no evidence or page IDs and
 instead records one or more exact `{ technology, ruleId, confidence, version }`
 parent relationships. If a technology is both observed and inferred, the
 direct result wins.
@@ -899,6 +907,9 @@ work boundary that emitted the code.
 Confidence is deterministic:
 
 - direct confidence is `min(100, sum of unique matched-rule confidence)`;
+- a direct technology requires at least one matched rule whose confidence is
+  greater than zero; matched `confidence:0` rules may contribute companion
+  evidence or a version only after another matched rule admits that technology;
 - matching the same rule on multiple pages does not increase confidence again;
 - inferred confidence is the maximum, across valid paths, of the minimum of
   parent confidence and relationship confidence;
@@ -1016,6 +1027,11 @@ category references resolve, and its only self-edge is the supported no-op
 `implies` case. These policies therefore cover observed catalog data rather
 than only hypothetical conflicts.
 
+The fixed point uses a deterministic priority heap, and exclusion components
+plus emitted inference provenance are validated iteratively rather than with
+recursive graph traversal. This keeps the accepted 20,000-technology boundary
+operational without quadratic queue sorting or JavaScript call-stack growth.
+
 Evidence redaction is part of the schema contract:
 
 - `match.value` contains only an allowlisted exact sanitized match, never the
@@ -1023,17 +1039,22 @@ Evidence redaction is part of the schema contract:
   Unicode code points with deterministic truncation;
 - every URL persisted anywhere in results, evidence, errors, or logs uses the
   same sanitizer: userinfo and fragments are removed, query values become
+  `[redacted]`, opaque/sensitive/oversized query names also become
   `[redacted]`, and an opaque or sensitive path segment becomes `[redacted]`;
   a path segment is retained only when it is at most 64 unreserved code units
   and is not a UUID, a hexadecimal token of at least 16 characters, an
   unseparated base64url-like token of at least 24 characters, or adjacent to
   `token`, `key`, `signature`, `session`, `auth`, `password`, `secret`, or
   `code`;
-- cookie values are never emitted or hashed; only the cookie name remains and a
-  value-dependent match uses `match.kind: "redacted"`;
+- cookie values are never emitted or hashed; only a bounded non-sensitive
+  cookie name remains, while an opaque/session-like name becomes `key: null`,
+  and a value-dependent match uses `match.kind: "redacted"`;
 - request headers are never persisted; sensitive response-header names and
   values, including authorization, cookies, tokens, secrets, signatures, API
-  keys, and credentials, are always redacted;
+  keys, credentials, and authentication schemes such as Basic, Bearer, Digest,
+  Negotiate, NTLM, or AWS4-HMAC-SHA256 are always redacted. Authentication
+  schemes are recognized at token boundaries anywhere in an allowlisted header
+  or metadata value, not only at the beginning;
 - `value` is allowed only for sanitized URL/hostname signals, public `A`/`AAAA`
   addresses and hostname-bearing `CNAME`/`MX`/`NS`/`PTR`/`SRV` DNS records, TLS
   issuer text, or bounded non-sensitive response-header and `generator` /
@@ -1045,9 +1066,14 @@ Evidence redaction is part of the schema contract:
 - `presence` represents an existence rule, `value` a safe displayed match, and
   `redacted` a real match whose value cannot be disclosed. `presence` and
   `redacted` always use `value: null` and `truncated: false`;
-- an extracted version is emitted only from a non-redacted source and only when
-  it matches `[A-Za-z0-9][A-Za-z0-9._+~-]{0,63}`; otherwise both the evidence
-  version and that technology's candidate version are `null`;
+- an extracted version is emitted only from a non-redacted source, only when it
+  matches `[A-Za-z0-9][A-Za-z0-9._+~-]{0,63}`, and only when both the matched
+  fragment and derived version pass the same credential/token classifier;
+  a URL-derived version is allowed only when the observed URL has no userinfo,
+  query, or fragment at all and its pathname survives URL sanitization
+  unchanged;
+  otherwise both the evidence version and that technology's candidate version
+  are `null`;
 - unknown values fail closed to redaction, and errors never include stack
   traces, response bodies, raw headers, cookies, or unsanitized URLs.
 
@@ -1056,8 +1082,9 @@ sanitization finish. Version 1 does not persist HTML, DOM, script bodies,
 headers, cookies, JavaScript values, network logs, or hashes of secrets.
 Cookie names and bounded values may exist only long enough to evaluate the
 catalog rule; values are never persisted, logged, or hashed, and a
-value-dependent result exposes only the cookie name plus a redacted match. The
-rendered DOM remains owned by Chromium: Node receives only bounded facts for
+value-dependent result exposes only a bounded non-sensitive cookie name
+(otherwise `key: null`) plus a redacted match. The rendered DOM remains owned
+by Chromium: Node receives only bounded facts for
 selectors and JavaScript paths explicitly requested by the validated catalog,
 never a serialized DOM or an enumeration of the complete `window` object.
 
@@ -1132,7 +1159,8 @@ limits use the proxy accounting defined in the result contract.
 
 The output builder enforces both the configured collection limits and the final
 UTF-8 record limit before append. If any is exceeded, it discards the oversized
-materialization and emits one bounded terminal
+technology materialization rather than publishing an unsupported prefix, emits
+`technologies: []`, and adds one bounded terminal
 `detect/RESULT_LIMIT_EXCEEDED` record: `partial` when a signal reached the
 detector, otherwise `failed`. Existing JSONL lines above the configured byte cap
 are rejected during resume before `JSON.parse`; the minimum configurable cap is
@@ -1368,7 +1396,11 @@ Usage constraints keep the packages inside their intended boundaries:
   work limits bound its synchronous matching algorithm;
 - Ajv compiles only the pinned, locally vendored, reviewed schema using its
   JSON Schema 2020-12 entry point; CLI-selected schemas, remote references,
-  custom keywords, formats, coercion, defaults, and mutation are forbidden;
+  custom keywords, formats, coercion, defaults, and mutation are forbidden.
+  The catalog-only validator keeps strict mode enabled but sets
+  `strictTypes: false`, because the immutable upstream schema omits an object
+  type around one `required` block. Result and configuration validators retain
+  full strict mode;
 - the upstream schema is necessary but not sufficient: the catalog compiler
   must also validate supported fields, references, selectors, paths, pattern
   syntax, lengths, counts, and depth before accepting a definition;
@@ -1423,6 +1455,72 @@ Tests use Node.js 24's built-in test runner and type stripping for `.test.ts`
 files. TypeScript still owns strict type checking, while the separate build
 configuration emits only `src` into `dist`.
 
+## Fingerprint compiler and static detector
+
+`detect/catalog.ts` loads an exact upstream allowlist: `schema.json`,
+`categories.json`, and `technologies/{_,a..z}.json`. It rejects missing or extra
+upstream entries, symlinks and non-regular files, invalid UTF-8, duplicate JSON
+members, excessive nesting, and all configured file/count/byte limits before
+the catalog can reach a scan. Custom v1 files may add only new technology names
+under `fingerprints/custom/technologies`; they cannot patch or override an
+upstream definition. The fixed upstream schema is validation layer one, and a
+semantic compiler then closes its permissive nested shapes, validates all
+references and supported locators, and produces only deeply frozen plain data.
+No catalog-selected schema or executable object enters Ajv or a worker.
+
+The pinned snapshot compiles without modification to 7,575 technologies, 109
+categories, 15,496 direct declarations, 15,489 unique rules, and 2,241
+relationship entries. Catalog accounting sees 8,541 regex-source declarations
+before exact-rule deduplication; the worker plan compiles 8,537 unique sources
+(8,033 value expressions and 504 cookie locators), alongside 1,769 DOM
+selectors, 5,570 JavaScript paths, and three probe paths. The reproducible
+upstream digest is
+`sha256:cdcccc905a14bbc7ad35a7ea6de636a2e6e51280c6ebbe5ba14f5e55aac18c8f`.
+
+Every direct declaration counts against `patternsPerCatalog` before exact
+duplicates are deduplicated, including empty presence rules. Non-empty value
+regexes and cookie-locator regexes independently count toward the regex count
+and total source limits. Stable direct rule IDs hash the UTF-8 JSON tuple
+`[namespace, technology, signal, normalizedLocator, originalTaggedRule]`;
+relationship IDs use
+`[namespace, parent, "implies", target, originalTaggedValue]`. The namespaces
+are `enthec/webappanalyzer:rule-v1` and
+`website-technologies-scraper/custom:rule-v1`, so unchanged rules retain IDs
+across a future snapshot refresh. Catalog digest paths are relative to
+`fingerprints/`, use `/`, sort by UTF-8 bytes, and retain the raw file bytes in
+the documented length-framed hash.
+
+`detect/engine.ts` maps the bounded HTTP observations without creating a new
+network or parsing path. Final and redirect URLs become `url`; response headers,
+cookies, HTML, visible text, normalized metadata, script resource URLs, and the
+retained robots body map to their matching signals. Stylesheet, image, iframe,
+generic link, navigation-link, and HTTP-status observations are deliberately
+not detector candidates in v1. HTML observations use `p1`; non-HTML response
+and robots observations use `pageId: null`. Exact candidate duplicates are
+removed and script URLs retain the configured deterministic cap before worker
+dispatch.
+
+Workers match raw bounded candidates, while the parent materializes only
+sanitized evidence. Cookie, HTML, text, and robots matches are always redacted;
+safe header and metadata rules expose only the matched fragment after the whole
+observation passes the sensitive-token classifier; URL evidence exposes the
+complete canonical sanitized URL or becomes redacted if it cannot fit the wire
+limit. Presence evidence always has `pattern: null` and `version: null`.
+Credential schemes anywhere in an otherwise allowlisted header or metadata
+value fail closed. A derived version is retained only when both the version and
+its raw matched fragment pass the same sensitive marker and opaque-token checks;
+URL-derived versions are also rejected whenever the observed URL contains
+userinfo, a query, or a fragment, or when URL sanitization changed the pathname.
+Confidence and version use unique rule IDs,
+then the accepted relationship fixed point and exclusion algorithm produce
+deterministic direct and inferred technologies. Relationship confidence,
+versions, and exclusions are resolved from all confirmed evidence before output
+limits are checked. A worker, execution, or watchdog limit preserves its
+deterministic confirmed prefix and adds a stable detect-stage error; an output
+materialization limit instead discards the complete technology array as
+described above, so a truncated evidence prefix can never change a relationship
+winner.
+
 ## Regex execution policy
 
 Fingerprint expressions use native JavaScript `RegExp` with the catalog's
@@ -1432,23 +1530,37 @@ main thread. A persistent pool of two local
 compiles the validated declarative catalog and matches only bounded, normalized
 candidate strings. Workers start from a fixed local module, never `eval`,
 receive no runtime objects through the task protocol, perform no network or
-filesystem I/O, and return rule and candidate identifiers plus match
-positions/captures rather than raw values in diagnostics.
+filesystem I/O, and return rule and candidate ordinals, match spans, and a
+bounded safe version rather than raw candidates or capture strings.
 
-The catalog compiler indexes rules first by signal type and then by their exact
-locator where one exists: header, cookie, metadata, DOM, and JavaScript rules
-run only against observations with the same normalized key, selector, or path.
+The catalog compiler indexes rules first by signal type and then by locator.
+Header and metadata locators are exact normalized lowercase keys; DOM and
+JavaScript locators remain exact selectors or paths. Cookie locators are the
+catalog's anchored whole-name expressions, compiled and executed in the same
+worker boundary as value regexes. One leading upstream `(?i)` marker is removed
+because every worker expression already uses `i`; the original locator remains
+part of the stable rule ID. Cookie-locator executions count toward the same
+per-domain budget.
 Unkeyed signals use the deterministic candidate caps in the resource table,
 including at most 80 script URLs, 20 script bodies, three page URLs, and 200
 browser request hostnames. They are deduplicated and ranked by page ID, then
 their source URL, hostname, or locator in UTF-16 code-unit order; script
 responses first apply the same-origin ranking defined by the browser policy.
 Before dispatch, the detector calculates a conservative upper bound from
-applicable rules times admitted candidates. It truncates candidate lists by that stable ranking when
-needed, records `REGEX_EXECUTION_LIMIT`, and never sends a task capable of
-exceeding the 500,000-execution domain limit. A prefilter may remove provably
-inapplicable rules but must not be required for correctness or for respecting
-the cap.
+applicable rules times admitted candidates. The configured 500,000 value is
+enforced as two independent ceilings: actual `RegExp` calls and total
+rule-candidate work pairs. Every presence and literal comparison therefore
+costs one work pair even when it costs no `RegExp` call. Candidates are admitted
+atomically in stable rank order; the first candidate which would cross either
+ceiling and every later candidate are omitted, and the domain records
+`REGEX_EXECUTION_LIMIT`. A prefilter may remove provably inapplicable rules but
+must not be required for correctness or for respecting either cap.
+
+Worker responses are chunked so one checkpoint cannot create an unbounded
+message. At most `min(executionsPerDomain, evidencePerDomain)` unique raw matches
+are retained (20,000 by default), with one extra sentinel used only to detect
+overflow. Reaching it terminates the attempt, preserves the deterministic
+bounded prefix, replaces the worker once, and records `REGEX_EXECUTION_LIMIT`.
 
 The parent owns a per-domain cumulative counter in shared memory which survives
 worker replacement. A worker must atomically reserve one unit before every
@@ -1463,6 +1575,8 @@ The initial limits are:
 | Regex control | Initial value |
 | --- | ---: |
 | Worker pool | 2 |
+| Catalog files / one file / total bytes | 64 / 1 MiB / 16 MiB |
+| Catalog JSON nesting depth | 64 |
 | Technologies per effective catalog | 20,000 |
 | Relationship edges per effective catalog | 100,000 |
 | Pattern source | 2,048 UTF-16 code units |
@@ -1476,7 +1590,9 @@ The initial limits are:
 | Total active detection budget per domain | 2 seconds |
 | Regex timeouts per domain | 3 |
 | Confirmed-result checkpoint | every 128 rules |
+| Rule-candidate work pairs per domain | 500,000 |
 | RegExp executions per domain | 500,000 |
+| Retained raw worker matches | 20,000, derived from the evidence/domain cap |
 
 The worker updates a small `SharedArrayBuffer` with phase, current rule, and
 progress. The parent watchdog can therefore identify stalled work without an
@@ -1500,6 +1616,12 @@ in-flight domain preserves observations and confirmed matches and becomes
 not crawled; each receives a `failed` record with `DETECTOR_UNAVAILABLE`. The
 batch still writes a complete summary and one result per input domain, then
 exits non-zero.
+
+The same lifecycle monitor remains attached while a worker is idle. An idle
+`error` or unexpected `exit` therefore starts exactly one bounded replacement;
+queued detector work waits for that replacement, and loss of the last viable
+worker latches the pool unavailable instead of surfacing an unhandled process
+event or leaving a stale ready slot.
 
 Invalid syntax, size/count overflow, catalog compile timeout, or worker startup
 failure rejects the catalog before crawling. Runtime failures use stable codes
@@ -1556,10 +1678,10 @@ Import policy:
   and keep original additions under `fingerprints/custom`;
 - do not edit vendored files in place; refreshes use a newly reviewed and
   explicitly pinned commit;
-- record the source, commit, retrieval date, license, and local modifications
-  in `THIRD_PARTY_NOTICES.md` before the first import;
-- keep the complete `GPL-3.0-only` project `LICENSE` and update
-  `THIRD_PARTY_NOTICES.md` when the pinned snapshot is imported;
+- retain the recorded source, commit, retrieval date, license, digest, and local
+  modification status in `THIRD_PARTY_NOTICES.md` for every refresh;
+- keep the complete `GPL-3.0-only` project `LICENSE` and the catalog notice
+  synchronized with the pinned snapshot;
 - validate every definition and reject unsupported or unsafe patterns before
   enabling it; a licensed catalog is still untrusted input.
 
@@ -1567,8 +1689,11 @@ The official commercial Wappalyzer catalog, website, extension, npm
 placeholder, and API are not sources for this project. Mirrors or MIT-licensed
 wrappers do not override the license of the catalog they copy. Additional
 catalogs will be considered only after benchmark results show a concrete gap.
-No third-party fingerprint files have been copied into this repository during
-this decision stage.
+The approved 29-file snapshot was vendored byte-for-byte on 2026-08-17 under
+`fingerprints/upstream/webappanalyzer`. It contains the fixed schema,
+categories, and 27 technology files; no upstream executable code, icons,
+dependencies, or branding were imported. Its provenance and unmodified status
+are recorded in `THIRD_PARTY_NOTICES.md`.
 
 ## Implementation roadmap
 
@@ -1592,8 +1717,10 @@ this decision stage.
 - [x] Implement Parquet input and target normalization.
 - [x] Implement the protected single-hop HTTP transport and local adversarial
   tests.
-- [ ] Implement robots policy and the static HTTP observation collector.
-- [ ] Implement the fingerprint catalog compiler and detector.
+- [x] Implement the bounded fail-closed robots policy and local adversarial
+  tests.
+- [x] Implement the static HTTP observation collector.
+- [x] Implement the fingerprint catalog compiler and static HTTP detector.
 - [ ] Implement the browser collector and browser pool.
 - [ ] Add DNS/TLS signals.
 - [ ] Add incremental output, resume, and summary generation.
@@ -1622,8 +1749,7 @@ Coding starts only after these decisions are explicit:
    JCS configuration digest, stable error registry, and completion-order JSONL
    semantics (selected).**
 
-The readiness gate, application foundation, and protected single-hop HTTP
-transport are complete. The next coding slice is robots policy, followed by the
-static HTTP observation collector that orchestrates candidates, redirect hops,
-retry policy, content admission, and extraction. Browser automation and
-fingerprint detection remain separate later slices.
+The readiness gate, application foundation, protected single-hop HTTP
+transport, robots policy, static HTTP observation collector, fingerprint
+compiler, and isolated static detector are complete. Browser automation remains
+the next separate slice.
