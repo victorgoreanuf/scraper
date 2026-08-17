@@ -1,0 +1,28 @@
+# Operating system and editors
+.DS_Store
+.idea/
+.vscode/
+
+# Node.js and build output
+node_modules/
+dist/
+coverage/
+*.log
+
+# Local configuration and secrets
+.env
+.env.*
+
+# Test and browser artifacts
+playwright-report/
+test-results/
+
+# Temporary crawler artifacts; final deliverables remain trackable
+.cache/
+tmp/
+output/raw/
+output/work/
+output/*.tmp
+
+# Challenge input is local until redistribution permission is confirmed
+input/domains.parquet
