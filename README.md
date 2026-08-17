@@ -1,6 +1,9 @@
 # Website Technologies Scraper
 
-> Project status: toolchain foundation complete. The crawler and fingerprint catalog have not been implemented yet.
+> Project status: first application-foundation slice complete. Validated
+> immutable configuration, shared result types and semantic validation,
+> fail-fast Parquet input, and hostname/public-address policy are implemented
+> and tested. The network crawler and fingerprint catalog are not implemented.
 
 ## Goal
 
@@ -51,7 +54,9 @@ The provided benchmark contains 200 unique domains in a Snappy-compressed Parque
 5. **Evidence first:** every direct detection retains the rule, locator, and a
    safe matched fragment or an explicit redaction marker.
 6. **Failure isolation:** one broken website must not stop the batch.
-7. **Streaming by default:** input and output should not require loading the entire dataset into memory.
+7. **Streaming by default:** row payloads and completed results are not retained
+   as one in-memory dataset; the bounded v1 duplicate preflight is the explicit
+   exception described in the Parquet contract.
 8. **Bounded resources:** requests, pages, redirects, response sizes, scripts, browser contexts, and time are limited.
 9. **No speculative layers:** no service containers, plugin framework, repositories, controllers, or generic utility folders without a current need.
 
@@ -63,11 +68,11 @@ The provided benchmark contains 200 unique domains in a Snappy-compressed Parque
 │   ├── cli.ts
 │   ├── config.ts
 │   ├── model.ts
+│   ├── network-policy.ts
 │   ├── pipeline.ts
 │   ├── input/
 │   │   └── parquet.ts
 │   ├── crawl/
-│   │   ├── target.ts
 │   │   ├── transport.ts
 │   │   ├── http.ts
 │   │   ├── robots.ts
@@ -92,9 +97,17 @@ The provided benchmark contains 200 unique domains in a Snappy-compressed Parque
 │   │           └── ...
 │   └── custom/
 │       └── technologies/
+├── schemas/
+│   ├── domain-result.v1.schema.json
+│   └── scan-config.v1.schema.json
 ├── test/
 │   ├── fixtures/
 │   ├── toolchain.test.ts
+│   ├── config.test.ts
+│   ├── domain-result-schema.test.ts
+│   ├── model.test.ts
+│   ├── parquet.test.ts
+│   ├── scan-config-schema.test.ts
 │   ├── target.test.ts
 │   ├── engine.test.ts
 │   └── pipeline.test.ts
@@ -111,6 +124,7 @@ The provided benchmark contains 200 unique domains in a Snappy-compressed Parque
 ├── package-lock.json
 ├── package.json
 ├── tsconfig.json
+├── tsconfig.build.json
 ├── .node-version
 └── .gitignore
 ```
@@ -130,11 +144,14 @@ cli
 crawl  ──> model
 detect ──> model + fingerprints
 output ──> model
+input + crawl + model ──> network-policy
 ```
 
 Rules:
 
 - `detect` performs no network requests.
+- `network-policy` is the application-module-independent shared owner of
+  hostname normalization and public-address classification.
 - `crawl` does not decide which technologies are present.
 - every crawler request path uses the destination checks, limits, and
   cancellation owned by `crawl/transport.ts`;
@@ -163,13 +180,17 @@ database.
 ```text
 Load and validate configuration
         ↓
+Preflight the complete Parquet input without network or output writes
+        ↓
 Load, validate, and index fingerprint data once; compile it per detector worker
         ↓
-Stream domains from Parquet
+Preflight the detector pool and protected browser egress
         ↓
-Normalize the domain and resolve an allowed canonical target
+Schedule canonical domains in Parquet row order
         ↓
-Fetch and apply robots.txt for each top-level authority
+Build a target candidate and validate all resolved addresses
+        ↓
+Fetch robots.txt through the protected transport and evaluate the candidate path
         ↓
 Collect the entry page with HTTP and the isolated browser
         ↓
@@ -186,6 +207,74 @@ Sanitize, merge, sort, and write one complete result record
 Generate run summary
 ```
 
+The robots fetch is itself an infrastructure request and is not gated by
+robots. Before every top-level redirect hop, the new destination is normalized,
+resolved, and checked by the same address policy; the cached or newly fetched
+robots policy for that scheme and authority is then evaluated for the new path
+before the next page request. A cross-authority redirect therefore receives its
+own robots policy, while a same-authority redirect still receives a new path
+decision.
+
+## Parquet input contract v1
+
+The input is an untrusted Parquet file with exactly one top-level primitive
+field named `root_domain`; a second field with that name, a nested field, or a
+`REPEATED` field is invalid. Its physical type is `BYTE_ARRAY` annotated as
+logical `STRING`; the equivalent legacy `ConvertedType.UTF8` annotation is
+accepted for compatibility. If both annotations exist, they must agree. An
+unannotated binary field is not decoded optimistically. The field may be
+`REQUIRED` or `OPTIONAL`, but every row must contain a non-null string. Other
+columns are allowed and are ignored without being decoded. Version 1 accepts
+only `UNCOMPRESSED` and `SNAPPY` for the selected column. Parquet
+`FileMetaData.version` is accepted only when it is `1` or `2`.
+
+Input processing is a fail-fast global preflight. The reader projects only
+`root_domain` and makes two bounded, row-group-based passes:
+
+1. validate every row, normalize it, and retain only canonical-domain keys and
+   their first 1-based row number for duplicate detection;
+2. after the whole file succeeds, read the selected column again and schedule
+   the canonical domains in Parquet row order with backpressure.
+
+The first pass therefore uses bounded but material `O(n)` memory for at most one
+million canonical keys; it does not retain arbitrary columns or raw row values.
+The distributed design replaces this local challenge tradeoff with partitioned
+validation or an external sort/key store rather than copying the Map into every
+worker.
+
+There is no `trim`, type coercion, skipped invalid row, first-row-wins, or
+automatic deduplication. `Shop.Vendor.TLD`, `shop.vendor.tld.`, and an
+IDNA-equivalent value collide after canonicalization. A null, non-string, empty,
+or invalid value, or any duplicate canonical domain rejects the complete input
+before a run file is created or modified and before any network request starts.
+Fatal diagnostics use 1-based row numbers but never echo the raw invalid value.
+
+The initial input limits are:
+
+| Limit | Value |
+| --- | ---: |
+| Rows | 1,000,000 |
+| Rows in one row group | 65,536 |
+| Parquet metadata/footer | 16 MiB |
+| Compressed `root_domain` column chunk | 32 MiB |
+| Uncompressed `root_domain` column chunk | 32 MiB |
+
+Zero rows is invalid. Corrupt or truncated input, unsupported schema or
+compression, and any limit violation are fatal global errors. The stable input
+codes are `INPUT_OPEN_FAILED`, `INPUT_PARQUET_INVALID`,
+`INPUT_SCHEMA_INVALID`, `INPUT_LIMIT_EXCEEDED`, `INPUT_DOMAIN_INVALID`, and
+`INPUT_DOMAIN_DUPLICATE`. They are stderr/run-start failures, not
+`DomainResult.errors`, because no valid per-domain run exists yet.
+
+The current reader validates the footer, schema, selected chunk offsets and
+sizes before decoding, gives `hyparquet` a one-row-group projected metadata
+view, and caps each Snappy output allocation. One production-hardening gap is
+explicit: `hyparquet@1.28.2` does not expose a public pre-decode hook for every
+page-header count/RLE allocation. The supplied benchmark and bounded valid
+files are covered by the current implementation and tests; before accepting
+arbitrary externally uploaded Parquet at scale, decoding must additionally run
+behind a killable resource boundary or use a reviewed page-header preflight.
+
 ## Initial scan policy
 
 The first implemented scan mode is `full`. It is intentionally exhaustive for
@@ -196,17 +285,88 @@ full-mode benchmark provides measurements.
 
 ### Canonical target
 
-Input is a hostname, not a URL. Normalization uses lowercase ASCII/IDNA and
-rejects a supplied scheme, path, credentials, port, or IP address. The target
-resolver tries these unique candidates in order:
+Input is a hostname, not a URL, and is normalized by one exact boundary:
+
+1. require a JavaScript string of 1 through 2,048 UTF-16 code units, with no
+   unpaired surrogate, control character, whitespace, or NUL; do not trim;
+2. reject URL syntax or ambiguous authority syntax, including `/`, `\`, `:`,
+   `@`, `?`, `#`, `[`, `]`, and `%`;
+3. convert with Node.js `domainToASCII()` and reject an empty or failed result;
+4. allow and remove exactly one trailing ASCII root dot, then lowercase the
+   ASCII result; another empty label is invalid;
+5. require 2 through 127 labels and at most 253 ASCII characters excluding the
+   removed root dot; every label is 1 through 63 characters and matches
+   `[a-z0-9](?:[a-z0-9-]*[a-z0-9])?`;
+6. require the final label to contain at least one ASCII letter and reject
+   underscores, wildcards, IP literals, and legacy numeric/hex/octal IPv4
+   forms; URL hostname serialization must reproduce the same non-IP hostname;
+7. reject every registered
+   [IANA Special-Use Domain](https://www.iana.org/assignments/special-use-domain-names/special-use-domain-names.xhtml)
+   and its descendants using the policy-v1 snapshot reviewed 2026-08-17.
+
+Version 1 deliberately has no Public Suffix List dependency. A syntactically
+valid multi-label hostname with an unknown suffix may proceed to DNS, while
+single-label/search-suffix names and special-use names fail before resolution.
+The target resolver then tries these unique candidates in order:
 
 1. `https://domain/`;
 2. `https://www.domain/` when the input does not already start with `www.`;
 3. `http://domain/`;
 4. `http://www.domain/` when applicable.
 
-Top-level requests use `GET`; there is no preliminary `HEAD`. Only HTTP(S) on
-ports 80 and 443 is allowed. Every DNS answer, actual connection destination,
+This hostname-only rule applies to Parquet input. A URL received from the
+network is parsed with the WHATWG URL parser; a canonical public IP literal in
+a redirect may proceed only after the same address-policy check, while legacy
+or non-public forms remain blocked. `http:` is restricted to effective port 80
+and `https:` to effective port 443; credentials and scoped IPv6 addresses are
+always invalid.
+
+### Public-address and connection contract
+
+Every new socket resolves the candidate hostname with
+`dns.lookup(hostname, { all: true, order: "verbatim" })`. An empty answer,
+malformed address, scoped IPv6 address, or answer count beyond the DNS budget is
+an error. Every A and AAAA answer must be ordinary public unicast; one blocked
+answer mixed with public answers rejects the whole authority rather than
+selecting the convenient answer.
+
+The versioned IPv4 deny table is the union of the IANA special-purpose registry,
+multicast, and one explicit cloud control endpoint:
+
+```text
+0.0.0.0/8          10.0.0.0/8         100.64.0.0/10
+127.0.0.0/8        168.63.129.16/32    169.254.0.0/16
+172.16.0.0/12      192.0.0.0/24        192.0.2.0/24
+192.31.196.0/24    192.52.193.0/24     192.88.99.0/24
+192.168.0.0/16     192.175.48.0/24     198.18.0.0/15
+198.51.100.0/24    203.0.113.0/24      224.0.0.0/4
+240.0.0.0/4
+```
+
+IPv6 is fail-closed: an address must first be inside `2000::/3`, then must not
+be inside `2001::/23`, `2001:db8::/32`, `2002::/16`,
+`2620:4f:8000::/48`, or `3fff::/20`. This also rejects unspecified, loopback,
+IPv4-mapped, translation, unique-local, link-local, documentation, transition,
+and multicast space. Policy v1 uses the
+[IANA IPv4](https://www.iana.org/assignments/iana-ipv4-special-registry/iana-ipv4-special-registry.xhtml)
+and
+[IANA IPv6](https://www.iana.org/assignments/iana-ipv6-special-registry/iana-ipv6-special-registry.xhtml)
+registry snapshots updated 2025-10-09, reviewed 2026-08-17, plus the documented
+[Azure platform address](https://learn.microsoft.com/en-us/azure/virtual-network/what-is-ip-address-168-63-129-16).
+The scanner never downloads registries at runtime. The policy intentionally
+blocks special-purpose exceptions which may be globally reachable because
+ordinary public websites do not require them.
+
+After resolution, the transport selects only from the validated answer set and
+pins the socket to that address without an implicit second lookup. The original
+hostname is preserved for HTTP `Host`, TLS SNI, and certificate verification,
+and the actual `remoteAddress` must equal a selected validated address. Each
+retry, new socket, and redirect repeats resolution, all-answer validation, and
+pinning. The browser forward proxy uses this same contract. URL interception is
+only an additional policy layer, never the address boundary.
+
+Top-level requests use `GET`; there is no preliminary `HEAD`. Every DNS answer,
+actual connection destination,
 and redirect destination is revalidated by the shared SSRF policy. A chain may
 contain at most five redirects, and a cross-origin redirect must pass the new
 origin's robots policy before the next top-level request.
@@ -218,11 +378,12 @@ ends target resolution without an alias. Other non-denial `4xx` responses move
 to the next candidate without retry. `408`, `425`, `5xx`, DNS/connect/timeout,
 and TLS failures receive at most one retry and then move to the next candidate.
 A redirect-policy, SSRF, or invalid-target rejection is permanent for the
-domain. The first final `2xx` response selects the target; a non-HTML response
-retains safe HTTP evidence but schedules no pages or browser and becomes
-`partial`. HTTP fallback is a separate candidate for sites that genuinely
-serve HTTP, never a TLS validation bypass. Every redirect hop and retry consumes
-the single HTTP transaction budget.
+domain. The first final `2xx` response selects the target. A non-HTML response
+retains bounded safe HTTP signals, schedules no page, browser, probe, or alias
+fallback, and emits terminal `http/UNSUPPORTED_CONTENT_TYPE` with
+`retryable: false`; it is therefore `partial`. HTTP fallback is a separate
+candidate for sites that genuinely serve HTTP, never a TLS validation bypass.
+Every redirect hop and retry consumes the single HTTP transaction budget.
 
 ### Robots and page selection
 
@@ -251,9 +412,10 @@ and probes; it is not treated as legal authorization.
 
 The scanner visits at most three top-level pages:
 
-1. the canonical entry page;
-2. one discovered product or detail page;
-3. one discovered collection, category, shop, or useful content page.
+1. the canonical `entry` page;
+2. one discovered product or `detail` page;
+3. one discovered collection/category/shop `listing`, or a useful `content`
+   fallback.
 
 Candidates come only from links observed on the static or rendered entry page;
 the crawler does not guess paths or recurse through internal pages. They must
@@ -262,8 +424,9 @@ and be safe `GET` targets. Authentication, account, admin, cart, checkout,
 logout, search, legal/privacy, fragments, files, and duplicates are excluded.
 A fixed path-class rank followed by shortest normalized path and UTF-16
 code-unit order makes the same entry observation select the same pages. If a
-preferred class is absent, the shortest remaining useful internal page fills
-the slot.
+`detail` candidate is absent, that slot stays empty. If a `listing` candidate is
+absent, the shortest remaining useful internal page may fill only that slot as
+`content`; the two internal slots never cross-fill or produce duplicate roles.
 
 Catalog probes do not count as pages. At most five unique probes are allowed;
 each must be a validated relative path on the exact final origin, contain no
@@ -305,7 +468,8 @@ Startup launches a loopback canary server and asks the proxied browser to reach
 it through a synthetic hostname which both test resolvers map to that canary.
 The proxy must record a policy rejection and the canary must receive zero
 connections; proxy configuration and required Chromium controls are also
-checked. Any failed preflight stops `full` mode before input processing. At
+checked. Any failed preflight stops `full` mode before domain processing or
+output creation. At
 production scale, host/container egress rules also restrict Chromium to the
 local proxy. A proxy failure during a domain scan closes the context and yields
 a partial result.
@@ -343,23 +507,68 @@ The primary output is UTF-8 JSON Lines. Each line is one complete
 `null`, and collections are arrays. The logical key is `(runId, domain)`.
 `runId` is one UUID generated when a new output starts and reused by resume;
 `domain` is canonical lowercase ASCII without a trailing dot.
-A representative direct detection is shown below; the eventual TypeScript and
-JSON Schema definitions must preserve this contract.
+The normative wire contracts are
+`schemas/domain-result.v1.schema.json` and
+`schemas/scan-config.v1.schema.json`, using JSON Schema 2020-12 with no remote
+references and `additionalProperties: false` at every object boundary.
+`src/model.ts` mirrors the result schema with TypeScript types, but the JSON
+Schema remains the serialization boundary. Ajv compiles only these fixed local
+schemas with coercion, defaults, mutation, remote loading, custom keywords, and
+external formats disabled.
+
+JSON Schema enforces the closed wire shape, lexical bounds, and the local
+direct/inferred, status, collector, and redaction variants which can be expressed
+without runtime context. The implemented semantic validator checks
+canonical URL/time values, page and parent references, status/signal meaning,
+`pagesVisited`, sorting/deduplication, confidence/version calculation, inference
+acyclicity, sanitizer compliance, scalar Unicode validity, and digest
+correctness. The output writer and resume reader must pass both layers; schema
+validity alone never authorizes a semantically inconsistent result.
+
+At scan time the writer must supply the non-serialized `signalAdmitted` fact to
+validate the `partial`/`failed` distinction; omitting that boolean is itself a
+validation failure. A future resume reader can recheck every persisted
+invariant, but cannot reconstruct that collection-history fact from the v1 wire
+record alone; it therefore trusts the status previously validated by the writer
+while still enforcing its schema-level cardinalities.
+
+Every result has exactly the top-level fields `schemaVersion`, `runId`,
+`domain`, `scannedAt`, `status`, `finalUrl`, `scanMode`, `pages`,
+`technologies`, `errors`, `timings`, `usage`, and `provenance`.
+`schemaVersion` is `1`; `runId` is a UUID; `scannedAt` is the exact UTC form
+produced by `Date.prototype.toISOString()`; and `scanMode` is `full` in this
+version. `finalUrl` is the only nullable top-level scalar. Arrays always exist,
+all usage counters are non-negative integers, `totalMs` is a non-negative
+integer, and each named stage timing is a non-negative integer or `null` when
+that stage never started or was skipped. Provenance is complete and non-null
+because missing runtime, catalog, or validated configuration identity is a
+global preflight failure rather than a per-domain result.
+
+A `PageRecord` has exactly `id`, `role`, `url`, `httpStatus`, and `collectors`.
+IDs are `p1`, `p2`, and `p3` in deterministic page order. `p1` has role
+`entry`; later roles are `detail`, `listing`, or the deterministic fallback
+`content`. With three records there is exactly one `detail` and exactly one
+`listing` or `content`; their `p2`/`p3` order follows the canonical URL sort.
+With two records, the second may use either class. `httpStatus` is an integer
+or `null`. Collectors preserve fixed order and are exactly `[]`, `["http"]`,
+or `["http", "browser"]`; a browser-only page is impossible.
+
+A representative direct detection is shown below.
 
 ```json
 {
   "schemaVersion": 1,
   "runId": "37937a78-f39d-49ed-a51d-6d398ae45a20",
-  "domain": "example.com",
+  "domain": "shop.vendor.tld",
   "scannedAt": "2026-08-17T00:00:00.000Z",
   "status": "success",
-  "finalUrl": "https://example.com/",
+  "finalUrl": "https://shop.vendor.tld/",
   "scanMode": "full",
   "pages": [
     {
       "id": "p1",
       "role": "entry",
-      "url": "https://example.com/",
+      "url": "https://shop.vendor.tld/",
       "httpStatus": 200,
       "collectors": ["http", "browser"]
     }
@@ -380,10 +589,10 @@ JSON Schema definitions must preserve this contract.
           "key": "src",
           "match": {
             "kind": "value",
-            "value": "https://cdn.example.com/example-1.2.0.js",
+            "value": "https://cdn.vendor.tld/example-1.2.0.js",
             "truncated": false
           },
-          "ruleId": "sha256:...",
+          "ruleId": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
           "pattern": "example-([0-9.]+)\\.js",
           "confidence": 50,
           "version": "1.2.0"
@@ -418,14 +627,14 @@ JSON Schema definitions must preserve this contract.
     "runtime": {
       "node": "24.19.0",
       "playwright": "1.62.1",
-      "chromiumRevision": "..."
+      "chromiumRevision": "chromium-123456"
     },
     "catalog": {
       "source": "enthec/webappanalyzer",
       "revision": "5e7c47b1d441ded0bd476b252261e87634349f96",
-      "digest": "sha256:..."
+      "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
     },
-    "configDigest": "sha256:..."
+    "configDigest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
   }
 }
 ```
@@ -434,8 +643,12 @@ Evidence `source` is one of `url`, `header`, `cookie`, `html`, `text`, `css`,
 `meta`, `script_url`, `script_content`, `dom`, `javascript`, `network_hostname`,
 `dns_record`, `tls_issuer`, `robots`, or `probe`. `collector` is `http`,
 `browser`, `dns`, or `tls`; `pageId` is `null` for non-page infrastructure
-signals. `key` identifies the header, cookie, metadata name, selector,
-JavaScript path, DNS record type, or equivalent locator.
+signals and is required for every browser observation. `key` identifies the
+header, cookie, metadata name, selector, JavaScript path, DNS record type, or
+equivalent locator and is `null` for an unkeyed signal; `dns_record` always uses
+a non-null uppercase record-type key. Evidence `pageId`,
+`key`, `pattern`, and `version` are the only nullable evidence scalars.
+`match.value` is nullable under the redaction rules below.
 
 `PageRecord.collectors` lists only collectors which completed for that page;
 failures are linked by `pageId`. Error `stage` is one of `target`, `robots`,
@@ -459,15 +672,47 @@ need not sum to total. A skipped or never-started stage is `null`, while a
 completed sub-millisecond stage may be `0`. Usage values are non-negative
 integers and remain `0` when the corresponding work is skipped.
 
-A direct detection has at least one evidence item and an empty `inferredFrom`
-array. An inferred detection has no evidence or page IDs and instead records
-one or more `{ technology, ruleId, confidence, version }` parent relationships.
-If a technology is both observed and inferred, the direct result wins. A scan
-error has `{ stage, code, pageId, retryable, message, ruleId, signal, limit,
-catalogRevision }`; the four regex-specific fields are nullable for other
-errors and for failures with no active rule. They are `string | null`, with
-`signal` using the evidence-source vocabulary and `limit` using a stable value
-such as `50ms`. Messages are application controlled and sanitized.
+A technology has exactly `name`, `categories`, `version`, `confidence`, `type`,
+`pageIds`, `evidence`, and `inferredFrom`; only its scalar `version` is
+nullable. A direct detection has at least one evidence item and an empty
+`inferredFrom` array. An inferred detection has no evidence or page IDs and
+instead records one or more exact `{ technology, ruleId, confidence, version }`
+parent relationships. If a technology is both observed and inferred, the
+direct result wins.
+
+A scan error has exactly `{ stage, code, pageId, retryable, message, ruleId,
+signal, limit, catalogRevision }`. `pageId`, `ruleId`, `signal`, `limit`, and
+`catalogRevision` are `string | null`; the other fields are non-null. `signal`
+uses the evidence-source vocabulary and `limit` uses a stable value such as
+`50ms`. Messages are application controlled and sanitized. `retryable` means a
+fresh scan could succeed, not that the current attempt will necessarily retry.
+`ruleId`, `signal`, `limit`, and `catalogRevision` are detector context and are
+therefore all `null` when `stage` is not `detect`.
+
+The schema admits append-only error codes matching
+`^[A-Z][A-Z0-9_]*$`; a central TypeScript registry will contain every code the
+implementation can emit. Adding a registered code is compatible with schema
+v1, but removing one or changing its meaning is not. The initial non-regex
+registry is:
+
+| Stage area | Codes |
+| --- | --- |
+| Target | `TARGET_NOT_FOUND`, `TARGET_ACCESS_DENIED`, `TARGET_REDIRECT_INVALID`, `TARGET_REDIRECT_LIMIT_EXCEEDED` |
+| Robots | `ROBOTS_DISALLOWED`, `ROBOTS_UNAVAILABLE`, `ROBOTS_LIMIT_EXCEEDED` |
+| HTTP | `HTTP_REQUEST_FAILED`, `HTTP_TIMEOUT`, `HTTP_LIMIT_EXCEEDED`, `HTTP_RESPONSE_LIMIT_EXCEEDED`, `HTTP_DECOMPRESSION_FAILED`, `UNSUPPORTED_CONTENT_TYPE` |
+| DNS | `DNS_LOOKUP_FAILED`, `DNS_NO_ADDRESS`, `DNS_LIMIT_EXCEEDED` |
+| TLS | `TLS_CONNECTION_FAILED`, `TLS_CERTIFICATE_INVALID`, `TLS_TIMEOUT` |
+| Browser | `BROWSER_UNAVAILABLE`, `BROWSER_NAVIGATION_FAILED`, `BROWSER_TIMEOUT`, `BROWSER_LIMIT_EXCEEDED`, `BROWSER_PROXY_FAILED` |
+| Destination policy | `SSRF_NON_PUBLIC_ADDRESS`, `SSRF_MIXED_ADDRESSES`, `SSRF_REMOTE_ADDRESS_MISMATCH` |
+| Domain | `DOMAIN_DEADLINE_EXCEEDED` |
+| Result materialization | `RESULT_LIMIT_EXCEEDED` |
+
+The regex-worker codes remain `REGEX_RULE_TIMEOUT`,
+`REGEX_DOMAIN_BUDGET_EXCEEDED`, `REGEX_EXECUTION_LIMIT`,
+`REGEX_WORKER_CRASH`, `REGEX_WORKER_RESTART_FAILED`, and
+`DETECTOR_UNAVAILABLE`. Error `stage` remains one of `target`, `robots`,
+`http`, `dns`, `tls`, `browser`, or `detect`; the stage names the request or
+work boundary that emitted the code.
 
 Confidence is deterministic:
 
@@ -503,15 +748,35 @@ version; inferences by parent technology then rule ID; errors by stage
 rule ID, then message. Operational timestamps and timings are not promised to
 be byte-identical.
 
+### Configuration and digest contract v1
+
+`ScanConfig` is immutable behavioral input validated against
+`schemas/scan-config.v1.schema.json` before any other work. It groups the full
+user-agent identity and policy versions plus concurrency, Parquet, target,
+robots, HTTP, page, browser, DNS/TLS, detection/regex, evidence, redaction, and
+output limits. Every behavior-affecting boolean, integer, string, order, retry
+rule, and resource limit that may vary within policy v1 has one named schema
+field.
+Fixed algorithms, registries, enumerations, and retry classifications are
+identified by their policy-version or registry pin. Unknown fields, unsafe
+integers, non-finite values, and implicit defaults are rejected. The object is
+not mutated after validation.
+
+Input and output paths, `--resume`, `--force`, stderr verbosity, and progress
+presentation are operational CLI options, not `ScanConfig`, and therefore do
+not affect `configDigest`. Runtime, browser, and catalog identities are recorded
+separately in provenance and are still required to match on resume.
+
 Digests have one construction. `catalog.digest` is SHA-256 over the sorted
 relative paths and raw bytes of the effective schema, categories, upstream, and
 custom fingerprint files; each UTF-8 path and byte payload is prefixed by its
-unsigned 64-bit big-endian length. `configDigest` is SHA-256 over UTF-8
-`JSON.stringify` of the validated fixed-key configuration object in schema
-order. It includes the scan mode, complete user agent, target/robots/page
-policy versions, every request/byte/time/candidate limit, sanitizer version,
-regex limits, and browser-egress policy; only output paths and log verbosity are
-excluded. Digests are lowercase `sha256:<hex>` strings.
+unsigned 64-bit big-endian length. `configDigest` is SHA-256 over the UTF-8
+RFC 8785 JSON Canonicalization Scheme representation of the validated
+`ScanConfig`. Object properties sort recursively by raw UTF-16 code units;
+array order is preserved; and only JSON strings, booleans, safe integers,
+arrays, and objects admitted by the schema participate. Digests are lowercase
+`sha256:<hex>` strings. Configuration schema property order and JavaScript
+insertion order are not part of this identity.
 
 ### Relationship resolution
 
@@ -587,9 +852,11 @@ Evidence redaction is part of the schema contract:
 - request headers are never persisted; sensitive response-header names and
   values, including authorization, cookies, tokens, secrets, signatures, API
   keys, and credentials, are always redacted;
-- `value` is allowed only for sanitized URL/hostname signals, DNS names, TLS
+- `value` is allowed only for sanitized URL/hostname signals, public `A`/`AAAA`
+  addresses and hostname-bearing `CNAME`/`MX`/`NS`/`PTR`/`SRV` DNS records, TLS
   issuer text, or bounded non-sensitive response-header and `generator` /
   `application-name` metadata values which also pass the token classifier;
+  `TXT`, `CAA`, `SOA`, cryptographic, and unknown DNS record values are redacted;
   HTML, visible text, CSS, script content, DOM values, JavaScript values, probe
   bodies, robots content, cookie values, and unknown classes are redacted by
   default;
@@ -605,6 +872,12 @@ Evidence redaction is part of the schema contract:
 Raw observations are bounded and exist only in memory until detection and
 sanitization finish. Version 1 does not persist HTML, DOM, script bodies,
 headers, cookies, JavaScript values, network logs, or hashes of secrets.
+Cookie names and bounded values may exist only long enough to evaluate the
+catalog rule; values are never persisted, logged, or hashed, and a
+value-dependent result exposes only the cookie name plus a redacted match. The
+rendered DOM remains owned by Chromium: Node receives only bounded facts for
+selectors and JavaScript paths explicitly requested by the validated catalog,
+never a serialized DOM or an enumeration of the complete `window` object.
 
 Allowed domain statuses are:
 
@@ -615,6 +888,10 @@ Allowed domain statuses are:
   or hard limit;
 - `failed`: no signal was admitted to the detector, `technologies` is empty,
   and at least one terminal per-domain error is present.
+
+A final 2xx non-HTML response satisfies `partial`, not `success`, because its
+bounded HTTP observations enter detection together with terminal
+`http/UNSUPPORTED_CONTENT_TYPE`; no page or browser work follows.
 
 An intentional policy skip is not an error, and a transient attempt which later
 succeeds affects usage/retry counters and optional sanitized stderr diagnostics,
@@ -642,7 +919,8 @@ These are starting values, not final performance claims:
 | Transient retry | 1 per request, still inside the 40-transaction total |
 | Top-level pages | 3 |
 | Catalog probes | 5 |
-| Any input, fetched, or persisted URL | 2,048 UTF-16 code units |
+| Input hostname | 2,048 UTF-16 code units |
+| Any fetched or persisted URL | 2,048 UTF-16 code units |
 | Header fields / total header bytes | 100 / 64 KiB |
 | HTML body per page | 2 MiB compressed / 4 MiB decompressed |
 | Total static decompressed bytes | 32 MiB per domain |
@@ -660,6 +938,22 @@ These are starting values, not final performance claims:
 | DOM inspection | 5,000 selectors; 1,024 code units each; 20 matches per selector |
 | JavaScript inspection | 10,000 paths; 512 code units each |
 | DOM + JavaScript returned values | 8 KiB each / 2 MiB total per page |
+| Catalog names / categories | 256-code-point technology name; 128-code-point category name; category IDs 1–1,000,000; 32 categories per technology; 1,024 categories total |
+| Result collections | 20,000 technologies; 128 errors; 256 evidence or inference records per technology; 20,000 of each per domain |
+| JSONL record | 16 MiB UTF-8, including its terminating newline |
+
+Unless a row explicitly says code units or code points, text limits are measured
+as UTF-8 bytes after the documented normalization. Compressed limits count wire
+body bytes, decompressed limits count decoded body bytes, and browser transfer
+limits use the proxy accounting defined in the result contract.
+
+The output builder enforces both the configured collection limits and the final
+UTF-8 record limit before append. If any is exceeded, it discards the oversized
+materialization and emits one bounded terminal
+`detect/RESULT_LIMIT_EXCEEDED` record: `partial` when a signal reached the
+detector, otherwise `failed`. Existing JSONL lines above the configured byte cap
+are rejected during resume before `JSON.parse`; the minimum configurable cap is
+64 KiB so the bounded failure shape itself remains representable.
 
 Queue wait is measured separately; the domain deadline begins only after the
 job receives a full-scan slot. Reaching a limit cancels the affected work,
@@ -695,6 +989,14 @@ configuration digest. Each `(runId, domain)` appears exactly once; duplicates
 and malformed middle lines are errors, not last-write wins. At most one
 incomplete final fragment may be removed before append. This is process-crash
 recovery at record granularity, not a claim of power-loss durability.
+
+Input rows are scheduled in validated Parquet order, but bounded concurrent
+scans append complete JSONL records in completion order. Global line order is
+therefore deliberately unspecified and may differ between runs; resume keeps
+the existing order and appends newly completed records without sorting.
+Determinism is guaranteed inside each record after excluding operational
+timestamps and timings. Consumers and tests compare by `(runId, domain)` or a
+separately sorted copy, never by raw JSONL line position.
 
 Initial controls:
 
@@ -745,9 +1047,20 @@ The final summary should include at least:
 ## Testing strategy
 
 - Foundation tests keep the pinned Node/npm declarations, exact direct
-  dependency versions, npm v3 lockfile, ESM mode, private-package guard, and
-  project license consistent before application behavior exists.
-- Unit tests for target normalization and public-address validation.
+  dependency versions, npm v3 lockfile, ESM mode, private-package guard, build
+  boundary, and project license consistent as application behavior is added.
+- Contract tests compile the two fixed local JSON Schemas with Ajv and validate
+  representative positive, negative, nullable, unknown-field, and cross-variant
+  fixtures without network access.
+- Configuration/model tests cover immutability, JCS digest binding, sanitizer
+  behavior, references, deterministic ordering, inferred provenance, status,
+  redaction, and configured lower limits.
+- Parquet tests cover the exact `root_domain` schema, metadata versions,
+  allowed compression, ignored binary-column statistics, row-group
+  backpressure, null/empty/invalid rows, limits, corrupt input, and duplicates
+  which appear only after canonicalization.
+- Unit tests cover target normalization, candidate boundaries, and
+  public-address validation.
 - Robots status/rule semantics and deterministic page-selection tests.
 - Fingerprint catalog validation and isolated regex compilation tests.
 - Catastrophic regex, watchdog termination, worker replacement, checkpoint,
@@ -860,8 +1173,9 @@ dependency notices are recorded in `THIRD_PARTY_NOTICES.md`.
 
 Usage constraints keep the packages inside their intended boundaries:
 
-- `hyparquet` reads only the required columns and uses bounded row windows for
-  larger files; extra codecs, Arrow, DuckDB, and a Parquet writer are excluded;
+- `hyparquet` reads only the required column through row-group-local projected
+  metadata and bounded chunk limits; extra codecs, Arrow, DuckDB, and a Parquet
+  writer are excluded;
 - Cheerio receives only bytes already fetched and bounded by our HTTP transport;
   `cheerio.fromURL()` is forbidden because it would create an unguarded request
   and redirect path;
@@ -889,8 +1203,10 @@ not add Commander, Axios, a direct Undici dependency, `p-limit`, dotenv, a
 logger, Zod, a separate test framework, a TypeScript runtime loader, or lint and
 format packages before a concrete need appears. Stable built-in TypeScript type
 stripping may be used for small development commands, while `tsc` remains the
-type-checking contract. A separate application build configuration will be
-added with the first real source file so tests are never emitted as CLI output.
+type-checking contract. `tsconfig.build.json` emits application source only, so
+tests are never compiled into CLI output. `npm run build` first removes only the
+generated, Git-ignored `dist` directory so renamed sources cannot leave stale
+JavaScript artifacts.
 
 No regex package is selected. Heuristic validators do not prove ReDoS safety,
 while RE2-style engines reject JavaScript features present in the catalog and
@@ -911,19 +1227,18 @@ binary was downloaded; Chromium provisioning remains the explicit later setup
 step described above. `node_modules` and compiled `dist` output remain local and
 Git-ignored.
 
-The available foundation commands are:
+The available project checks are:
 
 ```sh
 npm run typecheck
 npm test
 npm run check
+npm run build
 ```
 
 Tests use Node.js 24's built-in test runner and type stripping for `.test.ts`
-files. TypeScript still owns strict type checking. There is intentionally no
-application `build` command while `src` is empty; it will be introduced with a
-source-only build configuration when the first implementation slice adds real
-application code.
+files. TypeScript still owns strict type checking, while the separate build
+configuration emits only `src` into `dist`.
 
 ## Regex execution policy
 
@@ -1085,8 +1400,13 @@ this decision stage.
 - [x] Select the initial `full` page/browser policy, JSONL result and redacted
   evidence contract, and killable regex-worker policy.
 - [x] Add `package.json`, `tsconfig.json`, npm v3 lockfile, and foundation tests.
-- [ ] Implement configuration and shared data contracts.
-- [ ] Implement Parquet input and target normalization.
+- [x] Freeze the Parquet, hostname/address, result, configuration, lifecycle,
+  and output-order contracts required by the first coding slice.
+- [x] Add the two local JSON Schemas and their contract tests without crawler
+  behavior.
+- [x] Implement validated configuration, shared TypeScript data contracts, and
+  semantic result validation.
+- [x] Implement Parquet input and target normalization.
 - [ ] Implement the static HTTP collector.
 - [ ] Implement the fingerprint catalog compiler and detector.
 - [ ] Implement the browser collector and browser pool.
@@ -1111,8 +1431,13 @@ Coding starts only after these decisions are explicit:
    evidence, explicit inference, and no raw persistence (selected).**
 6. Untrusted fingerprint regex execution: **bounded native RegExp in a
    watchdog-controlled worker pool (selected).**
+7. Input and destination boundaries: **fail-fast Parquet v1 plus exact hostname,
+   public-address, and connection-pinning contracts (selected).**
+8. Machine contracts: **fixed JSON Schema 2020-12 result/configuration schemas,
+   JCS configuration digest, stable error registry, and completion-order JSONL
+   semantics (selected).**
 
-The readiness gate and toolchain foundation are complete. The next implementation
-slice remains limited to validated configuration, shared data contracts, Parquet
-input, and target normalization. Crawling and browser automation are separate
-later slices.
+The readiness gate and first application-foundation slice are complete. The
+next coding slice is the protected static HTTP transport/collector, including
+redirect, robots, byte-limit, timeout, and connection-pinning behavior. Browser
+automation and fingerprint detection remain separate later slices.

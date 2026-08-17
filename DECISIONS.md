@@ -45,6 +45,14 @@
   scripturi, headere, cookies sau valori JavaScript brute în versiunea 1.
 - Regexurile catalogului rulează cu semantica JavaScript nativă doar într-un pool
   de workeri supravegheat; nu rulează niciodată în threadul principal.
+- Inputul Parquet v1 este validat complet înainte de rețea sau output; orice
+  rând invalid ori domeniu duplicat după normalizare oprește batchul.
+- Hostname-urile au o singură normalizare IDNA strictă, iar fiecare socket HTTP
+  și browser este rezolvat, validat ca public și pin-uit la adresa verificată.
+- Contractele wire v1 sunt scheme JSON 2020-12 locale pentru `DomainResult` și
+  `ScanConfig`; configurația comportamentală folosește digest JCS + SHA-256.
+- Domeniile sunt programate în ordinea Parquet, dar liniile JSONL sunt scrise în
+  ordinea finalizării; ordinea globală nu face parte din contract.
 
 ## Structura proiectului
 
@@ -53,11 +61,11 @@ src/
 ├── cli.ts
 ├── config.ts
 ├── model.ts
+├── network-policy.ts
 ├── pipeline.ts
 ├── input/
 │   └── parquet.ts
 ├── crawl/
-│   ├── target.ts
 │   ├── transport.ts
 │   ├── http.ts
 │   ├── robots.ts
@@ -81,9 +89,15 @@ fingerprints/
 └── custom/
     └── technologies/
 
+schemas/
+├── domain-result.v1.schema.json
+└── scan-config.v1.schema.json
+
 test/
 ├── fixtures/
-└── toolchain.test.ts
+├── toolchain.test.ts
+├── domain-result-schema.test.ts
+└── scan-config-schema.test.ts
 ```
 
 Nu vom adăuga foldere generale precum `services`, `repositories`, `helpers`, `common` sau `utils` dacă nu apare o nevoie reală.
@@ -93,9 +107,11 @@ Nu vom adăuga foldere generale precum `services`, `repositories`, `helpers`, `c
 ```text
 Parquet
   ↓
-normalizare domeniu
+preflight complet: schemă, limite, domenii și duplicate
   ↓
-target canonic + robots + validare SSRF
+normalizare domeniu + candidat target + DNS/SSRF
+  ↓
+robots protejat + decizie pentru path
   ↓
 homepage HTTP + browser izolat
   ↓
@@ -114,16 +130,24 @@ Scanarea HTTP va colecta:
 
 - URL-ul final și redirect-urile;
 - headerele;
-- numele cookie-urilor;
+- numele și valorile limitate ale cookie-urilor, numai temporar în memorie
+  pentru matching;
 - HTML și meta tags;
 - scripturi și alte resurse externe.
 
 Browserul va colecta:
 
-- DOM-ul după executarea JavaScript-ului;
+- numai faptele DOM cerute de planul validat al catalogului, fără serializarea
+  sau enumerarea întregului DOM;
 - proprietăți JavaScript cunoscute;
 - request-uri făcute de pagină;
 - semnale randate care nu apar în răspunsul HTML inițial și pot fi interpretate ulterior de detector.
+
+Fetch-ul `robots.txt` nu este el însuși condiționat de robots. Înaintea fiecărui
+request top-level și redirect, validăm întâi destinația efectivă, apoi aplicăm
+politica robots a schemei/autorității pentru noul path. Redirecturile către altă
+autoritate primesc propria politică; cele de pe aceeași autoritate reevaluează
+pathul.
 
 ## Ce rămâne de confirmat înainte de publicare sau scanare reală
 
@@ -137,6 +161,58 @@ trigger-ele modului tiered vor fi ajustate numai după benchmark; contractele de
 siguranță, rezultat și redacție nu se relaxează pentru a crește numărul de
 detecții.
 
+## Decizia contractului Parquet v1
+
+Acceptăm exact un câmp primitiv top-level `root_domain`, fizic `BYTE_ARRAY` cu
+`LogicalType.STRING` sau echivalentul legacy `ConvertedType.UTF8`. Dacă există
+ambele adnotări, trebuie să fie coerente. Câmpul poate fi `REQUIRED` sau
+`OPTIONAL`, dar fiecare rând trebuie să conțină un string nenul; `REPEATED`,
+binary neadnotat, nested sau două câmpuri cu același nume sunt invalide. Coloane
+suplimentare sunt permise și ignorate fără decodare. Pentru coloana selectată
+acceptăm numai `UNCOMPRESSED` și `SNAPPY`.
+
+Facem două treceri pe row groups: preflight complet și apoi emitere cu
+backpressure în ordinea rândurilor. Nu facem trim, coercion sau deduplicare.
+Orice valoare invalidă ori duplicat după normalizare respinge întregul input
+înainte de output și trafic. Fișierul gol este invalid. Limitele sunt 1.000.000
+de rânduri, 65.536 rânduri per row group, 16 MiB metadata/footer și 32 MiB atât
+comprimat, cât și necomprimat pentru chunkul `root_domain`. Codurile globale
+sunt `INPUT_OPEN_FAILED`, `INPUT_PARQUET_INVALID`, `INPUT_SCHEMA_INVALID`,
+`INPUT_LIMIT_EXCEEDED`, `INPUT_DOMAIN_INVALID` și `INPUT_DOMAIN_DUPLICATE`; ele
+nu intră în `DomainResult.errors`. Contractul implementabil complet este în
+[`Parquet input contract v1`](README.md#parquet-input-contract-v1).
+
+Implementarea proiectează câte un singur row group și coloana selectată la
+fiecare apel `hyparquet`, pentru lucru liniar în numărul de grupuri, și nu
+decodează statisticile coloanelor ignorate cu parserul strict de string.
+Acceptăm numai versiunile de metadata Parquet 1 și 2; `ColumnChunk.file_offset`
+este deprecated și nu este folosit, iar offseturile efectiv citite sunt
+validate separat. Limitele de chunk și decomprimarea Snappy sunt enforceable,
+dar API-ul public `hyparquet@1.28.2` nu permite preflight pentru fiecare count
+de page header/RLE înaintea decoderului. Un input Parquet arbitrar încărcat din
+exterior va necesita decoder izolat terminabil sau un pre-parser revizuit;
+această întărire nu blochează benchmarkul local actual.
+
+## Decizia normalizării hostname și a SSRF
+
+Nu facem trim. Acceptăm un string Unicode limitat, fără whitespace, controls,
+surrogate invalid sau sintaxă URL, îl convertim cu `domainToASCII()`, eliminăm
+maximum un root dot și folosim lowercase ASCII. Cerem 2–127 labels, maximum 253
+caractere, 1–63 caractere per label, numai alfanumeric și hyphen fără hyphen la
+margini, iar ultimul label trebuie să conțină o literă. Respingem IDNA invalid,
+underscore, IP literal, IPv4 legacy, single-label și toate domeniile IANA
+Special-Use plus descendenții lor. Nu adăugăm Public Suffix List în v1.
+
+Pentru fiecare socket și fiecare retry/redirect rezolvăm toate răspunsurile
+A/AAAA, respingem orice răspuns nepublic sau set mixt și pin-uim conexiunea la
+setul validat. Verificăm `remoteAddress`, dar păstrăm hostname-ul original pentru
+Host, SNI și certificat. HTTP și proxy-ul browserului folosesc aceeași politică.
+IPv4 blochează registrul special IANA, multicast și endpointul Azure explicit;
+IPv6 permite numai `2000::/3` minus intervalele speciale fixate. Tabelele
+effective, versiunea și regulile complete sunt contractul unic din
+[`Public-address and connection contract`](README.md#public-address-and-connection-contract),
+nu date descărcate la runtime.
+
 ## Decizia politicii inițiale de scanare
 
 Primul mod implementat este `full`, ca să obținem un baseline bun pe cele 200 de
@@ -144,7 +220,9 @@ domenii. Încercăm determinist HTTPS pe domeniu și `www`, apoi HTTP pe acelea�
 hosturi. Folosim numai porturile 80/443, maximum cinci redirecturi și aceeași
 validare DNS/adresă efectiv conectată pentru orice request. Un răspuns explicit
 de access denial nu este o invitație să încercăm alt alias, browserul sau alte
-retry-uri.
+retry-uri. Un 2xx non-HTML păstrează semnalele HTTP sigure, nu încearcă pagini,
+browser, probe sau alias și produce `partial` cu eroarea terminală
+`http/UNSUPPORTED_CONTENT_TYPE`, `retryable: false`.
 
 Înaintea paginilor top-level și a probelor citim și aplicăm `robots.txt` pentru
 product tokenul `WebsiteTechScraper`. `robots-parser@3.0.1` furnizează gruparea
@@ -154,12 +232,14 @@ testele relevante din RFC 9309. Nu susținem că pachetul singur implementează
 toate detaliile RFC. Un contact real în User-Agent este precondiție pentru
 scanarea publică.
 
-Scanăm maximum trei pagini: homepage, o pagină product/detail și o pagină
-collection/category/shop/content. Linkurile vin numai din homepage-ul static
-sau randat, rămân pe originul final, trec robots și exclud auth, account, admin,
+Scanăm maximum trei pagini cu roluri wire exacte: `entry`, o pagină `detail` și
+o pagină `listing` sau fallback `content`. Linkurile vin numai din homepage-ul
+static sau randat, rămân pe originul final, trec robots și exclud auth, account, admin,
 cart, checkout, search, legal, query-uri și fișiere. Rankingul și tie-break-ul
-sunt fixe; nu facem crawl recursiv și nu ghicim pathuri. Maximum cinci probe
-declarative validate rămân în afara numărului de pagini.
+sunt fixe. Slotul `detail` rămâne gol dacă nu are candidat; numai slotul
+`listing` poate primi fallback `content`, fără două roluri interne duplicate. Nu
+facem crawl recursiv și nu ghicim pathuri. Maximum cinci probe declarative
+validate rămân în afara numărului de pagini.
 
 În `full`, fiecare pagină HTML 2xx eligibilă primește HTTP și browser. Folosim un
 context Chromium nepersistent per domeniu, maximum o pagină activă, sandbox și
@@ -192,6 +272,39 @@ poate fi eliminat, însă o linie invalidă în mijloc sau un duplicat oprește
 operația. `--retry-failed` nu este promis până când poate rescrie sigur printr-un
 fișier temporar și rename atomic.
 
+Contractele wire normative sunt `schemas/domain-result.v1.schema.json` și
+`schemas/scan-config.v1.schema.json`, JSON Schema 2020-12 local, fără referințe
+remote și cu `additionalProperties: false` la fiecare obiect. Toate câmpurile
+fixe există. La top-level numai `finalUrl` este nullable; timpii etapelor
+nepornite sunt nullable, counters rămân întregi nenegativi, iar provenance este
+complet. Page roles sunt exact `entry`, `detail`, `listing`, `content`, iar
+collector arrays sunt exact `[]`, `["http"]` sau `["http", "browser"]`.
+Evidence permite `null` pentru `pageId`, `key`, `pattern`, `version` și valoarea
+redactată; error permite `null` pentru `pageId`, `ruleId`, `signal`, `limit` și
+`catalogRevision`.
+
+JSON Schema închide forma wire și variantele locale, dar nu pretinde să verifice
+singur URL/timestamp canonic, sanitizerul, referințele, sortarea, calculele sau
+sensul statusului. `src/model.ts` implementează validatorul semantic unic, leagă
+digestul de configurația validată și cere explicit contextul boolean
+`signalAdmitted`; omiterea lui este invalidă. Writerul și viitorul resume reader
+vor aplica acest validator înainte de a accepta recordul.
+
+`success` cere `errors: []`; `partial` cere minimum un semnal admis și o eroare
+terminală; `failed` nu are semnale utilizabile, are `technologies: []` și minimum
+o eroare terminală. Detecția directă are minimum o dovadă și zero inferences;
+cea dedusă are zero evidence/page IDs și minimum un părinte. Codurile de eroare
+respectă `^[A-Z][A-Z0-9_]*$` și un registry TypeScript append-only; un cod nou
+este compatibil cu schema v1, dar eliminarea sau schimbarea sensului nu este.
+Registrul non-regex inițial și toate detaliile implementabile sunt în
+[`Result and evidence contract v1`](README.md#result-and-evidence-contract-v1).
+
+Domeniile sunt programate în ordinea Parquet, însă workerii scriu fiecare record
+complet când termină. Ordinea globală JSONL este nespecificată/completion-order;
+resume păstrează ordinea existentă și doar adaugă. Determinismul este garantat în
+interiorul rezultatului, exceptând timestampurile și timings, iar testele și
+consumatorii compară după `(runId, domain)`, nu după poziția liniei.
+
 Schema v1 păstrează domeniul și statusul, paginile, tehnologiile, erorile,
 timpii, consumul de resurse și provenance pentru scanner, catalog și
 configurație. O detecție directă are cel puțin o dovadă; una dedusă nu pretinde
@@ -209,6 +322,22 @@ sigură fixată. Observațiile brute rămân în memorie doar până la detecți
 intră în rezultate, cache, fixtures sau logs. Contractul complet, ordinea,
 digesturile și cheile de deduplicare sunt în
 [`Result and evidence contract v1`](README.md#result-and-evidence-contract-v1).
+
+`ScanConfig` conține numai comportamentul: identity și policy versions,
+concurrency, Parquet, target, robots, HTTP, pages, browser, DNS/TLS,
+detection/regex, evidence, redaction și limitele outputului. Input/output paths,
+`--resume`, `--force`, log verbosity și progress sunt opțiuni operaționale și nu
+intră în digest. Configurația validată și imutabilă se canonizează RFC 8785/JCS,
+apoi se hash-uiește SHA-256 ca `sha256:<hex>` lowercase; schema order și
+insertion order nu influențează rezultatul. Runtime-ul și catalogul rămân separat
+în provenance.
+
+Schema fixează plafoane catalog/output: nume tehnologie 256 code points, nume
+categorie 128, ID categorie 1–1.000.000, 32 categorii per tehnologie și 1.024
+total; per domeniu maximum 20.000 tehnologii, 128 erori, 256 dovezi sau părinți
+per tehnologie și 20.000 din fiecare total. O linie JSONL are maximum 16 MiB
+UTF-8. Depășirea produce un record bounded `detect/RESULT_LIMIT_EXCEEDED`, iar
+resume respinge o linie peste cap înainte de parsarea JSON.
 
 Relațiile se rezolvă determinist per domeniu. `requires` și
 `requiresCategory` formează un singur gate OR care poate fi satisfăcut de o
@@ -306,10 +435,11 @@ Cele cinci dependențe runtime au câte o singură responsabilitate:
 
 Pentru dezvoltare folosim numai `typescript@7.0.2` și
 `@types/node@24.13.3`. Nu adăugăm `tsx`, `ts-node`, Jest, Vitest, ESLint,
-Prettier sau Biome înainte să existe o nevoie măsurată. În fundația fără cod,
-`tsc` face verificarea de tipuri, iar testele folosesc `node:test` și
-`node:assert`. Adăugăm configurația de build numai odată cu primul fișier real
-din `src`, astfel încât buildul aplicației să nu emită testele.
+Prettier sau Biome înainte să existe o nevoie măsurată. `tsc` face verificarea
+strictă de tipuri, testele folosesc `node:test` și `node:assert`, iar
+`tsconfig.build.json` compilează numai `src` în `dist`, fără testele proiectului.
+Buildul curăță mai întâi numai directorul generat și ignorat `dist`, astfel încât
+fișierele sursă redenumite să nu lase artefacte executabile vechi.
 
 Node.js acoperă nativ argumentele CLI, HTTP(S), URL/DNS/TLS, timeouturile,
 decompresia, controlul concurenței, streamurile JSONL, hashingul și testele. De
