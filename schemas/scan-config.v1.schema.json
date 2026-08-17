@@ -1,0 +1,1140 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:website-technologies-scraper:scan-config:v1",
+  "title": "Website Technologies Scraper scan configuration v1",
+  "description": "Immutable behavior-affecting scan configuration. Operational CLI paths and presentation options are intentionally excluded.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "scanMode",
+    "userAgent",
+    "inputPolicy",
+    "policyVersions",
+    "registryPins",
+    "targetPolicy",
+    "limits",
+    "security"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "type": "integer",
+      "const": 1
+    },
+    "scanMode": {
+      "type": "string",
+      "const": "full"
+    },
+    "userAgent": {
+      "type": "string",
+      "minLength": 32,
+      "maxLength": 512,
+      "pattern": "^WebsiteTechScraper/[A-Za-z0-9][A-Za-z0-9._+~-]{0,63} \\((?:https://[\\x21-\\x27\\x2A-\\x7E]+|mailto:[\\x21-\\x27\\x2A-\\x7E]+@[\\x21-\\x27\\x2A-\\x7E]+)\\)$"
+    },
+    "inputPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["format", "selectedColumn", "allowedCodecs"],
+      "properties": {
+        "format": {
+          "type": "string",
+          "const": "parquet"
+        },
+        "selectedColumn": {
+          "type": "string",
+          "const": "root_domain"
+        },
+        "allowedCodecs": {
+          "type": "array",
+          "const": ["UNCOMPRESSED", "SNAPPY"]
+        }
+      }
+    },
+    "policyVersions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "parquet",
+        "hostname",
+        "address",
+        "target",
+        "robots",
+        "pageSelection",
+        "sanitizer",
+        "evidence",
+        "relationships",
+        "detector",
+        "browserEgress",
+        "output"
+      ],
+      "properties": {
+        "parquet": {
+          "type": "integer",
+          "const": 1
+        },
+        "hostname": {
+          "type": "integer",
+          "const": 1
+        },
+        "address": {
+          "type": "integer",
+          "const": 1
+        },
+        "target": {
+          "type": "integer",
+          "const": 1
+        },
+        "robots": {
+          "type": "integer",
+          "const": 1
+        },
+        "pageSelection": {
+          "type": "integer",
+          "const": 1
+        },
+        "sanitizer": {
+          "type": "integer",
+          "const": 1
+        },
+        "evidence": {
+          "type": "integer",
+          "const": 1
+        },
+        "relationships": {
+          "type": "integer",
+          "const": 1
+        },
+        "detector": {
+          "type": "integer",
+          "const": 1
+        },
+        "browserEgress": {
+          "type": "integer",
+          "const": 1
+        },
+        "output": {
+          "type": "integer",
+          "const": 1
+        }
+      }
+    },
+    "registryPins": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "specialUseDomainsReviewedOn",
+        "ianaIpv4UpdatedOn",
+        "ianaIpv6UpdatedOn",
+        "addressOverlayVersion"
+      ],
+      "properties": {
+        "specialUseDomainsReviewedOn": {
+          "type": "string",
+          "const": "2026-08-17"
+        },
+        "ianaIpv4UpdatedOn": {
+          "type": "string",
+          "const": "2025-10-09"
+        },
+        "ianaIpv6UpdatedOn": {
+          "type": "string",
+          "const": "2025-10-09"
+        },
+        "addressOverlayVersion": {
+          "type": "integer",
+          "const": 1
+        }
+      }
+    },
+    "targetPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["candidateOrder", "portsByScheme", "topLevelMethod"],
+      "properties": {
+        "candidateOrder": {
+          "type": "array",
+          "const": [
+            "https://{domain}/",
+            "https://www.{domain}/",
+            "http://{domain}/",
+            "http://www.{domain}/"
+          ]
+        },
+        "portsByScheme": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["http", "https"],
+          "properties": {
+            "http": {
+              "type": "integer",
+              "const": 80
+            },
+            "https": {
+              "type": "integer",
+              "const": 443
+            }
+          }
+        },
+        "topLevelMethod": {
+          "type": "string",
+          "const": "GET"
+        }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "concurrency",
+        "timeMs",
+        "parquet",
+        "target",
+        "hostname",
+        "url",
+        "http",
+        "pages",
+        "scripts",
+        "browser",
+        "cookies",
+        "dns",
+        "robots",
+        "inspection",
+        "detector",
+        "evidence",
+        "output"
+      ],
+      "properties": {
+        "concurrency": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["globalHttp", "perOriginHttp", "fullScans"],
+          "properties": {
+            "globalHttp": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 20
+            },
+            "perOriginHttp": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 2
+            },
+            "fullScans": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 3
+            }
+          }
+        },
+        "timeMs": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "activeDomain",
+            "httpRequest",
+            "browserPage",
+            "browserSettle",
+            "retryAfterCap",
+            "robotsCache"
+          ],
+          "properties": {
+            "activeDomain": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 60000
+            },
+            "httpRequest": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 10000
+            },
+            "browserPage": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 15000
+            },
+            "browserSettle": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 2000
+            },
+            "retryAfterCap": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 2000
+            },
+            "robotsCache": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 86400000
+            }
+          }
+        },
+        "parquet": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "rows",
+            "rowsPerRowGroup",
+            "metadataBytes",
+            "selectedChunkCompressedBytes",
+            "selectedChunkUncompressedBytes"
+          ],
+          "properties": {
+            "rows": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1000000
+            },
+            "rowsPerRowGroup": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 65536
+            },
+            "metadataBytes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 16777216
+            },
+            "selectedChunkCompressedBytes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 33554432
+            },
+            "selectedChunkUncompressedBytes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 33554432
+            }
+          }
+        },
+        "target": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["candidates", "redirectsPerChain"],
+          "properties": {
+            "candidates": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4
+            },
+            "redirectsPerChain": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 5
+            }
+          }
+        },
+        "hostname": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["inputCodeUnits"],
+          "properties": {
+            "inputCodeUnits": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 2048
+            }
+          }
+        },
+        "url": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["codeUnits"],
+          "properties": {
+            "codeUnits": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 2048
+            }
+          }
+        },
+        "http": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "transactionsPerDomain",
+            "transientRetriesPerRequest",
+            "headerFields",
+            "headerBytes",
+            "htmlCompressedBytesPerPage",
+            "htmlDecompressedBytesPerPage",
+            "staticDecompressedBytesPerDomain",
+            "probeCompressedBytes",
+            "probeDecompressedBytes"
+          ],
+          "properties": {
+            "transactionsPerDomain": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 40
+            },
+            "transientRetriesPerRequest": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "headerFields": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100
+            },
+            "headerBytes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 65536
+            },
+            "htmlCompressedBytesPerPage": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 2097152
+            },
+            "htmlDecompressedBytesPerPage": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4194304
+            },
+            "staticDecompressedBytesPerDomain": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 33554432
+            },
+            "probeCompressedBytes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 262144
+            },
+            "probeDecompressedBytes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 524288
+            }
+          }
+        },
+        "pages": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "topLevelPerDomain",
+            "catalogProbesPerDomain",
+            "extractedUrlsPerPage",
+            "visibleTextBytesPerPage"
+          ],
+          "properties": {
+            "topLevelPerDomain": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 3
+            },
+            "catalogProbesPerDomain": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 5
+            },
+            "extractedUrlsPerPage": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 5000
+            },
+            "visibleTextBytesPerPage": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 524288
+            }
+          }
+        },
+        "scripts": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "urlCandidatesPerDomain",
+            "bodiesPerDomain",
+            "bodyBytes",
+            "totalBodyBytesPerDomain"
+          ],
+          "properties": {
+            "urlCandidatesPerDomain": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 80
+            },
+            "bodiesPerDomain": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 20
+            },
+            "bodyBytes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 2097152
+            },
+            "totalBodyBytesPerDomain": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 16777216
+            }
+          }
+        },
+        "browser": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "contextsPerDomain",
+            "activePagesPerContext",
+            "networkHostnamesPerDomain",
+            "requestsPerPage",
+            "requestsPerDomain",
+            "transferBytesPerPage",
+            "transferBytesPerDomain"
+          ],
+          "properties": {
+            "contextsPerDomain": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1
+            },
+            "activePagesPerContext": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1
+            },
+            "networkHostnamesPerDomain": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200
+            },
+            "requestsPerPage": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 150
+            },
+            "requestsPerDomain": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 300
+            },
+            "transferBytesPerPage": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 15728640
+            },
+            "transferBytesPerDomain": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 31457280
+            }
+          }
+        },
+        "cookies": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["perDomain", "nameCodeUnits", "valueBytes", "totalBytesPerDomain"],
+          "properties": {
+            "perDomain": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100
+            },
+            "nameCodeUnits": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 256
+            },
+            "valueBytes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4096
+            },
+            "totalBytesPerDomain": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 65536
+            }
+          }
+        },
+        "dns": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["recordsPerType", "recordsPerDomain", "txtItemBytes", "textBytesPerDomain"],
+          "properties": {
+            "recordsPerType": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 32
+            },
+            "recordsPerDomain": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 128
+            },
+            "txtItemBytes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4096
+            },
+            "textBytesPerDomain": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 65536
+            }
+          }
+        },
+        "robots": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "bodyBytes",
+            "redirects",
+            "lines",
+            "rules",
+            "ruleCodeUnits",
+            "matchingStatesPerUrl"
+          ],
+          "properties": {
+            "bodyBytes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 524288
+            },
+            "redirects": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 5
+            },
+            "lines": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 5000
+            },
+            "rules": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 500
+            },
+            "ruleCodeUnits": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 512
+            },
+            "matchingStatesPerUrl": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1000000
+            }
+          }
+        },
+        "inspection": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "domSelectors",
+            "domSelectorCodeUnits",
+            "domMatchesPerSelector",
+            "javascriptPaths",
+            "javascriptPathCodeUnits",
+            "returnedValueBytes",
+            "returnedValuesBytesPerPage"
+          ],
+          "properties": {
+            "domSelectors": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 5000
+            },
+            "domSelectorCodeUnits": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1024
+            },
+            "domMatchesPerSelector": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 20
+            },
+            "javascriptPaths": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 10000
+            },
+            "javascriptPathCodeUnits": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 512
+            },
+            "returnedValueBytes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 8192
+            },
+            "returnedValuesBytesPerPage": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 2097152
+            }
+          }
+        },
+        "detector": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "workers",
+            "technologiesPerCatalog",
+            "technologyNameCodePoints",
+            "categoryNameCodePoints",
+            "categoriesPerTechnology",
+            "categoriesPerCatalog",
+            "relationshipEdgesPerCatalog",
+            "patternsPerCatalog",
+            "patternSourceCodeUnits",
+            "totalPatternSourceCodeUnits",
+            "compileWatchdogMs",
+            "workerOldHeapBytes",
+            "workerYoungHeapBytes",
+            "workerStackBytes",
+            "ruleWatchdogMs",
+            "watchdogPollMs",
+            "activeMsPerDomain",
+            "timeoutsPerDomain",
+            "checkpointRules",
+            "executionsPerDomain"
+          ],
+          "properties": {
+            "workers": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 2
+            },
+            "technologiesPerCatalog": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 20000
+            },
+            "technologyNameCodePoints": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 256
+            },
+            "categoryNameCodePoints": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 128
+            },
+            "categoriesPerTechnology": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 32
+            },
+            "categoriesPerCatalog": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1024
+            },
+            "relationshipEdgesPerCatalog": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100000
+            },
+            "patternsPerCatalog": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 20000
+            },
+            "patternSourceCodeUnits": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 2048
+            },
+            "totalPatternSourceCodeUnits": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1000000
+            },
+            "compileWatchdogMs": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 5000
+            },
+            "workerOldHeapBytes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 134217728
+            },
+            "workerYoungHeapBytes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 33554432
+            },
+            "workerStackBytes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4194304
+            },
+            "ruleWatchdogMs": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 50
+            },
+            "watchdogPollMs": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 10
+            },
+            "activeMsPerDomain": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 2000
+            },
+            "timeoutsPerDomain": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 3
+            },
+            "checkpointRules": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 128
+            },
+            "executionsPerDomain": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 500000
+            }
+          }
+        },
+        "evidence": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "matchCodePoints",
+            "safePathSegmentCodeUnits",
+            "hexTokenMinCodeUnits",
+            "base64UrlTokenMinCodeUnits",
+            "versionCodeUnits"
+          ],
+          "properties": {
+            "matchCodePoints": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 256
+            },
+            "safePathSegmentCodeUnits": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 64
+            },
+            "hexTokenMinCodeUnits": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 16
+            },
+            "base64UrlTokenMinCodeUnits": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 24
+            },
+            "versionCodeUnits": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 64
+            }
+          }
+        },
+        "output": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "jsonlRecordBytes",
+            "technologiesPerDomain",
+            "errorsPerDomain",
+            "evidencePerTechnology",
+            "evidencePerDomain",
+            "inferencesPerTechnology",
+            "inferencesPerDomain"
+          ],
+          "properties": {
+            "jsonlRecordBytes": {
+              "type": "integer",
+              "minimum": 65536,
+              "maximum": 16777216
+            },
+            "technologiesPerDomain": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 20000
+            },
+            "errorsPerDomain": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 128
+            },
+            "evidencePerTechnology": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 256
+            },
+            "evidencePerDomain": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 20000
+            },
+            "inferencesPerTechnology": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 256
+            },
+            "inferencesPerDomain": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 20000
+            }
+          }
+        }
+      }
+    },
+    "security": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["network", "robots", "browser", "evidence"],
+      "properties": {
+        "network": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "allowUrlCredentials",
+            "allowIpInput",
+            "requirePublicAddresses",
+            "rejectMixedAddressAnswers",
+            "validateConnectedAddress",
+            "revalidateRedirects",
+            "connectOnlySelectedAddress",
+            "verifyTls"
+          ],
+          "properties": {
+            "allowUrlCredentials": {
+              "type": "boolean",
+              "const": false
+            },
+            "allowIpInput": {
+              "type": "boolean",
+              "const": false
+            },
+            "requirePublicAddresses": {
+              "type": "boolean",
+              "const": true
+            },
+            "rejectMixedAddressAnswers": {
+              "type": "boolean",
+              "const": true
+            },
+            "validateConnectedAddress": {
+              "type": "boolean",
+              "const": true
+            },
+            "revalidateRedirects": {
+              "type": "boolean",
+              "const": true
+            },
+            "connectOnlySelectedAddress": {
+              "type": "boolean",
+              "const": true
+            },
+            "verifyTls": {
+              "type": "boolean",
+              "const": true
+            }
+          }
+        },
+        "robots": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["productToken", "failurePolicy", "protectedTransportRequired"],
+          "properties": {
+            "productToken": {
+              "type": "string",
+              "const": "WebsiteTechScraper"
+            },
+            "failurePolicy": {
+              "type": "string",
+              "const": "fail-closed"
+            },
+            "protectedTransportRequired": {
+              "type": "boolean",
+              "const": true
+            }
+          }
+        },
+        "browser": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "allowedMethods",
+            "persistentContexts",
+            "sandbox",
+            "bypassCsp",
+            "serviceWorkers",
+            "downloads",
+            "permissions",
+            "proxyRequired",
+            "proxyBypass",
+            "startupCanaryRequired",
+            "quic",
+            "nonProxiedWebRtc",
+            "webSockets",
+            "mutableMethods",
+            "popups",
+            "crossOriginMainFrames",
+            "interactions",
+            "abortedResourceTypes"
+          ],
+          "properties": {
+            "allowedMethods": {
+              "type": "array",
+              "const": ["GET", "HEAD", "OPTIONS"]
+            },
+            "persistentContexts": {
+              "type": "boolean",
+              "const": false
+            },
+            "sandbox": {
+              "type": "boolean",
+              "const": true
+            },
+            "bypassCsp": {
+              "type": "boolean",
+              "const": false
+            },
+            "serviceWorkers": {
+              "type": "string",
+              "const": "block"
+            },
+            "downloads": {
+              "type": "string",
+              "const": "deny"
+            },
+            "permissions": {
+              "type": "array",
+              "const": []
+            },
+            "proxyRequired": {
+              "type": "boolean",
+              "const": true
+            },
+            "proxyBypass": {
+              "type": "boolean",
+              "const": false
+            },
+            "startupCanaryRequired": {
+              "type": "boolean",
+              "const": true
+            },
+            "quic": {
+              "type": "boolean",
+              "const": false
+            },
+            "nonProxiedWebRtc": {
+              "type": "boolean",
+              "const": false
+            },
+            "webSockets": {
+              "type": "string",
+              "const": "block"
+            },
+            "mutableMethods": {
+              "type": "string",
+              "const": "block"
+            },
+            "popups": {
+              "type": "string",
+              "const": "block"
+            },
+            "crossOriginMainFrames": {
+              "type": "string",
+              "const": "block"
+            },
+            "interactions": {
+              "type": "string",
+              "const": "deny"
+            },
+            "abortedResourceTypes": {
+              "type": "array",
+              "const": ["image", "font", "media"]
+            }
+          }
+        },
+        "evidence": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "persistRawObservations",
+            "persistRequestHeaders",
+            "persistCookieValues",
+            "hashCookieValues",
+            "persistResponseBodies",
+            "redactUnknownValues",
+            "redactQueryValues",
+            "redactSensitivePathSegments",
+            "redactSensitiveResponseHeaders",
+            "stripUrlUserInfo",
+            "stripUrlFragments",
+            "emitVersionsFromRedactedSources",
+            "includeErrorStackTraces"
+          ],
+          "properties": {
+            "persistRawObservations": {
+              "type": "boolean",
+              "const": false
+            },
+            "persistRequestHeaders": {
+              "type": "boolean",
+              "const": false
+            },
+            "persistCookieValues": {
+              "type": "boolean",
+              "const": false
+            },
+            "hashCookieValues": {
+              "type": "boolean",
+              "const": false
+            },
+            "persistResponseBodies": {
+              "type": "boolean",
+              "const": false
+            },
+            "redactUnknownValues": {
+              "type": "boolean",
+              "const": true
+            },
+            "redactQueryValues": {
+              "type": "boolean",
+              "const": true
+            },
+            "redactSensitivePathSegments": {
+              "type": "boolean",
+              "const": true
+            },
+            "redactSensitiveResponseHeaders": {
+              "type": "boolean",
+              "const": true
+            },
+            "stripUrlUserInfo": {
+              "type": "boolean",
+              "const": true
+            },
+            "stripUrlFragments": {
+              "type": "boolean",
+              "const": true
+            },
+            "emitVersionsFromRedactedSources": {
+              "type": "boolean",
+              "const": false
+            },
+            "includeErrorStackTraces": {
+              "type": "boolean",
+              "const": false
+            }
+          }
+        }
+      }
+    }
+  }
+}

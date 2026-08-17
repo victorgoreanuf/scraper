@@ -1,0 +1,1028 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:website-technologies-scraper:domain-result:v1",
+  "title": "DomainResult v1",
+  "$ref": "#/$defs/domainResult",
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "version": {
+      "type": ["string", "null"],
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._+~-]{0,63}$"
+    },
+    "pageId": {
+      "type": "string",
+      "enum": ["p1", "p2", "p3"]
+    },
+    "nullablePageId": {
+      "type": ["string", "null"],
+      "enum": ["p1", "p2", "p3", null]
+    },
+    "evidenceSource": {
+      "type": "string",
+      "enum": [
+        "url",
+        "header",
+        "cookie",
+        "html",
+        "text",
+        "css",
+        "meta",
+        "script_url",
+        "script_content",
+        "dom",
+        "javascript",
+        "network_hostname",
+        "dns_record",
+        "tls_issuer",
+        "robots",
+        "probe"
+      ]
+    },
+    "url": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2048,
+      "pattern": "^https?://"
+    },
+    "match": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "value", "truncated"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["presence", "value", "redacted"]
+        },
+        "value": {
+          "type": ["string", "null"]
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": { "const": "value" }
+            },
+            "required": ["kind"]
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "value": { "type": "null" },
+              "truncated": { "const": false }
+            }
+          }
+        }
+      ]
+    },
+    "category": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name"],
+      "properties": {
+        "id": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000000
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
+      }
+    },
+    "inference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["technology", "ruleId", "confidence", "version"],
+      "properties": {
+        "technology": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "ruleId": {
+          "$ref": "#/$defs/digest"
+        },
+        "confidence": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "version": {
+          "$ref": "#/$defs/version"
+        }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "collector",
+        "source",
+        "pageId",
+        "key",
+        "match",
+        "ruleId",
+        "pattern",
+        "confidence",
+        "version"
+      ],
+      "properties": {
+        "collector": {
+          "type": "string",
+          "enum": ["http", "browser", "dns", "tls"]
+        },
+        "source": {
+          "$ref": "#/$defs/evidenceSource"
+        },
+        "pageId": {
+          "$ref": "#/$defs/nullablePageId"
+        },
+        "key": {
+          "type": ["string", "null"],
+          "minLength": 1,
+          "maxLength": 2048
+        },
+        "match": {
+          "$ref": "#/$defs/match"
+        },
+        "ruleId": {
+          "$ref": "#/$defs/digest"
+        },
+        "pattern": {
+          "type": ["string", "null"],
+          "maxLength": 2048
+        },
+        "confidence": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "version": {
+          "$ref": "#/$defs/version"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "match": {
+                "type": "object",
+                "properties": {
+                  "kind": { "const": "presence" }
+                },
+                "required": ["kind"]
+              }
+            },
+            "required": ["match"]
+          },
+          "then": {
+            "properties": {
+              "pattern": { "type": "null" },
+              "version": { "type": "null" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "match": {
+                "type": "object",
+                "properties": {
+                  "kind": { "enum": ["value", "redacted"] }
+                },
+                "required": ["kind"]
+              }
+            },
+            "required": ["match"]
+          },
+          "then": {
+            "properties": {
+              "pattern": { "type": "string", "minLength": 1 }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "match": {
+                "type": "object",
+                "properties": {
+                  "kind": { "enum": ["presence", "redacted"] }
+                },
+                "required": ["kind"]
+              }
+            },
+            "required": ["match"]
+          },
+          "then": {
+            "properties": {
+              "version": { "type": "null" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "match": {
+                "type": "object",
+                "properties": {
+                  "kind": { "const": "value" }
+                },
+                "required": ["kind"]
+              }
+            },
+            "required": ["match"]
+          },
+          "then": {
+            "properties": {
+              "source": {
+                "enum": [
+                  "url",
+                  "header",
+                  "meta",
+                  "script_url",
+                  "network_hostname",
+                  "dns_record",
+                  "tls_issuer"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "allOf": [
+              {
+                "properties": {
+                  "source": { "const": "meta" }
+                },
+                "required": ["source"]
+              },
+              {
+                "properties": {
+                  "match": {
+                    "type": "object",
+                    "properties": {
+                      "kind": { "const": "value" }
+                    },
+                    "required": ["kind"]
+                  }
+                },
+                "required": ["match"]
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "key": {
+                "enum": ["generator", "application-name"]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "source": { "const": "dns_record" }
+            },
+            "required": ["source"]
+          },
+          "then": {
+            "properties": {
+              "key": {
+                "type": "string",
+                "pattern": "^[A-Z][A-Z0-9]{0,15}$"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "allOf": [
+              {
+                "properties": {
+                  "source": { "const": "dns_record" }
+                },
+                "required": ["source"]
+              },
+              {
+                "properties": {
+                  "match": {
+                    "type": "object",
+                    "properties": {
+                      "kind": { "const": "value" }
+                    },
+                    "required": ["kind"]
+                  }
+                },
+                "required": ["match"]
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "key": {
+                "enum": ["A", "AAAA", "CNAME", "MX", "NS", "PTR", "SRV"]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "collector": { "const": "dns" }
+            },
+            "required": ["collector"]
+          },
+          "then": {
+            "properties": {
+              "source": { "const": "dns_record" },
+              "pageId": { "type": "null" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "source": { "const": "dns_record" }
+            },
+            "required": ["source"]
+          },
+          "then": {
+            "properties": {
+              "collector": { "const": "dns" },
+              "pageId": { "type": "null" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "collector": { "const": "tls" }
+            },
+            "required": ["collector"]
+          },
+          "then": {
+            "properties": {
+              "source": { "const": "tls_issuer" },
+              "pageId": { "type": "null" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "source": { "const": "tls_issuer" }
+            },
+            "required": ["source"]
+          },
+          "then": {
+            "properties": {
+              "collector": { "const": "tls" },
+              "pageId": { "type": "null" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "source": { "enum": ["robots", "probe"] }
+            },
+            "required": ["source"]
+          },
+          "then": {
+            "properties": {
+              "collector": { "const": "http" },
+              "pageId": { "type": "null" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "collector": { "const": "browser" }
+            },
+            "required": ["collector"]
+          },
+          "then": {
+            "properties": {
+              "pageId": { "$ref": "#/$defs/pageId" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "source": {
+                "enum": ["dom", "javascript", "network_hostname"]
+              }
+            },
+            "required": ["source"]
+          },
+          "then": {
+            "properties": {
+              "collector": { "const": "browser" }
+            }
+          }
+        }
+      ]
+    },
+    "technology": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "categories",
+        "version",
+        "confidence",
+        "type",
+        "pageIds",
+        "evidence",
+        "inferredFrom"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "categories": {
+          "type": "array",
+          "maxItems": 32,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/category"
+          }
+        },
+        "version": {
+          "$ref": "#/$defs/version"
+        },
+        "confidence": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "type": {
+          "type": "string",
+          "enum": ["direct", "inferred"]
+        },
+        "pageIds": {
+          "type": "array",
+          "maxItems": 3,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/pageId"
+          }
+        },
+        "evidence": {
+          "type": "array",
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/evidence"
+          }
+        },
+        "inferredFrom": {
+          "type": "array",
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/inference"
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "type": { "const": "direct" }
+            },
+            "required": ["type"]
+          },
+          "then": {
+            "properties": {
+              "evidence": { "type": "array", "minItems": 1 },
+              "inferredFrom": { "type": "array", "maxItems": 0 }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": { "const": "inferred" }
+            },
+            "required": ["type"]
+          },
+          "then": {
+            "properties": {
+              "pageIds": { "type": "array", "maxItems": 0 },
+              "evidence": { "type": "array", "maxItems": 0 },
+              "inferredFrom": { "type": "array", "minItems": 1 }
+            }
+          }
+        }
+      ]
+    },
+    "collectors": {
+      "oneOf": [
+        { "const": [] },
+        { "const": ["http"] },
+        { "const": ["http", "browser"] }
+      ]
+    },
+    "pageRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "role", "url", "httpStatus", "collectors"],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/pageId"
+        },
+        "role": {
+          "type": "string",
+          "enum": ["entry", "detail", "listing", "content"]
+        },
+        "url": {
+          "$ref": "#/$defs/url"
+        },
+        "httpStatus": {
+          "type": ["integer", "null"],
+          "minimum": 100,
+          "maximum": 599
+        },
+        "collectors": {
+          "$ref": "#/$defs/collectors"
+        }
+      }
+    },
+    "pages": {
+      "oneOf": [
+        {
+          "type": "array",
+          "maxItems": 0
+        },
+        {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "prefixItems": [
+            {
+              "$ref": "#/$defs/pageRecord",
+              "type": "object",
+              "properties": {
+                "id": { "const": "p1" },
+                "role": { "const": "entry" }
+              }
+            }
+          ],
+          "items": false
+        },
+        {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "prefixItems": [
+            {
+              "$ref": "#/$defs/pageRecord",
+              "type": "object",
+              "properties": {
+                "id": { "const": "p1" },
+                "role": { "const": "entry" }
+              }
+            },
+            {
+              "$ref": "#/$defs/pageRecord",
+              "type": "object",
+              "properties": {
+                "id": { "const": "p2" },
+                "role": {
+                  "enum": ["detail", "listing", "content"]
+                }
+              }
+            }
+          ],
+          "items": false
+        },
+        {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "prefixItems": [
+            {
+              "$ref": "#/$defs/pageRecord",
+              "type": "object",
+              "properties": {
+                "id": { "const": "p1" },
+                "role": { "const": "entry" }
+              }
+            },
+            {
+              "$ref": "#/$defs/pageRecord",
+              "type": "object",
+              "properties": {
+                "id": { "const": "p2" },
+                "role": {
+                  "enum": ["detail", "listing", "content"]
+                }
+              }
+            },
+            {
+              "$ref": "#/$defs/pageRecord",
+              "type": "object",
+              "properties": {
+                "id": { "const": "p3" },
+                "role": {
+                  "enum": ["detail", "listing", "content"]
+                }
+              }
+            }
+          ],
+          "items": false,
+          "allOf": [
+            {
+              "contains": {
+                "type": "object",
+                "properties": {
+                  "role": { "const": "detail" }
+                },
+                "required": ["role"]
+              },
+              "minContains": 1,
+              "maxContains": 1
+            },
+            {
+              "contains": {
+                "type": "object",
+                "properties": {
+                  "role": {
+                    "enum": ["listing", "content"]
+                  }
+                },
+                "required": ["role"]
+              },
+              "minContains": 1,
+              "maxContains": 1
+            }
+          ]
+        }
+      ]
+    },
+    "error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "stage",
+        "code",
+        "pageId",
+        "retryable",
+        "message",
+        "ruleId",
+        "signal",
+        "limit",
+        "catalogRevision"
+      ],
+      "properties": {
+        "stage": {
+          "type": "string",
+          "enum": ["target", "robots", "http", "dns", "tls", "browser", "detect"]
+        },
+        "code": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[A-Z][A-Z0-9_]*$"
+        },
+        "pageId": {
+          "$ref": "#/$defs/nullablePageId"
+        },
+        "retryable": {
+          "type": "boolean"
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "ruleId": {
+          "type": ["string", "null"],
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "signal": {
+          "type": ["string", "null"],
+          "enum": [
+            "url",
+            "header",
+            "cookie",
+            "html",
+            "text",
+            "css",
+            "meta",
+            "script_url",
+            "script_content",
+            "dom",
+            "javascript",
+            "network_hostname",
+            "dns_record",
+            "tls_issuer",
+            "robots",
+            "probe",
+            null
+          ]
+        },
+        "limit": {
+          "type": ["string", "null"],
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "catalogRevision": {
+          "type": ["string", "null"],
+          "minLength": 1,
+          "maxLength": 256
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "stage": {
+                "enum": ["target", "robots", "http", "dns", "tls", "browser"]
+              }
+            },
+            "required": ["stage"]
+          },
+          "then": {
+            "properties": {
+              "ruleId": { "type": "null" },
+              "signal": { "type": "null" },
+              "limit": { "type": "null" },
+              "catalogRevision": { "type": "null" }
+            }
+          }
+        }
+      ]
+    },
+    "timings": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "totalMs",
+        "targetMs",
+        "robotsMs",
+        "httpMs",
+        "dnsMs",
+        "tlsMs",
+        "browserMs",
+        "detectMs"
+      ],
+      "properties": {
+        "totalMs": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "targetMs": { "$ref": "#/$defs/nullableMilliseconds" },
+        "robotsMs": { "$ref": "#/$defs/nullableMilliseconds" },
+        "httpMs": { "$ref": "#/$defs/nullableMilliseconds" },
+        "dnsMs": { "$ref": "#/$defs/nullableMilliseconds" },
+        "tlsMs": { "$ref": "#/$defs/nullableMilliseconds" },
+        "browserMs": { "$ref": "#/$defs/nullableMilliseconds" },
+        "detectMs": { "$ref": "#/$defs/nullableMilliseconds" }
+      }
+    },
+    "nullableMilliseconds": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "usage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "httpRequests",
+        "browserRequests",
+        "retries",
+        "pagesVisited",
+        "probesIssued",
+        "scriptBodiesInspected",
+        "staticTransferredBytes",
+        "browserTransferredBytes"
+      ],
+      "properties": {
+        "httpRequests": { "$ref": "#/$defs/nonnegativeInteger" },
+        "browserRequests": { "$ref": "#/$defs/nonnegativeInteger" },
+        "retries": { "$ref": "#/$defs/nonnegativeInteger" },
+        "pagesVisited": { "$ref": "#/$defs/nonnegativeInteger" },
+        "probesIssued": { "$ref": "#/$defs/nonnegativeInteger" },
+        "scriptBodiesInspected": { "$ref": "#/$defs/nonnegativeInteger" },
+        "staticTransferredBytes": { "$ref": "#/$defs/nonnegativeInteger" },
+        "browserTransferredBytes": { "$ref": "#/$defs/nonnegativeInteger" }
+      }
+    },
+    "nonnegativeInteger": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["node", "playwright", "chromiumRevision"],
+      "properties": {
+        "node": {
+          "type": "string",
+          "maxLength": 64,
+          "pattern": "^(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)$"
+        },
+        "playwright": {
+          "type": "string",
+          "maxLength": 64,
+          "pattern": "^(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)$"
+        },
+        "chromiumRevision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
+      }
+    },
+    "catalog": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "revision", "digest"],
+      "properties": {
+        "source": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "revision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "digest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scannerVersion", "runtime", "catalog", "configDigest"],
+      "properties": {
+        "scannerVersion": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$"
+        },
+        "runtime": {
+          "$ref": "#/$defs/runtime"
+        },
+        "catalog": {
+          "$ref": "#/$defs/catalog"
+        },
+        "configDigest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "domainResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "runId",
+        "domain",
+        "scannedAt",
+        "status",
+        "finalUrl",
+        "scanMode",
+        "pages",
+        "technologies",
+        "errors",
+        "timings",
+        "usage",
+        "provenance"
+      ],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "runId": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+        },
+        "domain": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 253,
+          "pattern": "^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+          "allOf": [
+            {
+              "type": "string",
+              "pattern": "\\.[a-z0-9-]*[a-z][a-z0-9-]*$"
+            }
+          ]
+        },
+        "scannedAt": {
+          "type": "string",
+          "pattern": "^[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]\\.[0-9]{3}Z$"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["success", "partial", "failed"]
+        },
+        "finalUrl": {
+          "oneOf": [
+            { "$ref": "#/$defs/url" },
+            { "type": "null" }
+          ]
+        },
+        "scanMode": { "const": "full" },
+        "pages": {
+          "$ref": "#/$defs/pages"
+        },
+        "technologies": {
+          "type": "array",
+          "maxItems": 20000,
+          "items": {
+            "$ref": "#/$defs/technology"
+          }
+        },
+        "errors": {
+          "type": "array",
+          "maxItems": 128,
+          "items": {
+            "$ref": "#/$defs/error"
+          }
+        },
+        "timings": {
+          "$ref": "#/$defs/timings"
+        },
+        "usage": {
+          "$ref": "#/$defs/usage"
+        },
+        "provenance": {
+          "$ref": "#/$defs/provenance"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": { "const": "success" }
+            },
+            "required": ["status"]
+          },
+          "then": {
+            "properties": {
+              "errors": { "type": "array", "maxItems": 0 }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": { "const": "partial" }
+            },
+            "required": ["status"]
+          },
+          "then": {
+            "properties": {
+              "errors": { "type": "array", "minItems": 1 }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": { "const": "failed" }
+            },
+            "required": ["status"]
+          },
+          "then": {
+            "properties": {
+              "technologies": { "type": "array", "maxItems": 0 },
+              "errors": { "type": "array", "minItems": 1 }
+            }
+          }
+        }
+      ]
+    }
+  }
+}
