@@ -289,6 +289,36 @@ test("loads the exact pinned baseline as immutable plain data", () => {
     networkUrlRules: 113,
     indexes: 16,
   });
+  assert.deepEqual(catalog.inspectionPlan.probePaths, [
+    "/layouts/System/VisitorIdentification.aspx",
+    "/magento_version",
+    "/typo3/sysext/core/Resources/Public/Images/typo3_orange.svg",
+  ]);
+  assert.deepEqual(
+    catalog.rules
+      .filter((rule) => rule.source === "probe")
+      .map((rule) => [
+        rule.technology,
+        rule.locator,
+        rule.matchMode,
+        rule.pattern,
+      ]),
+    [
+      ["Magento", "/magento_version", "literal", "magento"],
+      [
+        "Sitecore",
+        "/layouts/System/VisitorIdentification.aspx",
+        "literal",
+        "sc_Contact",
+      ],
+      [
+        "TYPO3 CMS",
+        "/typo3/sysext/core/Resources/Public/Images/typo3_orange.svg",
+        "presence",
+        null,
+      ],
+    ],
+  );
   assertDeepFrozenPlainData(catalog);
   assert.deepEqual(structuredClone(catalog), catalog);
 });

@@ -11,6 +11,7 @@ import {
   type EvidenceSource,
   type HttpEntryResult,
   type HttpPageResult,
+  type HttpProbeObservation,
   type HttpRobotsObservation,
   type HttpResponseObservations,
   type InfrastructureObservations,
@@ -34,6 +35,7 @@ export interface DetectHttpContext {
   readonly pool: DetectorPool;
   readonly config: ScanConfig;
   readonly httpPages?: readonly HttpPageResult[];
+  readonly probes?: readonly HttpProbeObservation[];
   readonly robots?: readonly HttpRobotsObservation[];
   readonly browserPages?: readonly BrowserPageObservations[];
   readonly infrastructure?: InfrastructureObservations;
@@ -219,6 +221,7 @@ function candidateIdentity(candidate: CandidateDraft): string {
 function collectCandidates(
   input: HttpEntryResult,
   httpPages: readonly HttpPageResult[],
+  probes: readonly HttpProbeObservation[],
   additionalRobots: readonly HttpRobotsObservation[],
   browserPages: readonly BrowserPageObservations[],
   infrastructure: InfrastructureObservations | undefined,
@@ -310,6 +313,10 @@ function collectCandidates(
   }
   for (const robots of additionalRobots) {
     add("http", "value", "robots", null, null, robots.text);
+  }
+
+  for (const probe of probes) {
+    add("http", "value", "probe", null, probe.path, probe.body);
   }
 
   for (const page of browserPages) {
@@ -1197,6 +1204,7 @@ export async function detectHttp(
   const candidates = collectCandidates(
     input,
     context.httpPages ?? [],
+    context.probes ?? [],
     context.robots ?? [],
     context.browserPages ?? [],
     context.infrastructure,

@@ -207,6 +207,18 @@ export interface HttpRobotsObservation {
   readonly text: string;
 }
 
+export interface HttpProbeObservation {
+  readonly path: string;
+  readonly body: string;
+}
+
+export interface HttpProbeResult {
+  readonly observations: readonly HttpProbeObservation[];
+  readonly robots: readonly HttpRobotsObservation[];
+  readonly errors: readonly ScanError[];
+  readonly completed: boolean;
+}
+
 export interface HttpResponseObservations {
   readonly finalNetworkUrl: string;
   readonly statusCode: number;
@@ -784,6 +796,30 @@ function sanitizePath(pathname: string, limits: SanitizationLimits): string {
     .join("/");
 }
 
+function isSafeProbePath(value: string, maximumCodeUnits: number): boolean {
+  if (
+    value.length === 0
+    || value.length > maximumCodeUnits
+    || !value.startsWith("/")
+    || value.startsWith("//")
+    || value.includes("\\")
+    || value.includes("?")
+    || value.includes("#")
+  ) {
+    return false;
+  }
+
+  try {
+    const resolved = new URL(value, "https://catalog-probe.invalid/");
+    return resolved.origin === "https://catalog-probe.invalid"
+      && resolved.pathname === value
+      && resolved.search === ""
+      && resolved.hash === "";
+  } catch {
+    return false;
+  }
+}
+
 export function sanitizeUrl(
   value: string,
   limits: SanitizationLimits = defaultSanitizationLimits,
@@ -1279,6 +1315,16 @@ function validateEvidenceValue(
     issues.push(`${path}.key exposes a sensitive or opaque locator`);
   }
 
+  if (
+    evidence.source === "probe"
+    && (
+      evidence.key === null
+      || !isSafeProbePath(evidence.key, config.limits.url.codeUnits)
+    )
+  ) {
+    issues.push(`${path}.key is not a safe catalog probe path`);
+  }
+
   const value = evidence.match.value;
 
   if (evidence.match.kind !== "value" || value === null) {
@@ -1707,6 +1753,21 @@ function validateConfiguredLimits(
 
   if (result.usage.probesIssued > result.usage.httpRequests) {
     issues.push("$.usage.probesIssued exceeds $.usage.httpRequests");
+  }
+
+  if (result.usage.probesIssued > 0 && result.timings.httpMs === null) {
+    issues.push("$.timings.httpMs is null despite catalog probe requests");
+  }
+
+  const probeEvidenceKeys = new Set(
+    result.technologies.flatMap((technology) =>
+      technology.evidence
+        .filter((evidence) => evidence.source === "probe")
+        .map((evidence) => evidence.key),
+    ),
+  );
+  if (probeEvidenceKeys.size > result.usage.probesIssued) {
+    issues.push("$.usage.probesIssued is lower than evidenced catalog probes");
   }
 
   if (

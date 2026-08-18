@@ -3,9 +3,10 @@
 > Project status: the application foundation, protected HTTP/browser transports,
 > fail-closed robots policy, static HTTP collector, fingerprint compiler,
 > isolated detector, protected Playwright/Chromium collector and pool, and
-> bounded DNS/TLS infrastructure collection and pipeline orchestration are
-> implemented and tested. Catalog-probe collection is the next roadmap slice;
-> output integration and the runnable CLI remain separate later slices.
+> bounded catalog-probe and DNS/TLS infrastructure collection plus pipeline
+> orchestration are implemented and tested. Incremental output, resume, and
+> summary generation are the next roadmap slice; the runnable CLI remains a
+> separate later slice.
 
 ## Goal
 
@@ -77,6 +78,7 @@ The provided benchmark contains 200 unique domains in a Snappy-compressed Parque
 │   ├── crawl/
 │   │   ├── transport.ts
 │   │   ├── http.ts
+│   │   ├── probe.ts
 │   │   ├── robots.ts
 │   │   ├── browser.ts
 │   │   └── infrastructure.ts
@@ -115,6 +117,7 @@ The provided benchmark contains 200 unique domains in a Snappy-compressed Parque
 │   ├── model.test.ts
 │   ├── parquet.test.ts
 │   ├── pool.test.ts
+│   ├── probe.test.ts
 │   ├── robots.test.ts
 │   ├── scan-config-schema.test.ts
 │   ├── target.test.ts
@@ -205,7 +208,11 @@ Collect the entry page with HTTP and the isolated browser
         ↓
 Select at most two eligible internal pages deterministically
         ↓
-Collect the selected pages, DNS, TLS, and browser script observations
+Collect the selected pages and browser script observations
+        ↓
+Collect bounded catalog probes on the exact final origin
+        ↓
+Collect catalog-requested DNS records and the retained TLS issuer
         ↓
 Match direct fingerprints in the isolated detector pool
         ↓
@@ -224,10 +231,11 @@ before the next page request. A cross-authority redirect therefore receives its
 own robots policy, while a same-authority redirect still receives a new path
 decision.
 
-Catalog probe paths are already validated and compiled as non-executable data,
-but this pipeline slice does not fetch them. Probe collection remains a
-separate roadmap slice; until it is implemented, `usage.probesIssued` is always
-`0`.
+Catalog probe paths are validated and compiled as non-executable data. After
+the selected pages finish, the pipeline requests their sorted bounded prefix
+on the exact final origin, then collects DNS/TLS and submits every observation
+to the detector once. Probe requests use the same protected transport, robots
+policy, active-domain deadline, and aggregate HTTP limits as page requests.
 
 ## Parquet input contract v1
 
@@ -422,19 +430,21 @@ An admitted body accepts only one of `identity`,
 decompressed limits are enforced while streaming. `robots.txt` uses its 512 KiB
 limit for both wire and decoded bytes in v1.
 
-Redirect `Location` values are resolved and validated lexically by the
-transport helper, including canonical public IP literals, but are not fetched
-automatically. The next explicit hop performs the authoritative DNS and socket
-checks. Local adversarial tests hook Node's DNS/socket modules only inside the
-test process before loading the production module. The hook lives under
-`test/`, is excluded from `dist`, and the built transport exports no injectable
-resolver, connector, peer metadata, or production option that disables policy.
+Page and robots redirect `Location` values are resolved and validated lexically
+by the transport helper, including canonical public IP literals, but are not
+fetched automatically. The next explicit hop performs the authoritative DNS
+and socket checks. A catalog-probe `3xx` is deliberately a no-follow miss, so
+its `Location` is not interpreted as another probe destination. Local
+adversarial tests hook Node's DNS/socket modules only inside the test process
+before loading the production module. The hook lives under `test/`, is excluded
+from `dist`, and the built transport exports no injectable resolver, connector,
+peer metadata, or production option that disables policy.
 
 Top-level requests use `GET`; there is no preliminary `HEAD`. Every DNS answer,
-actual connection destination,
-and redirect destination is revalidated by the shared SSRF policy. A chain may
-contain at most five redirects, and a cross-origin redirect must pass the new
-origin's robots policy before the next top-level request.
+actual connection destination, and every page or robots redirect destination
+which may become a new request is revalidated by the shared SSRF policy. A
+followed chain may contain at most five redirects, and a cross-origin redirect
+must pass the new origin's robots policy before the next top-level request.
 
 ### Static HTTP collector v1
 
@@ -653,12 +663,67 @@ are removed, and the survivors are sorted by that public URL before receiving
 compact IDs `p2` and `p3`; therefore sanitization cannot invalidate wire order
 and a removed first candidate cannot leave an ID gap.
 
-Catalog probes do not count as pages. The compiler already retains at most five
-unique validated relative paths for a future collector, but the current
-pipeline issues none. That collector is deferred to a separate slice and will
-have to use the exact final origin, no query or fragment, `GET`, robots, and the
-separate request and byte budgets before `usage.probesIssued` may become
-non-zero.
+Catalog probes do not count as pages. Their collection policy is defined below
+and does not change page selection, page IDs, `pagesVisited`, or browser-prefix
+semantics.
+
+### Catalog probes v1
+
+`crawl/probe.ts` receives only the final network URL of an HTML entry, the
+probe paths from the deeply frozen catalog inspection plan, the validated
+configuration, and the same protected transport session and run-scoped robots
+service used by static pages. A non-HTML or unresolved entry schedules no
+probes. Probe collection is sequential after all selected-page HTTP/browser
+collection and before DNS/TLS, browser-session finalization, and the single
+detector invocation.
+
+The compiler and collector both enforce at most five unique paths. Each path is
+an absolute same-origin pathname beginning with one `/`, with no credentials,
+backslash, query, or fragment; it must survive WHATWG URL resolution without
+normalization. The collector revalidates and sorts paths by direct ascending
+UTF-16 code-unit order, resolves each against the exact final origin root, and
+never uses the final page pathname as a base. Both the path and the complete
+composed `origin + path` URL must fit the configured URL limit; an over-limit
+composed URL emits non-retryable `HTTP_LIMIT_EXCEEDED` before robots or
+transport reservation and stops the stage.
+
+Before each path, the collector evaluates robots for the resolved URL. A rule
+denial skips that path without issuing a probe or recording an error, while an
+unavailable robots policy fails closed, preserves its stable error, and stops
+the probe stage. A successfully admitted robots body remains a bounded
+`robots` detector signal and is deduplicated with bodies collected elsewhere.
+
+Each allowed path receives exactly one protected `GET` with body purpose
+`probe`. Version 1 performs no probe retry and follows no probe redirect. Only
+a `2xx` response produces an observation. `204` and `205` therefore produce an
+empty body observation. Ordinary `3xx` responses are not followed, and ordinary
+`4xx` responses are misses which continue to the next sorted path. `401`,
+`403`, `407`, and `451`
+emit a non-retryable `HTTP_REQUEST_FAILED` and stop the remaining probe
+stage; `408`, `425`, `429`, and `5xx` emit the same stable code as retryable and
+also stop without an in-scan retry.
+
+An admitted body uses the probe-specific 256 KiB compressed and 512 KiB
+decompressed limits and is decoded as UTF-8 with deterministic replacement for
+malformed byte sequences. This keeps a successful bounded response available
+to a presence rule without interpreting an arbitrary legacy charset; literal
+rules match only the resulting bounded string. Transport, deadline,
+decompression, destination-policy, or size failures keep their stable error and
+stop the stage. Probe bytes also consume the aggregate static-transfer and
+decompressed-domain budgets.
+
+The transport increments `usage.probesIssued` atomically with
+`usage.httpRequests` when a `purpose: "probe"` transaction is actually
+reserved, including a transaction which later fails. Robots-denied or
+pre-reservation rejected work does not increment it. The transport independently
+enforces both the five-probe limit and the 40-transaction domain limit.
+
+A successful observation supplies the exact validated path as detector key and
+the decoded body as its bounded value. This supports both catalog presence rules
+and literal body rules without treating response headers, cookies, status, or
+URL as additional probe signals. Public evidence is always
+`collector: "http"`, `source: "probe"`, `pageId: null`; the path remains the
+locator and every matched probe-body value is redacted.
 
 ### Browser behavior
 
@@ -818,37 +883,37 @@ The admitted scan performs these bounded steps:
 3. apply page-selection policy v1, perform at most two asynchronous robots
    checks, assign compact `p2`/`p3`, and collect each survivor with exact-origin
    HTTP followed by browser only when its HTTP page is browser-eligible;
-4. after all static page requests, collect the catalog-requested DNS records
-   and reuse the final verified HTTPS issuer, so infrastructure admission does
-   not race static HTTP on the shared session budget;
-5. finish the browser session, then invoke the detector pool exactly once with
-   the complete bounded HTTP `p1`–`p3`, browser, robots, DNS, and TLS
+4. for an HTML entry, collect the sorted bounded catalog probes on its exact
+   final origin, after all page requests and before infrastructure collection;
+5. collect the catalog-requested DNS records and reuse the final verified HTTPS
+   issuer, so infrastructure admission does not race any static HTTP request on
+   the shared session budget;
+6. finish the browser session, then invoke the detector pool exactly once with
+   the complete bounded HTTP `p1`–`p3`, browser, robots, probe, DNS, and TLS
    observations; relationships and exclusions therefore also run once over the
    combined candidate set;
-6. sanitize, deduplicate, sort, enforce result caps, and pass the complete
+7. sanitize, deduplicate, sort, enforce result caps, and pass the complete
    `DomainResult` through the semantic validator before returning it.
 
 Every successfully admitted robots body from entry collection, structural
-prechecks, or internal-page collection remains a detector signal with
-`pageId: null`, even when the associated page is later skipped or fails. Exact
-duplicates are collapsed by the detector, and any retained robots body counts
-as an admitted signal for `partial` versus `failed` status.
+prechecks, internal-page collection, or probe checks remains a detector signal
+with `pageId: null`, even when the associated page or probe is later skipped or
+fails. Exact duplicates are collapsed by the detector, and any retained robots
+body counts as an admitted signal for `partial` versus `failed` status.
 
 A failed static page is never presented as browser-only success. Browser pages
 form an ordered prefix of eligible `p1`–`p3`; once an earlier browser page
 cannot be collected, the pipeline does not create a later browser-page gap,
 although already selected later pages may still contribute static HTTP
 observations. A final entry 2xx non-HTML response still follows its documented
-terminal partial-result path and schedules no internal pages. Catalog probes
-are not part of these steps: compiled probe paths remain unused and
-`probesIssued` remains `0` for every result from pipeline v1.
+terminal partial-result path and schedules no internal pages or catalog probes.
 
 Stage timings use the same monotonic clock. `targetMs` covers entry target
-selection, `robotsMs` accumulates robots work, and `httpMs` covers static HTTP
-work excluding the robots time nested inside it; `browserMs`, `dnsMs`, `tlsMs`,
-and `detectMs` cover only started stages. Named stages may overlap and are
-clamped to `totalMs`. A skipped stage is `null`, and a completed
-sub-millisecond stage may be `0`.
+selection, `robotsMs` accumulates robots work, and `httpMs` covers static page
+and probe HTTP work excluding the robots time nested inside it; `browserMs`,
+`dnsMs`, `tlsMs`, and `detectMs` cover only started stages. Named stages may
+overlap and are clamped to `totalMs`. A skipped stage is `null`, and a
+completed sub-millisecond stage may be `0`.
 
 ## Observation and detection boundaries
 
@@ -863,6 +928,7 @@ Collectors produce normalized observations such as:
 - rendered DOM facts requested by the fingerprint catalog;
 - selected JavaScript property paths requested by the catalog;
 - bounded browser request URLs and canonical public hostnames;
+- validated catalog-probe paths and bounded decoded response bodies;
 - DNS records and TLS issuer.
 
 The detector consumes those observations and produces:
@@ -994,11 +1060,11 @@ A representative direct detection is shown below.
     "detectMs": 18
   },
   "usage": {
-    "httpRequests": 3,
+    "httpRequests": 5,
     "browserRequests": 24,
     "retries": 0,
     "pagesVisited": 1,
-    "probesIssued": 0,
+    "probesIssued": 3,
     "scriptBodiesInspected": 4,
     "staticTransferredBytes": 18320,
     "browserTransferredBytes": 130000
@@ -1027,7 +1093,8 @@ Evidence `source` is one of `url`, `header`, `cookie`, `html`, `text`, `css`,
 signals and is required for every browser observation. `key` identifies the
 header, cookie, metadata name, selector, JavaScript path, DNS record type, or
 equivalent locator and is `null` for an unkeyed signal; `dns_record` always uses
-a non-null uppercase record-type key. Evidence `pageId`,
+a non-null uppercase record-type key, while `probe` uses its exact validated
+path as a non-null key. Evidence `pageId`,
 `key`, `pattern`, and `version` are the only nullable evidence scalars.
 `match.value` is nullable under the redaction rules below.
 
@@ -1038,9 +1105,11 @@ browser traffic, while `usage.browserRequests` counts requests admitted or
 explicitly aborted by browser policy. Every candidate, robots fetch, redirect
 hop, retry, and page which reaches the HTTP transport increments
 `httpRequests`; `retries` counts only additional attempts. `pagesVisited` equals
-the number of emitted `PageRecord` values. `probesIssued` is reserved for probe
-requests which reach transport and is exactly `0` in the current pipeline slice;
-`scriptBodiesInspected` counts bounded bodies admitted to detection.
+the number of emitted `PageRecord` values. `probesIssued` counts only
+`purpose: "probe"` transactions reserved by the protected transport, is capped
+at five, and is always less than or equal to `httpRequests`; a later network or
+body failure does not undo an already reserved count. `scriptBodiesInspected`
+counts bounded bodies admitted to detection.
 
 `staticTransferredBytes` counts compressed response-body bytes read by the
 protected Node transport. `browserTransferredBytes` counts downstream bytes at
@@ -1319,10 +1388,10 @@ These are starting values, not final performance claims:
 | Browser page including settle | 15 seconds |
 | Canonical target candidates | 4 |
 | Redirects per chain | 5 |
-| Static HTTP transactions per domain | 40 total, including robots, candidates, redirects, retries, pages, and future probes |
-| Transient retry | 1 per request, still inside the 40-transaction total |
+| Static HTTP transactions per domain | 40 total, including robots, candidates, redirects, retries, pages, and probes |
+| Transient retry | 1 per eligible static-page request, still inside the 40-transaction total; robots and probes do not retry |
 | Top-level pages | 3 |
-| Catalog probes | 5 reserved; current pipeline issues 0 |
+| Catalog probes | 5 maximum; one sorted exact-origin `GET` per path |
 | Input hostname | 2,048 UTF-16 code units |
 | Any fetched or persisted URL | 2,048 UTF-16 code units |
 | Header fields / total header bytes | 100 / 64 KiB |
@@ -1484,8 +1553,13 @@ The final summary should include at least:
   and pruning an inference whose only parent was suppressed.
 - Pipeline tests use injected deterministic collectors or controlled local
   servers, never unstable public websites, and cover one combined detector
-  call, HTTP/browser `p1`–`p3`, DNS/TLS, queue/deadline separation, cleanup,
-  partial/failed results, deterministic error merge, and `probesIssued: 0`.
+  call, HTTP/browser `p1`–`p3`, sorted exact-origin probes, DNS/TLS,
+  queue/deadline separation, cleanup, partial/failed results, deterministic
+  error merge, probe evidence, and transport-owned `probesIssued` accounting.
+- Catalog-probe tests cover path revalidation and sorting, composed-URL limits,
+  robots allow/deny/unavailable behavior, one-shot GET/no-follow/no-retry,
+  2xx and empty-body presence, UTF-8 replacement, denial/transient stop
+  statuses, bounded bodies, redacted literal evidence, and request accounting.
 - `browser-proxy.test.ts` covers one-use HTTP grants, CONNECT authority/port
   policy, mixed and non-public DNS, peer pinning, late-DNS/page cleanup,
   request/byte limits, and a zero-hit loopback canary.
@@ -1717,7 +1791,8 @@ the documented length-framed hash.
 creating a new network or parsing path. Final and redirect URLs become `url`;
 response headers, cookies, HTML, visible text, normalized metadata, script
 resource URLs, retained robots text, requested DOM/JavaScript facts, bounded
-script bodies, and browser request URLs map to their matching signals.
+script bodies, browser request URLs, validated probe path/body pairs, DNS
+records, and the retained TLS issuer map to their matching signals.
 Upstream `xhr` rules match `network_url`, not only a hostname: the reviewed
 snapshot has 113 such rules and 16 require a path or query component. Matching
 therefore uses the complete bounded in-memory request URL, while evidence emits
@@ -1727,12 +1802,13 @@ XHR coverage. Stylesheet, image, iframe, generic link, navigation-link, and
 HTTP-status observations are deliberately not detector candidates in v1.
 Page-scoped HTTP observations retain their exact `p1`, `p2`, or `p3`, as
 browser evidence already does. A terminal non-HTML entry response and robots
-use `pageId: null`; an already selected internal response remains linked to its
-assigned `p2`/`p3`. Exact candidate duplicates are removed and HTTP candidates
-rank before the additional browser tier when a domain work cap admits only a
-prefix. The pipeline submits the complete bounded HTTP/browser/infrastructure
-set to the detector once per domain instead of merging independently detected
-page results.
+use `pageId: null`; probes also use `pageId: null` with the validated path as
+key, while an already selected internal response remains linked to its assigned
+`p2`/`p3`. Exact candidate duplicates are removed and HTTP candidates rank
+before the additional browser tier when a domain work cap admits only a prefix.
+The pipeline submits the complete bounded HTTP/browser/probe/infrastructure set
+to the detector once per domain instead of merging independently detected page
+results.
 
 Workers match raw bounded candidates, while the parent materializes only
 sanitized evidence. Cookie, HTML, text, and robots matches are always redacted;
@@ -1961,10 +2037,10 @@ are recorded in `THIRD_PARTY_NOTICES.md`.
 - [x] Add bounded DNS/TLS infrastructure signals.
 - [x] Implement `scanDomain()`, deterministic internal-page selection, and
   combined HTTP/browser/DNS/TLS detection.
+- [x] Add bounded declarative catalog-probe collection.
 
 Remaining implementation slices:
 
-- [ ] Add bounded declarative catalog-probe collection.
 - [ ] Add incremental output, resume, and summary generation.
 - [ ] Add the runnable CLI that connects Parquet input, the bounded local
   worker pool, `scanDomain()`, and incremental output.
@@ -1998,7 +2074,7 @@ Coding starts only after these decisions are explicit:
 
 The readiness gate, application foundation, protected HTTP/browser transports,
 robots policy, static and rendered observation collectors, fingerprint
-compiler, isolated detector, bounded Chromium pool, and DNS/TLS infrastructure
-collector are complete, as is pipeline orchestration. Catalog probes are the
-current unchecked slice; output integration and the runnable CLI remain
-separate later slices.
+compiler, isolated detector, bounded Chromium pool, catalog probes, and DNS/TLS
+infrastructure collector are complete, as is pipeline orchestration.
+Incremental output, resume, and summary generation are the current unchecked
+slice; the runnable CLI remains a separate later slice.

@@ -11,6 +11,7 @@ import {
   collectHttpPage,
 } from "./crawl/http.ts";
 import { collectInfrastructure } from "./crawl/infrastructure.ts";
+import { collectCatalogProbes } from "./crawl/probe.ts";
 import type {
   RobotsCheck,
   RobotsPolicyService,
@@ -34,6 +35,7 @@ import {
   type ErrorStage,
   type HttpEntryResult,
   type HttpPageResult,
+  type HttpProbeResult,
   type HttpRobotsObservation,
   type InfrastructureResult,
   type PageCollectors,
@@ -681,6 +683,12 @@ export async function scanDomain(
     tlsMs: null,
     completed: true,
   });
+  let probeResult: HttpProbeResult = Object.freeze({
+    observations: Object.freeze([]),
+    robots: Object.freeze([]),
+    errors: Object.freeze([]),
+    completed: true,
+  });
   let detection: DetectHttpResult = Object.freeze({
     technologies: Object.freeze([]),
     errors: Object.freeze([]),
@@ -916,6 +924,34 @@ export async function scanDomain(
       browserPrefixOpen = false;
     }
 
+    const probeFinalUrl = entry.kind === "html"
+      ? entry.page.response.finalNetworkUrl
+      : null;
+    if (
+      probeFinalUrl !== null
+      && context.catalog.inspectionPlan.probePaths.length > 0
+    ) {
+      const probeStarted = now();
+      probeResult = await collectMeasured(() => collectCatalogProbes(
+        probeFinalUrl,
+        {
+          config: context.config,
+          session,
+          robots: measuredRobots.service,
+          probePaths: context.catalog.inspectionPlan.probePaths,
+          ...(options.signal === undefined
+            ? {}
+            : { callerSignal: options.signal }),
+        },
+      ));
+      errors.push(...probeResult.errors);
+      precheckRobots.push(...probeResult.robots);
+      recordNetworkErrorTimings(
+        probeResult.errors,
+        elapsed(now, probeStarted),
+      );
+    }
+
     infrastructure = await collectInfrastructure(domain, {
       config: context.config,
       session,
@@ -953,6 +989,7 @@ export async function scanDomain(
         pool: context.detectorPool,
         config: context.config,
         httpPages,
+        probes: probeResult.observations,
         robots: Object.freeze([...precheckRobots]),
         browserPages: browserResult.pages,
         infrastructure: infrastructure.observations,
@@ -1022,6 +1059,8 @@ export async function scanDomain(
     || (entry?.robots.length ?? 0) > 0
     || precheckRobots.length > 0
     || httpPages.some((page) => page.robots.length > 0)
+    || probeResult.observations.length > 0
+    || probeResult.robots.length > 0
     || browserResult.pages.length > 0
     || infrastructure.observations.dnsRecords.length > 0
     || infrastructure.observations.tlsIssuer !== null;
@@ -1084,7 +1123,7 @@ export async function scanDomain(
     browserRequests: browserUsage.browserRequests,
     retries: transportUsage.retries,
     pagesVisited: outputPages.length,
-    probesIssued: 0,
+    probesIssued: transportUsage.probesIssued,
     scriptBodiesInspected: browserUsage.scriptBodiesInspected,
     staticTransferredBytes: transportUsage.staticTransferredBytes,
     browserTransferredBytes: browserUsage.browserTransferredBytes,

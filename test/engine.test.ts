@@ -787,6 +787,122 @@ test("orders infrastructure candidates and publishes bounded DNS and TLS evidenc
   }), domainResult);
 });
 
+test("maps catalog probes by path and redacts literal bodies", async () => {
+  const magentoPath = "/magento_version";
+  const typo3Path = "/typo3/sysext/core/Resources/Public/Images/typo3_orange.svg";
+  const rules = [
+    rule(1, "Magento", {
+      source: "probe",
+      locator: magentoPath,
+      pattern: "magento",
+      matchMode: "literal",
+    }),
+    rule(2, "TYPO3 CMS", {
+      source: "probe",
+      locator: typo3Path,
+      pattern: null,
+      matchMode: "presence",
+    }),
+  ];
+  const fingerprintCatalog = catalog(
+    [technology("Magento"), technology("TYPO3 CMS")],
+    rules,
+  );
+  let observed: readonly DetectorCandidate[] = [];
+  const input = htmlEntry();
+  const result = await detectHttp(input, {
+    catalog: fingerprintCatalog,
+    config: defaultConfig,
+    probes: [
+      { path: typo3Path, body: "" },
+      { path: magentoPath, body: "release=MAGENTO 2" },
+      { path: magentoPath, body: "release=MAGENTO 2" },
+    ],
+    pool: fakePool(fingerprintCatalog, (candidates) => {
+      observed = candidates;
+      const magento = candidateOrdinal(
+        candidates,
+        (candidate) => candidate.source === "probe"
+          && candidate.key === magentoPath,
+      );
+      const typo3 = candidateOrdinal(
+        candidates,
+        (candidate) => candidate.source === "probe"
+          && candidate.key === typo3Path,
+      );
+      return emptyMatchResult({
+        matches: [
+          {
+            ruleOrdinal: 0,
+            candidateOrdinal: magento,
+            index: "release=".length,
+            length: "MAGENTO".length,
+            version: null,
+          },
+          {
+            ruleOrdinal: 1,
+            candidateOrdinal: typo3,
+            index: 0,
+            length: 0,
+            version: null,
+          },
+        ],
+      });
+    }),
+  });
+
+  assert.deepEqual(
+    observed
+      .filter((candidate) => candidate.source === "probe")
+      .map(({ kind, key, value }) => [kind, key, value]),
+    [
+      ["value", magentoPath, "release=MAGENTO 2"],
+      ["value", typo3Path, ""],
+    ],
+  );
+  assert.equal(result.signalAdmitted, true);
+  assert.deepEqual(
+    result.technologies.map((item) => ({
+      name: item.name,
+      pageIds: item.pageIds,
+      evidence: item.evidence.map((evidence) => ({
+        collector: evidence.collector,
+        source: evidence.source,
+        pageId: evidence.pageId,
+        key: evidence.key,
+        pattern: evidence.pattern,
+        match: evidence.match,
+      })),
+    })),
+    [
+      {
+        name: "Magento",
+        pageIds: [],
+        evidence: [{
+          collector: "http",
+          source: "probe",
+          pageId: null,
+          key: magentoPath,
+          pattern: "magento",
+          match: { kind: "redacted", value: null, truncated: false },
+        }],
+      },
+      {
+        name: "TYPO3 CMS",
+        pageIds: [],
+        evidence: [{
+          collector: "http",
+          source: "probe",
+          pageId: null,
+          key: typo3Path,
+          pattern: null,
+          match: { kind: "presence", value: null, truncated: false },
+        }],
+      },
+    ],
+  );
+});
+
 test("merges browser observations once and preserves every evidence page", async () => {
   const domLocator = JSON.stringify(["#app", "exists", null]);
   const rules = [

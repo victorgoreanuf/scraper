@@ -298,6 +298,7 @@ test("pins a successful HTTP request while preserving Host and usage", async (t)
   assert.deepEqual(session.getUsage(), {
     httpRequests: 1,
     retries: 0,
+    probesIssued: 0,
     staticTransferredBytes: 2,
   });
 });
@@ -520,6 +521,7 @@ test("rejects malformed absolute request URLs before budget or DNS", async (t) =
   assert.deepEqual(session.getUsage(), {
     httpRequests: 0,
     retries: 0,
+    probesIssued: 0,
     staticTransferredBytes: 0,
   });
 });
@@ -696,6 +698,198 @@ test("performs redirect hops individually with fresh DNS and counters", async (t
   assert.equal(harness.lookupCalls.length, 2);
   assert.equal(harness.connectCalls.length, 2);
   assert.equal(session.getUsage().httpRequests, 2);
+});
+
+test("does not parse probe redirects and enforces the reserved probe cap", async (t) => {
+  const paths: string[] = [];
+  const server = createHttpServer((request, response) => {
+    paths.push(request.url ?? "");
+
+    if (request.url === "/redirect") {
+      response.statusCode = 302;
+      response.setHeader("location", "http://[");
+      response.end();
+      return;
+    }
+
+    response.end(request.url === "/page" ? "p" : "ok");
+  });
+  const port = await listenOnLoopback(t, server);
+  const harness = runtimeHarness({
+    lookup: () => [{ address: primaryPublicAddress, family: 4 }],
+    routes: new Map([
+      [primaryPublicAddress, { physicalPort: port }],
+    ]),
+  });
+  const session = createSession(t, configWith([
+    [["limits", "http", "transactionsPerDomain"], 4],
+    [["limits", "pages", "catalogProbesPerDomain"], 2],
+  ]));
+
+  const redirected = await session.requestHop({
+    url: "http://shop.vendor.tld/redirect",
+    purpose: "probe",
+  });
+  const accepted = await session.requestHop({
+    url: "http://shop.vendor.tld/accepted",
+    purpose: "probe",
+  });
+
+  assert.equal(responseStatus(redirected), 302);
+  assert.equal(responseHeader(redirected, "location"), "http://[");
+  assert.equal(redirected.redirectUrl, null);
+  assert.equal(bodyBuffer(redirected).byteLength, 0);
+  assert.equal(bodyBuffer(accepted).toString("utf8"), "ok");
+
+  await expectTransportError(
+    () => session.requestHop({
+      url: "http://shop.vendor.tld/over-probe-cap",
+      purpose: "probe",
+    }),
+    "HTTP_LIMIT_EXCEEDED",
+  );
+
+  const page = await session.requestHop({
+    url: "http://shop.vendor.tld/page",
+    purpose: "page",
+  });
+
+  assert.equal(bodyBuffer(page).toString("utf8"), "p");
+  assert.deepEqual(paths, ["/redirect", "/accepted", "/page"]);
+  assert.equal(harness.lookupCalls.length, 3);
+  assert.equal(harness.connectCalls.length, 3);
+  assert.deepEqual(session.getUsage(), {
+    httpRequests: 3,
+    retries: 0,
+    probesIssued: 2,
+    staticTransferredBytes: 3,
+  });
+});
+
+test("counts probes only after atomic transport reservation", async (t) => {
+  const harness = runtimeHarness({
+    lookup: () => [{ address: "127.0.0.1", family: 4 }],
+  });
+  const session = createSession(t, configWith([
+    [["limits", "pages", "catalogProbesPerDomain"], 1],
+  ]));
+
+  await assert.rejects(session.requestHop({
+    url: "http://[",
+    purpose: "probe",
+  }));
+  assert.deepEqual(session.getUsage(), {
+    httpRequests: 0,
+    retries: 0,
+    probesIssued: 0,
+    staticTransferredBytes: 0,
+  });
+
+  await expectTransportError(
+    () => session.requestHop({
+      url: "http://shop.vendor.tld/reserved",
+      purpose: "probe",
+    }),
+    "SSRF_NON_PUBLIC_ADDRESS",
+  );
+  assert.deepEqual(session.getUsage(), {
+    httpRequests: 1,
+    retries: 0,
+    probesIssued: 1,
+    staticTransferredBytes: 0,
+  });
+
+  await expectTransportError(
+    () => session.requestHop({
+      url: "http://shop.vendor.tld/rejected-before-dns",
+      purpose: "probe",
+    }),
+    "HTTP_LIMIT_EXCEEDED",
+  );
+  assert.equal(harness.lookupCalls.length, 1);
+  assert.equal(harness.connectCalls.length, 0);
+  assert.deepEqual(session.getUsage(), {
+    httpRequests: 1,
+    retries: 0,
+    probesIssued: 1,
+    staticTransferredBytes: 0,
+  });
+});
+
+test("uses probe-specific compressed and decompressed body limits", async (t) => {
+  const pageBody = "p".repeat(33);
+  const compressedOverflow = "c".repeat(33);
+  const decodedOverflow = "d".repeat(9);
+  const encodedOverflow = gzipSync(Buffer.from(decodedOverflow));
+  assert.ok(encodedOverflow.byteLength <= 32);
+  const paths: string[] = [];
+  const server = createHttpServer((request, response) => {
+    paths.push(request.url ?? "");
+
+    if (request.url === "/compressed-overflow") {
+      response.setHeader("transfer-encoding", "chunked");
+      response.write(compressedOverflow.slice(0, 16));
+      response.end(compressedOverflow.slice(16));
+      return;
+    }
+
+    if (request.url === "/decompressed-overflow") {
+      response.setHeader("content-encoding", "gzip");
+      response.end(encodedOverflow);
+      return;
+    }
+
+    response.end(pageBody);
+  });
+  const port = await listenOnLoopback(t, server);
+  runtimeHarness({
+    lookup: () => [{ address: primaryPublicAddress, family: 4 }],
+    routes: new Map([[primaryPublicAddress, { physicalPort: port }]]),
+  });
+  const session = createSession(t, configWith([
+    [["limits", "http", "probeCompressedBytes"], 32],
+    [["limits", "http", "probeDecompressedBytes"], 8],
+    [["limits", "pages", "catalogProbesPerDomain"], 2],
+  ]));
+
+  const page = await session.requestHop({
+    url: "http://shop.vendor.tld/page",
+    purpose: "page",
+  });
+  assert.equal(bodyBuffer(page).toString("utf8"), pageBody);
+
+  const compressedError = await expectTransportError(
+    () => session.requestHop({
+      url: "http://shop.vendor.tld/compressed-overflow",
+      purpose: "probe",
+    }),
+    "HTTP_RESPONSE_LIMIT_EXCEEDED",
+  );
+  assert.equal(compressedError.retryable, false);
+
+  const decompressedError = await expectTransportError(
+    () => session.requestHop({
+      url: "http://shop.vendor.tld/decompressed-overflow",
+      purpose: "probe",
+    }),
+    "HTTP_RESPONSE_LIMIT_EXCEEDED",
+  );
+  assert.equal(decompressedError.retryable, false);
+
+  assert.deepEqual(paths, [
+    "/page",
+    "/compressed-overflow",
+    "/decompressed-overflow",
+  ]);
+  assert.deepEqual(session.getUsage(), {
+    httpRequests: 3,
+    retries: 0,
+    probesIssued: 2,
+    staticTransferredBytes:
+      Buffer.byteLength(pageBody)
+      + Buffer.byteLength(compressedOverflow)
+      + encodedOverflow.byteLength,
+  });
 });
 
 test("a late DNS result cannot dial after the absolute request timeout", async (t) => {
@@ -985,6 +1179,7 @@ test("rejects response bodies from the head before reading or decompressing", as
   assert.deepEqual(session.getUsage(), {
     httpRequests: 2,
     retries: 0,
+    probesIssued: 0,
     staticTransferredBytes: 0,
   });
 });
@@ -1039,6 +1234,7 @@ test("never reads or decompresses 204 and 205 response bodies", async (t) => {
   assert.deepEqual(session.getUsage(), {
     httpRequests: 2,
     retries: 0,
+    probesIssued: 0,
     staticTransferredBytes: 0,
   });
 });
@@ -1200,6 +1396,7 @@ test("latches a decompressed domain-cap overflow before later body admission", a
   assert.deepEqual(session.getUsage(), {
     httpRequests: 2,
     retries: 0,
+    probesIssued: 0,
     staticTransferredBytes: afterOverflow.staticTransferredBytes,
   });
 });
@@ -1247,6 +1444,7 @@ test("charges per-page decoded overflows to the shared domain budget", async (t)
   assert.deepEqual(session.getUsage(), {
     httpRequests: 4,
     retries: 0,
+    probesIssued: 0,
     staticTransferredBytes: afterPageOverflows.staticTransferredBytes,
   });
 });
@@ -1320,6 +1518,7 @@ test("counts retries atomically and rejects transactions beyond the domain cap",
   assert.deepEqual(session.getUsage(), {
     httpRequests: 2,
     retries: 1,
+    probesIssued: 0,
     staticTransferredBytes: 2,
   });
 });
@@ -1350,6 +1549,7 @@ test("requires an initial transaction and permits at most one retry for it", asy
   assert.deepEqual(firstRetrySession.getUsage(), {
     httpRequests: 0,
     retries: 0,
+    probesIssued: 0,
     staticTransferredBytes: 0,
   });
 
@@ -1376,6 +1576,7 @@ test("requires an initial transaction and permits at most one retry for it", asy
   assert.deepEqual(boundedRetrySession.getUsage(), {
     httpRequests: 2,
     retries: 1,
+    probesIssued: 0,
     staticTransferredBytes: 2,
   });
 });
@@ -1568,6 +1769,7 @@ test("aborting an HTTP scheduler waiter never starts a post-abort connection", a
   assert.deepEqual(queuedSession.getUsage(), {
     httpRequests: 1,
     retries: 0,
+    probesIssued: 0,
     staticTransferredBytes: 0,
   });
   assert.equal(harness.lookupCalls.length, 2);

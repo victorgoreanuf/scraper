@@ -54,9 +54,16 @@ import {
 } from "../src/pipeline.ts";
 
 type JsonRecord = Record<string, unknown>;
+type ResponseFactory = (
+  request: ProtectedTransportRequest,
+  signal: AbortSignal,
+) => ProtectedTransportResponse | Promise<ProtectedTransportResponse>;
+type ResponseItem = ProtectedTransportResponse
+  | ProtectedTransportError
+  | ResponseFactory;
 type ResponseStep = readonly [
   url: string,
-  response: ProtectedTransportResponse | ProtectedTransportError,
+  response: ResponseItem,
 ];
 type RecordedDetectorCandidate = DetectorCandidate & {
   readonly collector?: "http" | "browser" | "dns" | "tls";
@@ -150,7 +157,7 @@ class ScriptedSession implements ProtectedTransportSession {
   closeCount = 0;
   readonly #responses = new Map<
     string,
-    Array<ProtectedTransportResponse | ProtectedTransportError>
+    ResponseItem[]
   >();
   readonly #signal: AbortSignal;
   #retries = 0;
@@ -175,8 +182,11 @@ class ScriptedSession implements ProtectedTransportSession {
     }
 
     const queued = this.#responses.get(request.url);
-    const source = queued?.shift();
-    assert.notEqual(source, undefined, `Unexpected HTTP request: ${request.url}`);
+    const scripted = queued?.shift();
+    assert.notEqual(scripted, undefined, `Unexpected HTTP request: ${request.url}`);
+    const source = typeof scripted === "function"
+      ? await scripted(request, this.#signal)
+      : scripted;
     if (source instanceof ProtectedTransportError) throw source;
 
     let bodyAccepted = source!.statusCode >= 200
@@ -217,6 +227,7 @@ class ScriptedSession implements ProtectedTransportSession {
     return Object.freeze({
       httpRequests: this.calls.length,
       retries: this.#retries,
+      probesIssued: this.calls.filter((call) => call.purpose === "probe").length,
       staticTransferredBytes: this.#staticTransferredBytes,
     });
   }
@@ -229,13 +240,18 @@ class ScriptedSession implements ProtectedTransportSession {
 class ScriptedTransport implements ProtectedHttpTransport {
   readonly sessions: ScriptedSession[] = [];
   readonly #steps: readonly ResponseStep[];
+  readonly #sessionSignal: AbortSignal | undefined;
 
-  constructor(steps: readonly ResponseStep[]) {
+  constructor(steps: readonly ResponseStep[], sessionSignal?: AbortSignal) {
     this.#steps = steps;
+    this.#sessionSignal = sessionSignal;
   }
 
   createSession(options?: ProtectedTransportSessionOptions): ScriptedSession {
-    const session = new ScriptedSession(this.#steps, options?.signal);
+    const session = new ScriptedSession(
+      this.#steps,
+      this.#sessionSignal ?? options?.signal,
+    );
     this.sessions.push(session);
     return session;
   }
@@ -444,6 +460,7 @@ class FakeBrowserPool implements BrowserPool {
 function catalogWith(
   options: {
     readonly tlsIssuer?: boolean;
+    readonly probePaths?: readonly string[];
   } = {},
 ): CompiledFingerprintCatalog {
   return {
@@ -457,7 +474,7 @@ function catalogWith(
     inspectionPlan: Object.freeze({
       dom: Object.freeze([]),
       javascript: Object.freeze([]),
-      probePaths: Object.freeze([]),
+      probePaths: Object.freeze([...(options.probePaths ?? [])]),
       dnsRecordTypes: Object.freeze([]),
       tlsIssuer: options.tlsIssuer ?? false,
     }),
@@ -774,6 +791,135 @@ test("orchestrates p1-p3 once and combines HTTP, browser, TLS, usage, and proven
     assert.ok((result.timings[key] ?? 0) <= result.timings.totalMs, key);
   }
   assert.deepEqual(result.provenance, provenance);
+  assertValidResult(result, config, true);
+});
+
+test("collects bounded catalog probes before the single detector pass", async () => {
+  const config = configWith();
+  const probePaths = [
+    "/exists.svg",
+    "/magento_version",
+    "/missing",
+  ] as const;
+  const catalog = catalogWith({ probePaths });
+  const entryBody = "<html><body>fixture</body></html>";
+  const probeUrls = probePaths.map((path) => new URL(path, ENTRY_URL).href);
+  const transport = new ScriptedTransport([
+    [ENTRY_URL, htmlResponse(ENTRY_URL, entryBody)],
+    [probeUrls[0]!, response(probeUrls[0]!, 204)],
+    [probeUrls[1]!, response(probeUrls[1]!, 200, {
+      contentType: "application/octet-stream",
+      body: "release=MAGENTO 2",
+    })],
+    [probeUrls[2]!, response(probeUrls[2]!, 404)],
+  ]);
+  const robots = new FakeRobotsService();
+  const browserPool = new FakeBrowserPool();
+  const detectorPool = new RecordingDetectorPool(catalog);
+
+  const result = await scanDomain(DOMAIN, {
+    runId: RUN_ID,
+    config,
+    provenance: provenanceFor(config, catalog),
+    transport,
+    robots,
+    browserPool,
+    detectorPool,
+    catalog,
+  }, deterministicOptions());
+
+  assert.equal(result.status, "success");
+  assert.deepEqual(
+    transport.sessions[0]?.calls.map(({ url, purpose }) => [url, purpose]),
+    [
+      [ENTRY_URL, "page"],
+      [probeUrls[0], "probe"],
+      [probeUrls[1], "probe"],
+      [probeUrls[2], "probe"],
+    ],
+  );
+  assert.deepEqual(robots.checks, [ENTRY_URL, ...probeUrls]);
+  assert.deepEqual(
+    detectorPool.calls[0]
+      ?.filter((candidate) => candidate.source === "probe")
+      .map(({ collector, kind, pageId, key, value }) => [
+        collector,
+        kind,
+        pageId,
+        key,
+        value,
+      ]),
+    [
+      ["http", "value", null, probePaths[0], ""],
+      ["http", "value", null, probePaths[1], "release=MAGENTO 2"],
+    ],
+  );
+  assert.equal(result.pages.length, 1);
+  assert.equal(result.usage.pagesVisited, 1);
+  assert.equal(result.usage.httpRequests, 4);
+  assert.equal(result.usage.probesIssued, 3);
+  assert.equal(
+    result.usage.staticTransferredBytes,
+    Buffer.byteLength(entryBody) + Buffer.byteLength("release=MAGENTO 2"),
+  );
+  assert.equal(detectorPool.calls.length, 1);
+  assertValidResult(result, config, true);
+});
+
+test("keeps an admitted probe and attributes a session deadline to HTTP", async () => {
+  const config = configWith();
+  const probePaths = ["/first", "/later"] as const;
+  const catalog = catalogWith({ probePaths });
+  const controller = new AbortController();
+  const firstProbeUrl = new URL(probePaths[0], ENTRY_URL).href;
+  const laterProbeUrl = new URL(probePaths[1], ENTRY_URL).href;
+  const transport = new ScriptedTransport([
+    [ENTRY_URL, htmlResponse(ENTRY_URL)],
+    [firstProbeUrl, (request) => {
+      controller.abort(new DOMException(
+        "The active domain deadline was exceeded.",
+        "TimeoutError",
+      ));
+      return response(request.url, 200, { body: "first" });
+    }],
+    [laterProbeUrl, response(laterProbeUrl, 200, { body: "unused" })],
+  ], controller.signal);
+  const robots = new FakeRobotsService();
+  const browserPool = new FakeBrowserPool();
+  const detectorPool = new RecordingDetectorPool(catalog);
+
+  const result = await scanDomain(DOMAIN, {
+    runId: RUN_ID,
+    config,
+    provenance: provenanceFor(config, catalog),
+    transport,
+    robots,
+    browserPool,
+    detectorPool,
+    catalog,
+  }, deterministicOptions());
+
+  assert.equal(result.status, "partial");
+  assert.deepEqual(
+    transport.sessions[0]?.calls.map(({ url, purpose }) => [url, purpose]),
+    [
+      [ENTRY_URL, "page"],
+      [firstProbeUrl, "probe"],
+    ],
+  );
+  assert.deepEqual(
+    detectorPool.calls[0]
+      ?.filter((candidate) => candidate.source === "probe")
+      .map(({ key, value }) => [key, value]),
+    [[probePaths[0], "first"]],
+  );
+  assert.deepEqual(result.errors.map((error) => [
+    error.stage,
+    error.code,
+    error.retryable,
+  ]), [["http", "DOMAIN_DEADLINE_EXCEEDED", true]]);
+  assert.equal(result.usage.probesIssued, 1);
+  assert.equal(result.timings.detectMs === null, false);
   assertValidResult(result, config, true);
 });
 

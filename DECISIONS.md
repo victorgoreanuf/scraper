@@ -60,13 +60,13 @@
   catalog pentru domeniul input canonic și reutilizează exclusiv issuerul TLS
   din handshake-ul HTTPS final deja verificat și pin-uit.
 - `scanDomain()` unește într-o singură scanare bounded HTTP `p1`–`p3`, browser,
-  robots și DNS/TLS, apoi apelează detectorul exact o dată pe setul complet de
-  observații.
+  robots, probe declarative și DNS/TLS, apoi apelează detectorul exact o dată pe
+  setul complet de observații.
 - Coada FIFO pentru slotul `full` rămâne în afara deadline-ului activ al
   domeniului; anularea callerului rămâne activă și în coadă.
-- Pathurile de probe rămân validate în planul catalogului, dar fetch-ul lor este
-  amânat într-un slice separat; pipeline-ul curent raportează întotdeauna
-  `probesIssued: 0`.
+- Colectorul de probe revalidează maximum cinci pathuri sortate din planul
+  catalogului și emite body observations bounded numai prin originul final,
+  robots și transportul protejat comun.
 
 ## Structura proiectului
 
@@ -82,6 +82,7 @@ src/
 ├── crawl/
 │   ├── transport.ts
 │   ├── http.ts
+│   ├── probe.ts
 │   ├── robots.ts
 │   ├── browser.ts
 │   └── infrastructure.ts
@@ -111,6 +112,7 @@ test/
 ├── fixtures/
 ├── browser-proxy.test.ts
 ├── browser.test.ts
+├── probe.test.ts
 ├── toolchain.test.ts
 ├── domain-result-schema.test.ts
 └── scan-config-schema.test.ts
@@ -133,7 +135,9 @@ homepage HTTP + browser izolat
   ↓
 maximum două pagini interne determinate reproductibil
   ↓
-HTTP + browser + DNS/TLS + scripturi deja observate
+HTTP + browser + probe declarative bounded
+  ↓
+DNS/TLS + scripturi deja observate
   ↓
 fingerprints în workeri regex terminabili
   ↓
@@ -149,7 +153,8 @@ Scanarea HTTP colectează:
 - numele și valorile limitate ale cookie-urilor, numai temporar în memorie
   pentru matching;
 - HTML și meta tags;
-- scripturi și alte resurse externe.
+- scripturi și alte resurse externe;
+- pathurile validate și body-urile bounded ale probelor declarative.
 
 Browserul colectează:
 
@@ -233,9 +238,11 @@ nu date descărcate la runtime.
 ## Decizia transportului HTTP protejat
 
 Transportul v1 execută o singură tranzacție `GET` și nu urmărește automat
-redirecturi sau retry-uri. Orchestratorul robots/HTTP decide următorul pas, iar
-fiecare apel repetă validarea URL-ului, rezolvarea DNS completă, verificarea SSRF
-pentru toate răspunsurile, pinning și verificarea peer-ului. Alegem primul IP
+redirecturi sau retry-uri. Orchestratorul robots/HTTP decide următorul pas;
+pentru `purpose: "probe"`, un `3xx` este miss și transportul nu interpretează
+`Location` drept un nou target. Fiecare apel repetă validarea URL-ului,
+rezolvarea DNS completă, verificarea SSRF pentru toate răspunsurile, pinning și
+verificarea peer-ului. Alegem primul IP
 valid în ordinea `verbatim`, deschidem un
 socket nou per tranzacție și păstrăm hostname-ul logic pentru Host, SNI și
 certificat. Nu există keep-alive, proxy implicit sau opțiune de producție care
@@ -389,9 +396,9 @@ supraviețuitorii pentru publicare, eliminăm coliziunile cu entry-ul sau între
 îi resortăm după URL-ul public și abia apoi atribuim IDs compacte `p2`/`p3`, fără
 goluri.
 
-Maximum cinci pathuri de probe declarative rămân validate în planul catalogului
-și în afara numărului de pagini, dar pipeline-ul curent nu le fetch-uiește.
-Colectorul lor va fi un slice separat; până atunci `probesIssued` este exact `0`.
+Maximum cinci pathuri de probe declarative sunt validate și sortate în planul
+catalogului, rămân în afara numărului de pagini și sunt colectate prin politica
+separată de mai jos. Un entry non-HTML nu pornește probe.
 
 În `full`, fiecare pagină HTML 2xx eligibilă primește HTTP și browser.
 `crawl/browser.ts` implementează un pool FIFO cu un proxy protejat și un proces
@@ -462,6 +469,61 @@ HTTP rulează pentru toate domeniile, iar probele, paginile interne și browseru
 cu scripturile deja descărcate de el sunt tier-uri selective măsurate împotriva
 baseline-ului `full`.
 
+## Decizia colectării probelor declarative
+
+Politica v1 este implementată în `crawl/probe.ts`. Colectorul primește URL-ul
+final de rețea numai pentru un entry HTML, maximum cinci pathuri din planul
+catalogului, configurația validată, sesiunea de transport protejat și serviciul
+robots al runului. Rulează secvențial după toate colectările HTTP/browser
+`p1`–`p3` și înainte de DNS/TLS, finalizarea sesiunii browser și singura
+invocare a detectorului.
+
+Compilatorul și collectorul validează independent pathurile. Ele trebuie să fie
+unice, să înceapă cu exact un `/`, să nu conțină backslash, query, fragment sau
+o schimbare de origin și să supraviețuiască rezolvării WHATWG fără normalizare.
+Colectorul le sortează direct după code units UTF-16 și construiește fiecare URL
+de la rădăcina originului final exact, nu relativ la pathname-ul paginii finale.
+Atât pathul, cât și URL-ul complet `origin + path` respectă capul URL configurat;
+un URL compus prea lung emite `HTTP_LIMIT_EXCEEDED` non-retryable înainte de
+robots sau rezervarea transportului și oprește stage-ul.
+
+Înaintea fiecărui path aplicăm robots pe URL-ul compus. Denialul este un skip
+intenționat fără request sau eroare; indisponibilitatea robots păstrează eroarea
+stabilă, eșuează fail-closed și oprește stage-ul. Orice body robots admis rămâne
+semnal bounded `robots` cu `pageId: null` și este deduplicat ulterior.
+
+Un path permis primește exact un `GET` protejat cu `purpose: "probe"`, fără
+retry și fără urmărirea redirecturilor. Numai `2xx` produce observație; `204` și
+`205` produc body gol. Un `3xx` nu este urmat, iar un `4xx` obișnuit este miss și
+permite următorul path. `401`, `403`, `407` și `451` emit
+`HTTP_REQUEST_FAILED` non-retryable și opresc probele rămase. `408`, `425`,
+`429` și `5xx` emit același cod cu `retryable: true` și opresc fără retry în
+scanarea curentă. Erorile transportului, deadline-ului, decomprimării, politicii
+de destinație sau limitelor își păstrează codurile și opresc stage-ul.
+
+Body-ul admis folosește maximum 256 KiB comprimat și 512 KiB decomprimat, plus
+bugetul static decomprimat per domeniu, și este decodat UTF-8 cu replacement
+determinist pentru secvențe invalide. Nu interpretăm charseturi legacy din
+`Content-Type`. Astfel, un răspuns bounded rămâne disponibil regulilor presence,
+iar regulile literale se aplică numai stringului rezultat. Observația conține
+doar pathul validat și body-ul decodat; headerele, cookies, statusul și URL-ul
+probe-ului nu devin semnale suplimentare.
+
+Transportul deține accountingul: la rezervarea efectivă a unei tranzacții
+`purpose: "probe"` incrementează atomic atât `httpRequests`, cât și
+`probesIssued`, înainte de DNS. O eroare ulterioară nu scade contorul, iar un
+denial robots sau un reject înainte de rezervare nu îl crește. Același boundary
+enforcează capul de cinci probe, totalul de 40 tranzacții, deadline-ul și
+bugetele de bytes; `staticTransferredBytes` include body bytes citiți pentru
+probe.
+
+Detectorul primește probele în aceeași invocare cu toate celelalte observații.
+Pathul exact devine locatorul/key, iar body-ul bounded este valoarea pentru
+reguli presence sau literale. Evidence este întotdeauna
+`collector: "http"`, `source: "probe"`, `pageId: null`; valoarea body-ului este
+redactată și probele nu creează `PageRecord`, nu schimbă `pagesVisited` și nu
+afectează prefixul paginilor browser.
+
 ## Decizia colectării semnalelor DNS/TLS
 
 Politica este fixată prin `policyVersions.infrastructure: 1` și implementată în
@@ -520,18 +582,18 @@ primesc semnalul pipeline deja armat, primul și autoritativ.
 
 Ordinea bounded este: HTTP/robots `p1`; browser `p1` numai pentru HTML 2xx
 complete sau truncated; reuniunea linkurilor statice și randate; selecția v1 și
-maximum două checks robots; HTTP apoi browser pentru `p2`/`p3` eligibile; DNS
-cerut de catalog și issuerul TLS reutilizat numai după toate requesturile HTTP
-statice; finalizarea sesiunii browser; apoi o singură invocare a detectorului cu
-toate observațiile HTTP `p1`–`p3`, browser, robots, DNS și TLS. Relațiile și
-excluderile se rezolvă astfel o singură dată pe setul combinat. Probe paths nu
-intră în această ordine și `probesIssued` rămâne `0`.
+maximum două checks robots; HTTP apoi browser pentru `p2`/`p3` eligibile;
+probele sortate pe originul final pentru un entry HTML; DNS cerut de catalog și
+issuerul TLS reutilizat numai după toate requesturile HTTP statice; finalizarea
+sesiunii browser; apoi o singură invocare a detectorului cu toate observațiile
+HTTP `p1`–`p3`, browser, robots, probe, DNS și TLS. Relațiile și excluderile se
+rezolvă astfel o singură dată pe setul combinat.
 
-Orice body robots admis cu succes în entry, precheck structural sau colectarea
-unei pagini interne rămâne semnal de detector cu `pageId: null`, inclusiv când
-pagina asociată este ulterior omisă ori eșuează. Detectorul deduplică valorile
-identice, iar existența unui astfel de semnal participă la alegerea
-`partial`/`failed`.
+Orice body robots admis cu succes în entry, precheck structural, colectarea unei
+pagini interne sau verificarea unui probe rămâne semnal de detector cu
+`pageId: null`, inclusiv când lucrul asociat este ulterior omis ori eșuează.
+Detectorul deduplică valorile identice, iar existența unui astfel de semnal
+participă la alegerea `partial`/`failed`.
 
 O pagină statică eșuată nu poate deveni browser-only. Navigările browser formează
 un prefix ordonat: după un gap nu deschidem o pagină browser ulterioară, deși un
@@ -539,11 +601,11 @@ un prefix ordonat: după un gap nu deschidem o pagină browser ulterioară, deș
 urmează terminalul `partial` deja decis și nu pornește pagini interne.
 
 `targetMs` măsoară selecția entry, `robotsMs` acumulează lucrul robots, iar
-`httpMs` exclude robots inclus în colectarea statică. Celelalte stages măsoară
-numai lucrul pornit, pot overlap și sunt plafonate la `totalMs`; un stage
-nepornit este `null`. Pipeline-ul deduplică și sortează erorile, construiește
-usage din sesiunile efective, sanitizează rezultatul și îl trece prin validatorul
-semantic înainte să-l returneze.
+`httpMs` include paginile și probele, dar exclude robots inclus în colectarea
+statică. Celelalte stages măsoară numai lucrul pornit, pot overlap și sunt
+plafonate la `totalMs`; un stage nepornit este `null`. Pipeline-ul deduplică și
+sortează erorile, construiește usage din sesiunile efective, sanitizează
+rezultatul și îl trece prin validatorul semantic înainte să-l returneze.
 
 ## Decizia rezultatului și a dovezilor
 
@@ -808,23 +870,24 @@ revizia și digestul snapshotului.
 
 Detectorul admite numai observațiile deja limitate ale collectorilor HTTP și
 browser: URL final/redirecturi, headere, cookie-uri, HTML, text, metadata,
-script URLs, robots, fapte DOM/JavaScript cerute de plan, script bodies și
-request URLs. Regulile upstream `xhr` folosesc `network_url`; canalul separat
+script URLs, robots, probe declarative, fapte DOM/JavaScript cerute de plan,
+script bodies și request URLs. Regulile upstream `xhr` folosesc `network_url`;
+canalul separat
 `network_hostname` nu este prezentat drept acoperire XHR completă. Nu
 reinterpretăm statusuri, stylesheet-uri, imagini, iframe-uri, linkuri sau
 navigation links ca semnale v1. Observațiile HTTP page-scoped păstrează exact
 `p1`, `p2` sau `p3`, la fel ca browserul; non-HTML entry și robots rămân cu
-`pageId: null`, iar un răspuns intern deja selectat păstrează `p2`/`p3`.
-Pipeline-ul trimite o singură dată setul combinat HTTP/browser/DNS/TLS, nu unește
-rezultate detectate separat pe pagini. Matchingul regex rulează pe valoarea raw bounded
-în worker; parentul primește doar spanul și versiunea sigură și construiește
-dovada prin sanitizerul comun. URL-urile se publică numai integral, canonic și
-sanitizat; header/meta publică doar matchul după clasificarea întregii
-observații, iar cookie/HTML/text/robots/DOM/JavaScript/script content rămân
-redacted. Candidații HTTP au prioritate înaintea tierului browser când bugetul
-admite doar un prefix. Confidence și version se calculează din rule ID-uri
-unice, apoi se aplică fixed point-ul relațiilor și excluderile deterministe deja
-decise.
+`pageId: null`, probele folosesc tot `pageId: null` și pathul drept key, iar un
+răspuns intern deja selectat păstrează `p2`/`p3`. Pipeline-ul trimite o singură
+dată setul combinat HTTP/browser/probe/DNS/TLS, nu unește rezultate detectate
+separat pe pagini. Matchingul regex rulează pe valoarea raw bounded în worker;
+parentul primește doar spanul și versiunea sigură și construiește dovada prin
+sanitizerul comun. URL-urile se publică numai integral, canonic și sanitizat;
+header/meta publică doar matchul după clasificarea întregii observații, iar
+cookie/HTML/text/robots/probe/DOM/JavaScript/script content rămân redacted.
+Candidații HTTP au prioritate înaintea tierului browser când bugetul admite doar
+un prefix. Confidence și version se calculează din rule ID-uri unice, apoi se
+aplică fixed point-ul relațiilor și excluderile deterministe deja decise.
 
 ## Ce trebuie măsurat
 

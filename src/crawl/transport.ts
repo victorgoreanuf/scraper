@@ -151,6 +151,7 @@ interface BodyLimits {
 export interface ProtectedTransportUsage {
   readonly httpRequests: number;
   readonly retries: number;
+  readonly probesIssued: number;
   readonly staticTransferredBytes: number;
 }
 
@@ -2285,6 +2286,7 @@ class ProtectedTransportSessionImpl implements ProtectedTransportSession {
   private readonly signal: AbortSignal;
   private httpRequests = 0;
   private retries = 0;
+  private probesIssued = 0;
   private staticTransferredBytes = 0;
   private staticDecompressedBytes = 0;
   private dnsAdmissionUsed = false;
@@ -2331,7 +2333,7 @@ class ProtectedTransportSessionImpl implements ProtectedTransportSession {
 
     try {
       this.throwIfDomainAborted(phase);
-      this.reserveTransaction(request.isRetry === true);
+      this.reserveTransaction(request.isRetry === true, request.purpose);
 
       const timeout = delayAbortController(
         this.config.limits.timeMs.httpRequest,
@@ -2396,11 +2398,13 @@ class ProtectedTransportSessionImpl implements ProtectedTransportSession {
 
         const rawHeaders = response.rawHeaders;
         const headers = toHeaders(rawHeaders);
-        const redirectUrl = this.redirectTarget(
-          parsed.url.href,
-          statusCode,
-          rawHeaders,
-        );
+        const redirectUrl = request.purpose === "probe"
+          ? null
+          : this.redirectTarget(
+            parsed.url.href,
+            statusCode,
+            rawHeaders,
+          );
 
         let body: Uint8Array = new Uint8Array();
 
@@ -2497,6 +2501,7 @@ class ProtectedTransportSessionImpl implements ProtectedTransportSession {
     return Object.freeze({
       httpRequests: this.httpRequests,
       retries: this.retries,
+      probesIssued: this.probesIssued,
       staticTransferredBytes: this.staticTransferredBytes,
     });
   }
@@ -2533,8 +2538,15 @@ class ProtectedTransportSessionImpl implements ProtectedTransportSession {
     throw abortError(this.signal.reason);
   }
 
-  private reserveTransaction(isRetry: boolean): void {
+  private reserveTransaction(isRetry: boolean, purpose: BodyPurpose): void {
     if (this.httpRequests >= this.config.limits.http.transactionsPerDomain) {
+      throw transportError("HTTP_LIMIT_EXCEEDED", "http", false);
+    }
+
+    if (
+      purpose === "probe"
+      && this.probesIssued >= this.config.limits.pages.catalogProbesPerDomain
+    ) {
       throw transportError("HTTP_LIMIT_EXCEEDED", "http", false);
     }
 
@@ -2551,6 +2563,10 @@ class ProtectedTransportSessionImpl implements ProtectedTransportSession {
     }
 
     this.httpRequests += 1;
+
+    if (purpose === "probe") {
+      this.probesIssued += 1;
+    }
 
     if (isRetry) {
       this.retries += 1;

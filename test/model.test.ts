@@ -1071,6 +1071,56 @@ test("requires timings and counters to agree with emitted work", () => {
   );
 });
 
+test("links catalog probe evidence to a safe path, usage, and HTTP timing", () => {
+  const probeEvidence = makeEvidence({
+    collector: "http",
+    source: "probe",
+    pageId: null,
+    key: "/magento_version",
+    match: { kind: "redacted", value: null, truncated: false },
+    pattern: "magento",
+    version: null,
+  });
+  const technology = makeDirectTechnology({
+    version: null,
+    pageIds: [],
+    evidence: [probeEvidence],
+  });
+  const valid = makeResult({
+    technologies: [technology],
+    usage: { ...makeResult().usage, probesIssued: 1 },
+  });
+
+  assert.equal(validateDomainResult(valid, {
+    scanConfig,
+    expectedConfigDigest: configDigest,
+    signalAdmitted: true,
+  }), valid);
+  expectSemanticFailure(
+    makeResult({ technologies: [technology] }),
+    /probesIssued is lower than evidenced catalog probes/,
+  );
+  expectSemanticFailure(
+    makeResult({
+      technologies: [technology],
+      usage: { ...makeResult().usage, probesIssued: 1 },
+      timings: { ...makeResult().timings, httpMs: null },
+    }),
+    /httpMs is null despite catalog probe requests/,
+  );
+  expectSemanticFailure(
+    makeResult({
+      technologies: [makeDirectTechnology({
+        version: null,
+        pageIds: [],
+        evidence: [{ ...probeEvidence, key: "//other.invalid/probe" }],
+      })],
+      usage: { ...makeResult().usage, probesIssued: 1 },
+    }),
+    /key is not a safe catalog probe path/,
+  );
+});
+
 test("enforces safe lower limits from the validated scan configuration", () => {
   const mutableConfig = structuredClone(scanConfig) as unknown as {
     limits: { evidence: { matchCodePoints: number } };

@@ -181,6 +181,7 @@ class ScriptedSession implements ProtectedTransportSession {
     return Object.freeze({
       httpRequests: this.calls.length,
       retries: this.calls.filter((call) => call.isRetry === true).length,
+      probesIssued: this.calls.filter((call) => call.purpose === "probe").length,
       staticTransferredBytes: 0,
     });
   }
