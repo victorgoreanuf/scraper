@@ -7,6 +7,7 @@ import {
   sanitizeEvidenceKey,
   type BrowserPageObservations,
   type Collector,
+  type DetectionStats,
   type Evidence,
   type EvidenceSource,
   type HttpEntryResult,
@@ -44,6 +45,7 @@ export interface DetectHttpContext {
 
 export interface DetectHttpResult {
   readonly technologies: readonly Technology[];
+  readonly detectionStats: DetectionStats;
   readonly errors: readonly ScanError[];
   readonly signalAdmitted: boolean;
   readonly completed: boolean;
@@ -1213,6 +1215,12 @@ export async function detectHttp(
   if (candidates.length === 0) {
     return Object.freeze({
       technologies: Object.freeze([]),
+      detectionStats: Object.freeze({
+        rawDirect: 0,
+        gatedDirect: 0,
+        suppressedDirect: 0,
+        retainedDirect: 0,
+      }),
       errors: Object.freeze([]),
       signalAdmitted: false,
       completed: true,
@@ -1286,6 +1294,12 @@ export async function detectHttp(
   const retainedDirect = new Map(
     [...admission.admitted].filter(([name]) => exclusions.retained.has(name)),
   );
+  const detectionStats: DetectionStats = Object.freeze({
+    rawDirect: rawDirect.size,
+    gatedDirect: rawDirect.size - admission.admitted.size,
+    suppressedDirect: admission.admitted.size - retainedDirect.size,
+    retainedDirect: retainedDirect.size,
+  });
   const finalClosure = computeImplications(
     retainedDirect,
     definitions,
@@ -1338,6 +1352,7 @@ export async function detectHttp(
 
   return Object.freeze({
     technologies: Object.freeze([...bounded.technologies]),
+    detectionStats,
     errors: Object.freeze(finalErrors),
     signalAdmitted: true,
     completed: matchResult.completed

@@ -324,6 +324,44 @@ function indexedHeaderPool(
   });
 }
 
+test("returns zero detection statistics without detector candidates", async () => {
+  const fingerprintCatalog = catalog([], []);
+  let poolCalled = false;
+  const result = await detectHttp({
+    kind: "failed",
+    response: null,
+    robots: [],
+    errors: [{
+      stage: "http",
+      code: "HTTP_REQUEST_FAILED",
+      pageId: null,
+      retryable: true,
+      message: "The static request failed.",
+      ruleId: null,
+      signal: null,
+      limit: null,
+      catalogRevision: null,
+    }],
+  }, {
+    catalog: fingerprintCatalog,
+    pool: fakePool(fingerprintCatalog, () => {
+      poolCalled = true;
+      return emptyMatchResult();
+    }),
+    config: defaultConfig,
+  });
+
+  assert.equal(poolCalled, false);
+  assert.deepEqual(result.detectionStats, {
+    rawDirect: 0,
+    gatedDirect: 0,
+    suppressedDirect: 0,
+    retainedDirect: 0,
+  });
+  assert.equal(result.signalAdmitted, false);
+  assert.equal(result.completed, true);
+});
+
 test("maps, normalizes, deduplicates, and ranks only supported HTTP candidates", async () => {
   const fingerprintCatalog = catalog([], []);
   let observed: readonly DetectorCandidate[] = [];
@@ -743,6 +781,7 @@ test("orders infrastructure candidates and publishes bounded DNS and TLS evidenc
     scanMode: "full",
     pages: [],
     technologies: result.technologies,
+    detectionStats: result.detectionStats,
     errors: failedInput.errors,
     timings: {
       totalMs: 1,
@@ -1119,6 +1158,7 @@ test("merges browser observations once and preserves every evidence page", async
       collectors: ["http", "browser"],
     }],
     technologies: result.technologies,
+    detectionStats: result.detectionStats,
     errors: [],
     timings: {
       totalMs: 1,
@@ -1815,6 +1855,12 @@ test("resolves technology and category gates with implications to a fixed point"
     "direct",
   );
   assert.equal(result.technologies.some((item) => item.name === "Self gate"), false);
+  assert.deepEqual(result.detectionStats, {
+    rawDirect: 4,
+    gatedDirect: 1,
+    suppressedDirect: 0,
+    retainedDirect: 3,
+  });
 });
 
 test("uses widest implication paths, then minimum depth, with all winning parents", async () => {
@@ -1947,6 +1993,12 @@ test("keeps exclusion direction in chains and prevents suppressed nodes from act
   });
 
   assert.deepEqual(result.technologies.map((item) => item.name), ["A", "C"]);
+  assert.deepEqual(result.detectionStats, {
+    rawDirect: 3,
+    gatedDirect: 0,
+    suppressedDirect: 1,
+    retainedDirect: 2,
+  });
 });
 
 test("breaks exclusion cycles only after external edges and uses the SCC rank", async () => {
@@ -2255,6 +2307,12 @@ test("discards an oversized materialization and reports every output limit", asy
     [...new Set(technologyResult.errors.map((item) => item.code))],
     ["RESULT_LIMIT_EXCEEDED"],
   );
+  assert.deepEqual(technologyResult.detectionStats, {
+    rawDirect: 2,
+    gatedDirect: 0,
+    suppressedDirect: 0,
+    retainedDirect: 2,
+  });
 
   const evidenceLimited = configWith([
     [["limits", "output", "evidencePerTechnology"], 1],
@@ -2437,6 +2495,7 @@ test("produces technology data accepted by the v1 schema and semantic validator"
       collectors: ["http", "browser"],
     }],
     technologies: result.technologies,
+    detectionStats: result.detectionStats,
     errors: [],
     timings: {
       totalMs: 1,

@@ -791,6 +791,12 @@ test("orchestrates p1-p3 once and combines HTTP, browser, TLS, usage, and proven
     assert.ok((result.timings[key] ?? 0) <= result.timings.totalMs, key);
   }
   assert.deepEqual(result.provenance, provenance);
+  assert.deepEqual(result.detectionStats, {
+    rawDirect: 0,
+    gatedDirect: 0,
+    suppressedDirect: 0,
+    retainedDirect: 0,
+  });
   assertValidResult(result, config, true);
 });
 
@@ -1001,6 +1007,12 @@ test("returns failed when target discovery produced no detector signal", async (
   assert.equal(browserPool.openCount, 1);
   assert.equal(detectorPool.calls.length, 0);
   assert.equal(transport.sessions[0]?.closeCount, 1);
+  assert.deepEqual(result.detectionStats, {
+    rawDirect: 0,
+    gatedDirect: 0,
+    suppressedDirect: 0,
+    retainedDirect: 0,
+  });
   assertValidResult(result, config, false);
 });
 
@@ -1418,6 +1430,12 @@ test("returns an early failed record when the detector pool is unavailable", asy
   });
   assert.equal(transport.sessions.length, 0);
   assert.equal(robots.checks.length, 0);
+  assert.deepEqual(result.detectionStats, {
+    rawDirect: 0,
+    gatedDirect: 0,
+    suppressedDirect: 0,
+    retainedDirect: 0,
+  });
   assert.equal(browserPool.openCount, 0);
   assert.equal(browserPool.session.finishCount, 0);
   assert.equal(browserPool.session.closeCount, 0);
@@ -1856,6 +1874,12 @@ test("materializes a bounded partial result when JSONL output overflows", async 
   assert.deepEqual(result.errors.map((error: ScanError) => error.code), [
     "RESULT_LIMIT_EXCEEDED",
   ]);
+  assert.deepEqual(result.detectionStats, {
+    rawDirect: 1,
+    gatedDirect: 0,
+    suppressedDirect: 0,
+    retainedDirect: 1,
+  });
   assert.ok(
     Buffer.byteLength(`${JSON.stringify(result)}\n`, "utf8")
       <= config.limits.output.jsonlRecordBytes,
@@ -2083,6 +2107,12 @@ test("feeds robots text refetched for p2 into detector evidence", async () => {
     [robotsText],
   );
   assert.equal(result.technologies[0]?.name, "Robots fixture");
+  assert.deepEqual(result.detectionStats, {
+    rawDirect: 1,
+    gatedDirect: 0,
+    suppressedDirect: 0,
+    retainedDirect: 1,
+  });
   assert.deepEqual(result.technologies[0]?.evidence, [
     {
       collector: "http",

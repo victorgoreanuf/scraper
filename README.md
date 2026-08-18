@@ -5,8 +5,8 @@
 > isolated detector, protected Playwright/Chromium collector and pool, and
 > bounded catalog-probe and DNS/TLS infrastructure collection plus pipeline
 > orchestration are implemented and tested. Incremental output, resume, and
-> summary generation are the next roadmap slice; the runnable CLI remains a
-> separate later slice.
+> summary generation are also implemented and tested; the runnable CLI is the
+> next roadmap slice.
 
 ## Goal
 
@@ -122,7 +122,9 @@ The provided benchmark contains 200 unique domains in a Snappy-compressed Parque
 │   ├── scan-config-schema.test.ts
 │   ├── target.test.ts
 │   ├── transport.test.ts
-│   └── pipeline.test.ts
+│   ├── pipeline.test.ts
+│   ├── summary.test.ts
+│   └── writer.test.ts
 ├── input/
 │   └── domains.parquet
 ├── output/
@@ -972,16 +974,19 @@ acyclicity, sanitizer compliance, scalar Unicode validity, and digest
 correctness. The output writer and resume reader must pass both layers; schema
 validity alone never authorizes a semantically inconsistent result.
 
-At scan time the writer must supply the non-serialized `signalAdmitted` fact to
-validate the `partial`/`failed` distinction; omitting that boolean is itself a
-validation failure. A future resume reader can recheck every persisted
-invariant, but cannot reconstruct that collection-history fact from the v1 wire
-record alone; it therefore trusts the status previously validated by the writer
-while still enforcing its schema-level cardinalities.
+At scan time `scanDomain()` supplies the non-serialized `signalAdmitted` fact
+when it validates the `partial`/`failed` distinction; omitting that boolean is a
+validation failure. The writer validates the exact serialized value under the
+persisted-record semantics before appending it. Writer and resume validation
+cannot reconstruct that collection-history fact from the v1 wire record, so
+they trust its pipeline-validated status while still enforcing the fixed wire
+schema, context-independent semantic invariants, configured limits, run
+identity, and provenance.
 
 Every result has exactly the top-level fields `schemaVersion`, `runId`,
 `domain`, `scannedAt`, `status`, `finalUrl`, `scanMode`, `pages`,
-`technologies`, `errors`, `timings`, `usage`, and `provenance`.
+`technologies`, `detectionStats`, `errors`, `timings`, `usage`, and
+`provenance`.
 `schemaVersion` is `1`; `runId` is a UUID; `scannedAt` is the exact UTC form
 produced by `Date.prototype.toISOString()`; and `scanMode` is `full` in this
 version. `finalUrl` is the only nullable top-level scalar. Arrays always exist,
@@ -990,6 +995,16 @@ integer, and each named stage timing is a non-negative integer or `null` when
 that stage never started or was skipped. Provenance is complete and non-null
 because missing runtime, catalog, or validated configuration identity is a
 global preflight failure rather than a per-domain result.
+
+`detectionStats` persists exactly `rawDirect`, `gatedDirect`,
+`suppressedDirect`, and `retainedDirect`. `rawDirect` counts positive-confidence
+direct candidates before relationships, `gatedDirect` counts those not admitted
+by requirements, `suppressedDirect` counts admitted candidates removed by
+exclusions, and `retainedDirect` counts the remaining direct detections before
+final output materialization. Every counter is bounded by the fixed v1 catalog
+technology ceiling of 20,000, and `rawDirect` is exactly the sum of the other
+three. These counters remain available even when bounded output materialization
+or a final record-size limit must discard the technology array.
 
 A `PageRecord` has exactly `id`, `role`, `url`, `httpStatus`, and `collectors`.
 IDs are `p1`, `p2`, and `p3` in deterministic page order. `p1` has role
@@ -1048,6 +1063,12 @@ A representative direct detection is shown below.
       "inferredFrom": []
     }
   ],
+  "detectionStats": {
+    "rawDirect": 1,
+    "gatedDirect": 0,
+    "suppressedDirect": 0,
+    "retainedDirect": 1
+  },
   "errors": [],
   "timings": {
     "totalMs": 912,
@@ -1466,6 +1487,9 @@ configuration digest. Each `(runId, domain)` appears exactly once; duplicates
 and malformed middle lines are errors, not last-write wins. At most one
 incomplete final fragment may be removed before append. This is process-crash
 recovery at record granularity, not a claim of power-loss durability.
+If no complete record remains after removing that allowed fragment, there is no
+persisted identity to reuse; resume creates a new UUID and continues as an empty
+run in the same validated result file.
 
 Input rows are scheduled in validated Parquet order, but bounded concurrent
 scans append complete JSONL records in completion order. Global line order is
@@ -1492,34 +1516,72 @@ an appended `.summary.json`. It carries the same `runId`, complete
 runtime/browser versions, scan configuration and limits, and catalog
 provenance. Version 1 has no independent summary-path override.
 
-`--resume` and `--force` are mutually exclusive. The writer canonicalizes the
-existing parent directory once; every existing result or paired-summary target
-must be a regular non-symlink file opened without following the final path
-component and verified through its file descriptor. `--resume` scans, removes
+`--resume` and `--force` are mutually exclusive. An invalid writer mode fails
+before any output mutation. The writer canonicalizes the existing parent
+directory once. Every existing result target must be a single-link regular
+non-symlink file opened without following the final path component and verified
+through its file descriptor; symlinks, directories, and hard-linked results are
+rejected. A paired summary must also be a regular non-symlink file, but may have
+another hard link because a crash can occur between atomic link publication and
+temporary-alias cleanup. A new run treats any such existing summary as
+`OUTPUT_EXISTS`; resume/force unlink only the validated summary pathname and do
+not modify the inode visible through any other alias. `--resume` scans, removes
 an allowed incomplete final fragment, and appends through that same validated
-result descriptor. `--force` may truncate only that exact validated result,
-creates a new `runId`, and replaces only its validated paired summary. A normal
-new run refuses existing targets and creates them exclusively. Summary updates
-use a new exclusive temporary file in the same canonical parent followed by an
-atomic rename; no mode removes an output directory or another path implicitly.
+result descriptor. Once resume validation succeeds, it removes a validated
+stale paired summary before accepting new records. `--force` removes that stale
+validated summary before it truncates only the exact validated result, then
+creates a new `runId`. A normal new run refuses existing targets and creates
+them exclusively. Summary updates use a new exclusive temporary file in the
+same canonical parent followed by an exclusive hard-link publication. The
+published descriptor must retain the temporary file's exact device/inode, and
+cleanup unlinks only a pathname that still names that owned inode. No mode
+removes an output directory or another path implicitly.
+
+Only one writer may own a canonical output directory in a Node.js process. A
+second same-process open in that directory fails with `OUTPUT_BUSY`; closing or
+finalizing the owner releases the directory for reopening. The conservative
+directory-inode lock avoids filename aliases under filesystem-specific Unicode
+and case folding without implementing a second collation engine; the CLI needs
+only one result writer. Version 1 has no cross-process lock, so concurrent
+writers in separate processes are unsupported and callers must serialize that
+access.
 
 ## Run summary
 
-The final summary should include at least:
+`RunSummary` is a closed, deeply frozen version-1 object with exactly
+`schemaVersion`, `runId`, `scanMode`, `inputDomains`, `processedDomains`,
+`statusCounts`, `technologies`, `detectionStats`, `durationMs`, `usage`,
+`evidenceAttribution`, `hardLimitHits`, `errors`, `provenance`, and `config`.
+The paired JSON file serializes that object directly. Configuration and
+provenance are copied into a fixed canonical key order, so semantically equal
+contexts produce byte-stable summary JSON independent of caller insertion
+order. `statusCounts` contains `success`, `partial`, and `failed`.
+`technologies` contains direct, inferred, total domain-technology occurrences
+and the number of distinct technology names. `detectionStats` and all eight
+usage counters are sums of the exact persisted per-domain counters.
 
-- input, processed, successful, partial, and failed domain counts;
-- direct, inferred, total, and unique technology counts;
-- raw direct candidates gated or suppressed by relationship rules;
-- average and percentile scan duration;
-- HTTP-only detections versus additional browser detections;
-- incremental direct-detection lift and cost for probes, internal pages,
-  browser rendering, and script-content matching;
-- retry counts, hard-limit hits, pages visited, probes issued, browser requests,
-  and script bodies inspected;
-- error counts grouped by stage and stable error code;
-- fingerprint catalog version or source revision;
-- relevant runtime limits used for the run;
-- the shared `runId`, configuration digest, and runtime/browser versions.
+`durationMs.average` is the arithmetic mean of `timings.totalMs`, rounded to
+three decimal places. `p50`, `p95`, and `p99` use nearest rank at
+`ceil(p * n) - 1` after numeric ascending sort. All four values are zero when no
+record was processed. Error groups have exactly `stage`, `code`, and `count`,
+and sort by the fixed stage order followed by ascending UTF-16 error code.
+`hardLimitHits` counts codes ending in `_LIMIT_EXCEEDED` plus
+`REGEX_DOMAIN_BUDGET_EXCEEDED` and `REGEX_EXECUTION_LIMIT`.
+
+Evidence attribution counts emitted direct domain-technology occurrences with
+persisted evidence and is deliberately overlapping: every evidence item being
+HTTP contributes to `directWithOnlyHttpEvidence`; any browser collector, probe
+source, `p2`/`p3` page, or script-content source contributes to its corresponding
+counter. These are exact descriptions of final evidence, not additive or
+counterfactual lift. Measuring causal incremental lift or per-feature cost
+requires subset reruns and is deferred to benchmark analysis. Summary
+construction rejects duplicate domains, context/provenance mismatches, an
+`inputDomains` value lower than the number processed, or either count above the
+configured Parquet row cap. Every aggregate addition is preflighted as a safe
+integer and an overflow rejects the entire new record without mutating prior
+summary state. Aggregation is independent of JSONL completion order. The
+complete validated configuration and scanner/runtime/catalog provenance are
+included in canonical form.
 
 ## Testing strategy
 
@@ -1571,7 +1633,11 @@ The final summary should include at least:
 - Browser-egress tests prove that private, link-local, loopback, metadata, and
   mixed DNS destinations never receive a connection; CI does not require a live
   public website.
-- Resume and partial-result tests.
+- Output tests cover serialized append ordering, per-record and row caps,
+  persisted semantic validation, fragment-only recovery, duplicate resume keys,
+  target/link safety, single-process ownership, no-clobber summary publication,
+  canonical aggregate ordering, percentiles, safe sums, and atomic overflow
+  rejection.
 - A small optional real-site smoke run that is not required in CI.
 - Deterministic sorting and output-schema checks.
 
@@ -2041,7 +2107,7 @@ are recorded in `THIRD_PARTY_NOTICES.md`.
 
 Remaining implementation slices:
 
-- [ ] Add incremental output, resume, and summary generation.
+- [x] Add incremental output, resume, and summary generation.
 - [ ] Add the runnable CLI that connects Parquet input, the bounded local
   worker pool, `scanDomain()`, and incremental output.
 
@@ -2074,7 +2140,7 @@ Coding starts only after these decisions are explicit:
 
 The readiness gate, application foundation, protected HTTP/browser transports,
 robots policy, static and rendered observation collectors, fingerprint
-compiler, isolated detector, bounded Chromium pool, catalog probes, and DNS/TLS
-infrastructure collector are complete, as is pipeline orchestration.
-Incremental output, resume, and summary generation are the current unchecked
-slice; the runnable CLI remains a separate later slice.
+compiler, isolated detector, bounded Chromium pool, catalog probes, DNS/TLS
+infrastructure collector, pipeline orchestration, incremental output, resume,
+and summary generation are complete. The runnable CLI is the remaining
+implementation slice.

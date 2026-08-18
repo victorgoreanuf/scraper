@@ -12,6 +12,7 @@ import {
   sanitizeEvidenceKey,
   sanitizeUrl,
   validateDomainResult,
+  validatePersistedDomainResult,
   type DomainResult,
   type Evidence,
   type ScanError,
@@ -79,6 +80,12 @@ function makeResult(overrides: Partial<DomainResult> = {}): DomainResult {
       },
     ],
     technologies: [makeDirectTechnology()],
+    detectionStats: {
+      rawDirect: 1,
+      gatedDirect: 0,
+      suppressedDirect: 0,
+      retainedDirect: 1,
+    },
     errors: [],
     timings: {
       totalMs: 912,
@@ -148,6 +155,143 @@ test("accepts a schema-valid and semantically consistent result", () => {
       signalAdmitted: true,
     }),
     result,
+  );
+});
+
+test("requires detection statistics to partition raw direct candidates", () => {
+  expectSemanticFailure(
+    makeResult({
+      detectionStats: {
+        rawDirect: 4,
+        gatedDirect: 1,
+        suppressedDirect: 1,
+        retainedDirect: 1,
+      },
+    }),
+    /rawDirect does not equal gatedDirect \+ suppressedDirect \+ retainedDirect/,
+  );
+});
+
+test("ties retained detection statistics to materialized direct technologies", () => {
+  expectSemanticFailure(
+    makeResult({
+      detectionStats: {
+        rawDirect: 2,
+        gatedDirect: 0,
+        suppressedDirect: 0,
+        retainedDirect: 2,
+      },
+    }),
+    /retainedDirect does not match emitted direct technologies/,
+  );
+
+  const resultLimitError: ScanError = {
+    stage: "detect",
+    code: "RESULT_LIMIT_EXCEEDED",
+    pageId: null,
+    retryable: false,
+    message: "Detector result exceeded a materialization output limit.",
+    ruleId: null,
+    signal: null,
+    limit: "configured output limits",
+    catalogRevision: makeResult().provenance.catalog.revision,
+  };
+  const bounded = makeResult({
+    status: "partial",
+    technologies: [],
+    errors: [resultLimitError],
+  });
+  assert.equal(
+    validateDomainResult(bounded, {
+      scanConfig,
+      expectedConfigDigest: configDigest,
+      signalAdmitted: true,
+    }),
+    bounded,
+  );
+
+  assert.throws(
+    () =>
+      validatePersistedDomainResult(makeResult({
+        status: "partial",
+        detectionStats: {
+          rawDirect: 2,
+          gatedDirect: 0,
+          suppressedDirect: 0,
+          retainedDirect: 2,
+        },
+        errors: [resultLimitError],
+      }), {
+        scanConfig,
+        expectedConfigDigest: configDigest,
+      }),
+    /retainedDirect does not match emitted direct technologies/,
+  );
+});
+
+test("requires failed records to carry zero detection statistics", () => {
+  const failure: ScanError = {
+    stage: "target",
+    code: "TARGET_NOT_FOUND",
+    pageId: null,
+    retryable: false,
+    message: "No canonical target succeeded.",
+    ruleId: null,
+    signal: null,
+    limit: null,
+    catalogRevision: null,
+  };
+  expectSemanticFailure(
+    makeResult({
+      status: "failed",
+      finalUrl: null,
+      pages: [],
+      technologies: [],
+      detectionStats: {
+        rawDirect: 1,
+        gatedDirect: 1,
+        suppressedDirect: 0,
+        retainedDirect: 0,
+      },
+      errors: [failure],
+      usage: { ...makeResult().usage, pagesVisited: 0 },
+    }),
+    /failed requires zero detection statistics/,
+    false,
+  );
+
+  assert.throws(
+    () =>
+      validatePersistedDomainResult(makeResult({
+        status: "failed",
+        technologies: [],
+        detectionStats: {
+          rawDirect: 0,
+          gatedDirect: 0,
+          suppressedDirect: 0,
+          retainedDirect: 0,
+        },
+        errors: [failure],
+      }), {
+        scanConfig,
+        expectedConfigDigest: configDigest,
+      }),
+    /failed requires no final URL or page/,
+  );
+});
+
+test("bounds per-record duration for deterministic summary aggregation", () => {
+  const aggregateUnitLimit = Math.floor(
+    Number.MAX_SAFE_INTEGER / scanConfig.limits.parquet.rows,
+  );
+  expectSemanticFailure(
+    makeResult({
+      timings: {
+        ...makeResult().timings,
+        totalMs: aggregateUnitLimit + 1,
+      },
+    }),
+    /unsafe for bounded run-summary aggregation/,
   );
 });
 
@@ -742,6 +886,29 @@ test("requires registered ordered errors and checks signal-aware status", () => 
       expectedConfigDigest: configDigest,
       signalAdmitted: true,
     })
+  );
+  assert.equal(
+    validatePersistedDomainResult(partial, {
+      scanConfig,
+      expectedConfigDigest: configDigest,
+    }),
+    partial,
+  );
+  assert.throws(
+    () =>
+      validatePersistedDomainResult({
+        ...partial,
+        detectionStats: {
+          rawDirect: 2,
+          gatedDirect: 0,
+          suppressedDirect: 0,
+          retainedDirect: 1,
+        },
+      }, {
+        scanConfig,
+        expectedConfigDigest: configDigest,
+      }),
+    /rawDirect does not equal/,
   );
 
   const tlsLimitError: ScanError = {

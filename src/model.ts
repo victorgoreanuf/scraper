@@ -413,6 +413,13 @@ export interface Usage {
   readonly browserTransferredBytes: number;
 }
 
+export interface DetectionStats {
+  readonly rawDirect: number;
+  readonly gatedDirect: number;
+  readonly suppressedDirect: number;
+  readonly retainedDirect: number;
+}
+
 export interface RuntimeProvenance {
   readonly node: string;
   readonly playwright: string;
@@ -442,15 +449,20 @@ export interface DomainResult {
   readonly scanMode: "full";
   readonly pages: readonly PageRecord[];
   readonly technologies: readonly Technology[];
+  readonly detectionStats: DetectionStats;
   readonly errors: readonly ScanError[];
   readonly timings: Timings;
   readonly usage: Usage;
   readonly provenance: Provenance;
 }
 
-export interface DomainResultValidationContext {
+export interface PersistedDomainResultValidationContext {
   readonly scanConfig: ScanConfig;
   readonly expectedConfigDigest: string;
+}
+
+export interface DomainResultValidationContext
+  extends PersistedDomainResultValidationContext {
   readonly signalAdmitted: boolean;
 }
 
@@ -1783,6 +1795,18 @@ function validateConfiguredLimits(
     issues.push("$.usage.browserTransferredBytes exceeds the configured limit");
   }
 
+  const aggregateUnitLimit = Math.floor(
+    Number.MAX_SAFE_INTEGER / config.limits.parquet.rows,
+  );
+  if (result.timings.totalMs > aggregateUnitLimit) {
+    issues.push("$.timings.totalMs is unsafe for bounded run-summary aggregation");
+  }
+  for (const [key, value] of Object.entries(result.usage)) {
+    if (value > aggregateUnitLimit) {
+      issues.push(`$.usage.${key} is unsafe for bounded run-summary aggregation`);
+    }
+  }
+
   const recordBytes = Buffer.byteLength(`${JSON.stringify(result)}\n`, "utf8");
   if (recordBytes > output.jsonlRecordBytes) {
     issues.push("$ exceeds the configured JSONL record byte limit");
@@ -1791,7 +1815,8 @@ function validateConfiguredLimits(
 
 function validateSemantics(
   result: DomainResult,
-  context: DomainResultValidationContext,
+  context: PersistedDomainResultValidationContext,
+  signalAdmitted: boolean | null | undefined,
 ): readonly string[] {
   const issues: string[] = [];
   const config = context.scanConfig;
@@ -1830,6 +1855,44 @@ function validateSemantics(
 
   if (result.usage.pagesVisited !== result.pages.length) {
     issues.push("$.usage.pagesVisited does not match $.pages.length");
+  }
+
+  if (
+    result.detectionStats.rawDirect
+      !== result.detectionStats.gatedDirect
+        + result.detectionStats.suppressedDirect
+        + result.detectionStats.retainedDirect
+  ) {
+    issues.push(
+      "$.detectionStats.rawDirect does not equal gatedDirect + suppressedDirect + retainedDirect",
+    );
+  }
+
+  const detectionStatValues = [
+    result.detectionStats.rawDirect,
+    result.detectionStats.gatedDirect,
+    result.detectionStats.suppressedDirect,
+    result.detectionStats.retainedDirect,
+  ];
+  if (
+    result.status === "failed"
+    && detectionStatValues.some((value) => value !== 0)
+  ) {
+    issues.push("$.status failed requires zero detection statistics");
+  }
+
+  const directTechnologyCount = result.technologies.filter(
+    (technology) => technology.type === "direct",
+  ).length;
+  const materializationDiscarded = result.technologies.length === 0
+    && result.errors.some((error) => error.code === "RESULT_LIMIT_EXCEEDED");
+  if (
+    !materializationDiscarded
+    && result.detectionStats.retainedDirect !== directTechnologyCount
+  ) {
+    issues.push(
+      "$.detectionStats.retainedDirect does not match emitted direct technologies",
+    );
   }
 
   const pageIds = new Set(result.pages.map((page) => page.id));
@@ -2053,16 +2116,25 @@ function validateSemantics(
     }
   });
 
-  if (typeof context.signalAdmitted !== "boolean") {
+  if (
+    result.status === "failed"
+    && (result.finalUrl !== null || result.pages.length > 0)
+  ) {
+    issues.push("$.status failed requires no final URL or page");
+  }
+
+  if (signalAdmitted === null) {
+    // Persisted records no longer carry the pipeline's transient admission fact.
+  } else if (typeof signalAdmitted !== "boolean") {
     issues.push("validation context must declare signalAdmitted");
-  } else if (result.status === "success" && !context.signalAdmitted) {
+  } else if (result.status === "success" && !signalAdmitted) {
     issues.push("$.status success requires an admitted signal");
-  } else if (context.signalAdmitted && result.status === "failed") {
+  } else if (signalAdmitted && result.status === "failed") {
     issues.push("$.status is failed even though a signal was admitted");
-  } else if (!context.signalAdmitted && result.status === "partial") {
+  } else if (!signalAdmitted && result.status === "partial") {
     issues.push("$.status is partial even though no signal was admitted");
   } else if (
-    !context.signalAdmitted
+    !signalAdmitted
     && (result.finalUrl !== null || result.pages.length > 0)
   ) {
     issues.push("a no-signal result cannot contain a final URL or page");
@@ -2077,6 +2149,21 @@ export function validateDomainResult(
   value: unknown,
   context: DomainResultValidationContext,
 ): DomainResult {
+  return validateResult(value, context, context.signalAdmitted);
+}
+
+export function validatePersistedDomainResult(
+  value: unknown,
+  context: PersistedDomainResultValidationContext,
+): DomainResult {
+  return validateResult(value, context, null);
+}
+
+function validateResult(
+  value: unknown,
+  context: PersistedDomainResultValidationContext,
+  signalAdmitted: boolean | null | undefined,
+): DomainResult {
   if (!validateWireResult(value)) {
     const issue = validateWireResult.errors?.[0];
     const path = issue?.instancePath === "" ? "$" : `$${issue?.instancePath ?? ""}`;
@@ -2087,7 +2174,7 @@ export function validateDomainResult(
   }
 
   const result = value as DomainResult;
-  const issues = validateSemantics(result, context);
+  const issues = validateSemantics(result, context, signalAdmitted);
 
   if (issues.length > 0) {
     throw new DomainResultValidationError(issues);

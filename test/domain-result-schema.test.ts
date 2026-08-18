@@ -114,6 +114,12 @@ function makeResult(): JsonObject {
       },
     ],
     technologies: [makeDirectTechnology()],
+    detectionStats: {
+      rawDirect: 1,
+      gatedDirect: 0,
+      suppressedDirect: 0,
+      retainedDirect: 1,
+    },
     errors: [],
     timings: {
       totalMs: 912,
@@ -392,6 +398,10 @@ test("rejects unknown and missing fields at every result object boundary", () =>
     ["match", (result) => { asObject(firstEvidence(result).match).extra = true; }],
     ["timings", (result) => { asObject(result.timings).extra = true; }],
     ["usage", (result) => { asObject(result.usage).extra = true; }],
+    [
+      "detectionStats",
+      (result) => { asObject(result.detectionStats).extra = true; },
+    ],
     ["provenance", (result) => { asObject(result.provenance).extra = true; }],
     [
       "runtime",
@@ -445,6 +455,10 @@ test("rejects unknown and missing fields at every result object boundary", () =>
   const missing = makeResult();
   delete missing.provenance;
   expectInvalid(missing);
+
+  const missingDetectionStats = makeResult();
+  delete missingDetectionStats.detectionStats;
+  expectInvalid(missingDetectionStats);
 });
 
 test("enforces deterministic page identifiers, roles, and collector order", () => {
@@ -768,4 +782,16 @@ test("enforces status, lexical, digest, and numeric wire constraints", () => {
   asObject(unsafeInteger.usage).browserTransferredBytes =
     Number.MAX_SAFE_INTEGER + 1;
   expectInvalid(unsafeInteger);
+
+  const excessiveDetectionCount = makeResult();
+  asObject(excessiveDetectionCount.detectionStats).rawDirect = 20_001;
+  expectInvalid(excessiveDetectionCount);
+
+  const negativeDetectionCount = makeResult();
+  asObject(negativeDetectionCount.detectionStats).gatedDirect = -1;
+  expectInvalid(negativeDetectionCount);
+
+  const fractionalDetectionCount = makeResult();
+  asObject(fractionalDetectionCount.detectionStats).retainedDirect = 0.5;
+  expectInvalid(fractionalDetectionCount);
 });

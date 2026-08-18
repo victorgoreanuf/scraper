@@ -632,8 +632,12 @@ JSON Schema închide forma wire și variantele locale, dar nu pretinde să verif
 singur URL/timestamp canonic, sanitizerul, referințele, sortarea, calculele sau
 sensul statusului. `src/model.ts` implementează validatorul semantic unic, leagă
 digestul de configurația validată și cere explicit contextul boolean
-`signalAdmitted`; omiterea lui este invalidă. Writerul și viitorul resume reader
-vor aplica acest validator înainte de a accepta recordul.
+`signalAdmitted`; omiterea lui este invalidă. Pipeline-ul aplică această
+validare cu factul real înainte să returneze rezultatul. Writerul și resume
+readerul validează valoarea serializată sub semantica persisted-record: au
+încredere numai în statusul deja validat, dar reaplică schema, invariants
+semantice independente de istoria colectării, limitele și identitatea completă
+a runului.
 
 `success` cere `errors: []`; `partial` cere minimum un semnal admis și o eroare
 terminală; `failed` nu are semnale utilizabile, are `technologies: []` și minimum
@@ -644,11 +648,67 @@ este compatibil cu schema v1, dar eliminarea sau schimbarea sensului nu este.
 Registrul non-regex inițial și toate detaliile implementabile sunt în
 [`Result and evidence contract v1`](README.md#result-and-evidence-contract-v1).
 
+Fiecare rezultat persistă `detectionStats` cu exact `rawDirect`, `gatedDirect`,
+`suppressedDirect` și `retainedDirect`. Primul numără candidatele directe cu
+confidence pozitiv înainte de relații, al doilea pe cele respinse de gates, al
+treilea pe cele eliminate de exclusions, iar ultimul pe cele directe păstrate
+înainte de materializarea bounded. Toate sunt întregi bounded și
+`rawDirect = gatedDirect + suppressedDirect + retainedDirect`.
+
 Domeniile sunt programate în ordinea Parquet, însă workerii scriu fiecare record
 complet când termină. Ordinea globală JSONL este nespecificată/completion-order;
 resume păstrează ordinea existentă și doar adaugă. Determinismul este garantat în
 interiorul rezultatului, exceptând timestampurile și timings, iar testele și
 consumatorii compară după `(runId, domain)`, nu după poziția liniei.
+După eliminarea fragmentului final permis, un fișier fără niciun record complet
+nu are identitate persistată; resume generează un UUID nou și continuă ca run
+gol în același fișier validat.
+
+Writerul validează modul înainte de orice mutație și acceptă ca rezultat
+existent numai un fișier regular, non-symlink, cu un singur hard link, verificat
+și prin descriptor. Summary-ul pereche trebuie să fie regular și non-symlink,
+dar poate avea încă un hard link: un crash poate surveni între publicarea prin
+`link(temp, summary)` și ștergerea aliasului temporar. Create îl tratează ca
+existent, iar resume/force șterg numai aliasul summary validat, fără să modifice
+inode-ul vizibil prin alt hard link. Resume face asta numai după validarea
+completă a prefixului; force înainte să trunchieze rezultatul validat. Într-un
+proces poate exista un singur writer în directorul output canonic; o a doua
+deschidere în același inode de director dă `OUTPUT_BUSY`, iar close/finalize
+eliberează ownership-ul. Lock-ul conservator pe director evită aliasurile de
+filename produse de regulile Unicode/case ale filesystemului fără un al doilea
+motor de collation; CLI-ul are nevoie de un singur result writer. V1 nu
+implementează locking între procese: writeri concurenți din procese diferite sunt
+unsupported, iar apelantul trebuie să îi serializeze.
+
+Publicarea summary-ului folosește un temp exclusiv și sincronizat, apoi un hard
+link exclusiv. Writerul verifică după link că device/inode-ul publicat este exact
+cel validat prin descriptor și șterge temp-ul numai dacă pathname-ul încă indică
+acel inode; un replacement concurent nu este publicat și nu este șters.
+
+Summary-ul v1 este un obiect TypeScript închis și deep-frozen cu exact
+`schemaVersion`, `runId`, `scanMode`, `inputDomains`, `processedDomains`,
+`statusCounts`, `technologies`, `detectionStats`, `durationMs`, `usage`,
+`evidenceAttribution`, `hardLimitHits`, `errors`, `provenance` și `config`.
+Numără tehnologiile ca apariții domeniu-tehnologie, iar `unique` ca nume
+distincte. Media duratei este rotunjită la trei zecimale; p50/p95/p99 folosesc
+nearest-rank `ceil(p*n)-1`, cu zero pentru un run fără rezultate. Erorile sunt
+grupate după stage/code și sortate în ordinea fixă a stages, apoi după cod UTF-16.
+Hard-limit hits sunt codurile terminate în `_LIMIT_EXCEEDED` plus
+`REGEX_DOMAIN_BUDGET_EXCEEDED` și `REGEX_EXECUTION_LIMIT`.
+
+Atribuirea evidence este direct-only, exactă și neaditivă: numără separat
+aparițiile domeniu-tehnologie directe emise cu evidence persistat: cele cu toate
+dovezile HTTP și cele cu orice dovadă browser, probe, pagină internă `p2`/`p3`
+sau script content. Acești counteri descriu dovezile finale și nu pretind lift
+cauzal. Counterfactual lift și costul per feature cer rerulări pe subseturi și
+rămân pentru analiza benchmarkului. Accumulatorul respinge duplicatele,
+nepotrivirile de context/provenance, orice input/processed count peste capul
+`limits.parquet.rows` și un input count sub processed count. Fiecare sumă este
+preflighted ca safe integer înainte de orice mutație; overflow-ul respinge
+atomic noul record. Configurația și provenance sunt copiate în ordine canonică
+fixă, astfel încât JSON-ul summary este byte-stable pentru contexte semantic
+egale indiferent de insertion order. Outputul rămâne independent de completion
+order.
 
 Schema v1 păstrează domeniul și statusul, paginile, tehnologiile, erorile,
 timpii, consumul de resurse și provenance pentru scanner, catalog și

@@ -838,6 +838,38 @@
         "browserTransferredBytes": { "$ref": "#/$defs/nonnegativeInteger" }
       }
     },
+    "detectionStats": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rawDirect",
+        "gatedDirect",
+        "suppressedDirect",
+        "retainedDirect"
+      ],
+      "properties": {
+        "rawDirect": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 20000
+        },
+        "gatedDirect": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 20000
+        },
+        "suppressedDirect": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 20000
+        },
+        "retainedDirect": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 20000
+        }
+      }
+    },
     "nonnegativeInteger": {
       "type": "integer",
       "minimum": 0,
@@ -919,6 +951,7 @@
         "scanMode",
         "pages",
         "technologies",
+        "detectionStats",
         "errors",
         "timings",
         "usage",
@@ -966,6 +999,9 @@
           "items": {
             "$ref": "#/$defs/technology"
           }
+        },
+        "detectionStats": {
+          "$ref": "#/$defs/detectionStats"
         },
         "errors": {
           "type": "array",

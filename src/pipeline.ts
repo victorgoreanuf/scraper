@@ -30,6 +30,7 @@ import {
   sanitizeUrl,
   validateDomainResult,
   type DomainResult,
+  type DetectionStats,
   type DomainStatus,
   type ErrorCode,
   type ErrorStage,
@@ -477,6 +478,15 @@ function zeroUsage(): Usage {
   });
 }
 
+function zeroDetectionStats(): DetectionStats {
+  return Object.freeze({
+    rawDirect: 0,
+    gatedDirect: 0,
+    suppressedDirect: 0,
+    retainedDirect: 0,
+  });
+}
+
 function earlyFailure(
   domain: string,
   context: ScanDomainContext,
@@ -505,6 +515,7 @@ function earlyFailure(
     scanMode: "full" as const,
     pages: Object.freeze([]),
     technologies: Object.freeze([]),
+    detectionStats: zeroDetectionStats(),
     errors: Object.freeze([error]),
     timings: Object.freeze(values as unknown as Timings),
     usage: zeroUsage(),
@@ -691,6 +702,7 @@ export async function scanDomain(
   });
   let detection: DetectHttpResult = Object.freeze({
     technologies: Object.freeze([]),
+    detectionStats: zeroDetectionStats(),
     errors: Object.freeze([]),
     signalAdmitted: false,
     completed: true,
@@ -1138,6 +1150,7 @@ export async function scanDomain(
     scanMode: "full" as const,
     pages: outputPages,
     technologies,
+    detectionStats: detection.detectionStats,
     errors: boundedErrors,
     timings: createTimings(measuredTotalMs),
     usage: createUsage(),
