@@ -171,10 +171,13 @@ politica robots a schemei/autorității pentru noul path. Redirecturile către a
 autoritate primesc propria politică; cele de pe aceeași autoritate reevaluează
 pathul.
 
-## Ce rămâne de confirmat înainte de publicare sau scanare reală
+## Ce rămâne de confirmat înainte de republicare sau crawl la scară de producție
 
-- URL-ul sau emailul real de contact care intră în User-Agent înainte de a
-  accesa domenii publice.
+- Fiecare crawl public primește la runtime un contact real în User-Agent;
+  benchmarkul v0.1.4 a folosit contactul autorizat de operator, fără să îl
+  hardcodăm în repository.
+- Politicile finale de robots, opt-out, retenție și terms-of-service trebuie
+  revizuite înaintea unui crawl la scară de producție.
 - Dacă Veridion permite republicarea fișierului `input/domains.parquet`; până
   confirmăm, acesta rămâne local și ignorat de Git.
 
@@ -1042,6 +1045,52 @@ aplică fixed point-ul relațiilor și excluderile deterministe deja decise.
 - cele mai frecvente erori;
 - reguli care par să producă false positives.
 
+## Rezultatul benchmarkului full v0.1.4 și decizia rămasă deschisă
+
+Runul public autorizat v0.1.4 a terminat 200/200 domenii, iar resume nu a
+modificat artefactele. Validarea independentă a confirmat setul exact de input,
+toate cele 200 de rezultate, provenance/config/catalog, summary-ul reconstruit
+byte-identic și redacția. Rezultatul are 3 success, 190 partial și 7 failed,
+2.061 detecții directe, 167 deduse și 373 nume unice total. În acest run nu a
+existat un failure proxy sau de disponibilitate la nivelul întregului pool:
+zero `BROWSER_PROXY_FAILED`, `BROWSER_UNAVAILABLE` și `DETECTOR_UNAVAILABLE`;
+72/74 pagini interne încercate în browser au admis un draft bounded.
+
+Baseline-ul arată însă două limite de calitate care nu trebuie ascunse prin
+mărirea tăcută a bugetelor sau reinterpretarea dovezilor:
+
+- 176/180 pagini browser admise sunt trunchiate și există 193
+  `BROWSER_LIMIT_EXCEEDED`; catalogul pin-uit conține în continuare selectori
+  value foarte largi, iar outputul redacted nu dovedește offline cauza exactă a
+  fiecărei limite;
+- review-ul evidențelor a produs o coadă inițială, neexhaustivă, de
+  reguli/aliasuri de corectat: toate cele patru detecții Onsen UI includ cel
+  puțin un match fals `onsen` în `consent`; WebsiteBuilder este mapat din Wix;
+  `svSession` susține Store Vantage/Sirvoy; Wix eCommerce folosește un host
+  generic; familia Lightbox este puternic suspectă; există patru perechi de
+  aliasuri duplicate.
+
+Ținta inițială pe occurrence-uri, 95% din detecțiile directe cu browser pe
+maximum 20% dintre domenii, este infirmată de date: fără browser rămân cel mult
+1.317/2.061; chiar un oracle care alege cele mai productive 40 de domenii ajunge
+numai la 1.768/2.061 (85,78%), iar 95% cere minimum 68/200 domenii (34%). Nu mai
+folosim această țintă drept criteriu de acceptare implicit.
+
+Rămâne deschisă o alegere de produs/măsurare înainte de implementarea tiered:
+
+1. păstrăm occurrence retention și acceptăm un plafon browser de cel puțin 34%
+   ca lower bound oracle; un trigger deployabil poate necesita mai mult;
+2. sau, recomandat pentru evaluare, cerem minimum 95% din numele directe
+   canonicalizate cu browser pe maximum 20%, păstrând occurrence retention ca
+   metrică secundară.
+
+A doua variantă este fezabilă numai ca oracle post-hoc în acest moment: 25 de
+domenii acoperă 342/360 nume directe și 40 acoperă 357/360. Înainte să devină
+politică trebuie să corectăm aliasurile/false-positive-urile cu fixtures
+pozitive și negative și să măsurăm un trigger care folosește exclusiv semnale
+tier 1/2. Nu adăugăm acum un framework generic de override, nu schimbăm capul
+browser și nu declarăm gate-ul final închis fără această decizie și o rerulare.
+
 ## Probleme posibile
 
 - fingerprints incomplete sau învechite;
@@ -1077,9 +1126,11 @@ aplică fixed point-ul relațiilor și excluderile deterministe deja decise.
 - Rezultatele vor fi scrise incremental și partiționate.
 - Vom monitoriza durata, erorile, throughput-ul și dimensiunea cozilor.
 - Numărul de workeri va fi calculat după ce măsurăm costul scanării HTTP și al scanării cu browserul.
-- Ținta inițială pentru tiering este minimum 95% din detecțiile directe ale
-  baseline-ului `full`, cu browser pe maximum 20% dintre domenii; nu tratăm
-  aceste procente ca adevăr înainte de benchmark.
+- Ținta inițială de 95% din occurrence-urile directe cu browser pe maximum 20%
+  a fost infirmată de benchmarkul v0.1.4. KPI-ul final rămâne alegerea explicită
+  dintre occurrence retention cu plafon browser mai mare și nume directe
+  canonicalizate cu occurrence retention secundar; nu extrapolăm capacitatea
+  până nu măsurăm triggerul ales.
 
 ## Descoperirea tehnologiilor noi
 

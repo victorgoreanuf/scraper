@@ -1775,13 +1775,16 @@ The measured scaling policy has four tiers:
    signals.
 
 The 200-domain `full` run is the reference dataset used to simulate these
-triggers before implementing tiered orchestration. The initial acceptance target
-is at least 95% of `full` mode's direct detections while rendering at most 20%
-of domains. If measurements miss either bound, triggers change before capacity
-is extrapolated. HTTP and browser worker counts are then sized independently
-from observed p95 cost with at least 2x throughput headroom. Robots, opt-out,
-retention, terms-of-service review, and an operational contact remain release
-gates for a production-scale crawl.
+triggers before implementing tiered orchestration. The original acceptance
+target was at least 95% of `full` mode's direct detection occurrences while
+rendering at most 20% of domains. That target is infeasible on the v0.1.4
+baseline under the optimistic evidence-based upper bound: even an oracle
+selecting the best 40 domains retains only 85.78%, and at least 68 domains (34%)
+are required for 95%. The final objective therefore remains an explicit
+evaluation decision rather than an implementation invariant. HTTP and browser
+worker counts are then sized independently from observed p95 cost with at least
+2x throughput headroom. Robots, opt-out, retention, terms-of-service review,
+and an operational contact remain release gates for a production-scale crawl.
 
 ## Runtime baseline
 
@@ -2171,6 +2174,81 @@ categories, and 27 technology files; no upstream executable code, icons,
 dependencies, or branding were imported. Its provenance and unmodified status
 are recorded in `THIRD_PARTY_NOTICES.md`.
 
+## 200-domain full benchmark (v0.1.4)
+
+The v0.1.4 reference evaluation run used the pinned catalog/configuration
+recorded in its summary. It completed all 200 unique input domains, then a
+resume run completed without changing either output file. The captured
+artifact has verifiable provenance and bytes; live website responses are not
+expected to be identical across reruns. The Git-ignored local artifacts are
+`output/work/results-200-v0.1.4.jsonl` and its paired `.summary.json` file.
+
+Integrity checks independently validated all 200 persisted results against the
+embedded configuration, rebuilt the summary byte-for-byte, and confirmed the
+input/output domain sets, run provenance, catalog digest, redaction invariants,
+UTF-8/JSONL boundaries, and regular single-link `0600` output files. The stable
+artifact hashes are:
+
+- input Parquet: `sha256:65e77097c669c29b392f3279a93f04566ab934cf1e8acfaf1ae4046a01e97bb2`;
+- result JSONL: `sha256:502a72c1ad161ed0e55c188ef7a517d975204eb1d0ef89059dfaeae1c066caa7`;
+- summary JSON: `sha256:cfd022789b1fc2f9bfb9db03f498e00992d8e712bba73f505ecec4bdd6dc6ca7`.
+
+The measured result is:
+
+| Metric | v0.1.4 result |
+| --- | ---: |
+| Status | 3 success, 190 partial, 7 failed |
+| Detections | 2,061 direct + 167 inferred = 2,228 |
+| Unique technology names | 373 total; 360 direct |
+| Direct candidate accounting | 2,120 raw - 55 gated - 4 suppressed = 2,061 retained |
+| Domains with zero detections | 37 |
+| HTTP / browser requests | 1,033 / 14,419 |
+| Pages / probes / script bodies | 235 / 374 / 1,445 |
+| Static / browser transfer | 10,777,145 / 204,825,582 bytes |
+| Duration | 9,692.140 ms average; 8,969 ms p50; 25,182 ms p95; 52,972 ms p99 |
+
+The zero-detection set does not establish 37 catalog misses: 35 domains admitted
+no page and the other two ended with incomplete collection. Evidence-exclusive
+support, which is descriptive and not counterfactual lift, includes 744 browser
+detections across 103 domains, 33 internal-page detections across 23 domains,
+70 script-content detections across 44 domains, two probe detections, 142 DNS
+detections across 95 domains, and 86 TLS detections across 86 domains. These
+categories overlap and must not be summed.
+
+No pool-wide proxy or availability failure occurred in this run: it emitted no
+`BROWSER_PROXY_FAILED`, `BROWSER_UNAVAILABLE`, or `DETECTOR_UNAVAILABLE`, and
+admitted browser observations for 72 of 74 attempted `p2` pages. Browser
+observation truncation is nevertheless systemic: 176 of 180 admitted browser
+pages were truncated and the run emitted 193 `BROWSER_LIMIT_EXCEEDED` errors.
+The pinned catalog still contains broad value inspections such as `div`,
+`button`, `script`, and `style`; the persisted result intentionally does not
+identify the exact selector/limit responsible for each truncation. The detector
+also emitted 15 rule timeouts, six execution-limit errors, and six domain-budget
+errors; the Liveinternet HTML rule accounts for 13 of the 15 timeouts.
+
+Manual evidence review identified an initial, non-exhaustive correction queue
+rather than a global false-positive estimate. All four Onsen UI detections
+include at least one false `onsen` substring match inside `consent`; one also has
+redacted evidence that cannot be adjudicated offline. Other entries are
+WebsiteBuilder (9/9 Wix generator mappings), Store Vantage (3/3) and Sirvoy
+(1/1) from Wix's generic `svSession`, Wix eCommerce (1/1 from a generic Wix
+asset host), and 11/11 strongly suspect Lightbox evidence sets pointing to other
+lightbox implementations. Four alias families also duplicate the same
+technology: LiteSpeed Cache/Litespeed Cache, All in One SEO/All in One SEO Pack,
+MUI/Material UI, and Adobe Fonts/Typekit.
+
+The original occurrence-based tiering target is infeasible on this baseline
+under the optimistic evidence-based upper bound. Without browser evidence, at
+most 1,317/2,061 direct occurrences remain; an oracle selecting the best 40/200
+domains reaches only 1,768/2,061 (85.78%), and 95% requires at least 68/200
+domains (34%). A deployable trigger may require more. A possible replacement
+objective is canonical direct technology names: a post-hoc greedy selection
+covers 342/360 (95%) with 25 domains and 357/360 (99.17%) with 40. That is not
+yet a deployable policy because it uses full-result knowledge; aliases/false
+positives must be corrected and a trigger based only on tier-1/tier-2 signals
+must be measured. Consequently, the scan-and-analysis gate is complete while
+the final-results and debate gate remains open.
+
 ## Implementation roadmap
 
 - [x] Confirm challenge scope and input format.
@@ -2212,7 +2290,7 @@ Remaining implementation slices:
 Completion and evaluation gates:
 
 - [x] Run deterministic tests and a small real-site smoke test.
-- [ ] Scan all 200 domains and analyze misses and false positives.
+- [x] Scan all 200 domains and analyze misses and false positives.
 - [ ] Produce final results and complete the debate topics.
 
 ## Readiness gate for the coding stage
