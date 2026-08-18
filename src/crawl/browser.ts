@@ -78,6 +78,8 @@ export interface BrowserPageInput {
 
 export interface BrowserPageCollection {
   readonly completed: boolean;
+  readonly observationsAdmitted: boolean;
+  readonly continuationAllowed: boolean;
   readonly errors: readonly ScanError[];
   readonly navigationLinks: readonly string[];
 }
@@ -2180,6 +2182,8 @@ class BrowserDomainSessionImpl implements BrowserDomainSession {
       this.#hadCollectionFailure = true;
       return Object.freeze({
         completed: false,
+        observationsAdmitted: false,
+        continuationAllowed: false,
         errors: [error],
         navigationLinks: Object.freeze([]),
       });
@@ -2219,6 +2223,8 @@ class BrowserDomainSessionImpl implements BrowserDomainSession {
     let tracker: PageScriptTracker | null = null;
     let onFrameNavigated: ((frame: Frame) => void) | null = null;
     let completed = false;
+    let observationsAdmitted = false;
+    let continuationAllowed = false;
     let admittedNavigationLinks: readonly string[] = Object.freeze([]);
 
     try {
@@ -2373,6 +2379,7 @@ class BrowserDomainSessionImpl implements BrowserDomainSession {
         truncated: state.truncated,
       }));
       admittedNavigationLinks = navigationLinks;
+      observationsAdmitted = true;
       completed = pageErrors.length === 0;
       if (!completed) {
         this.#hadCollectionFailure = true;
@@ -2404,7 +2411,10 @@ class BrowserDomainSessionImpl implements BrowserDomainSession {
         if (onFrameNavigated !== null) {
           page.off("framenavigated", onFrameNavigated);
         }
-        await this.#closePageBounded(page);
+        const pageClosed = await this.#closePageBounded(page);
+        if (!pageClosed) {
+          pageErrors.push(browserError("BROWSER_UNAVAILABLE", input.pageId));
+        }
       }
       this.#activePage = null;
       try {
@@ -2418,19 +2428,33 @@ class BrowserDomainSessionImpl implements BrowserDomainSession {
         } else if (!this.#domainSignal.aborted) {
           pageErrors.push(this.#errorForFailure(error, input.pageId));
           this.#hadCollectionFailure = true;
+          this.#contextUsable = false;
         }
       }
       this.#activeState = null;
     }
 
     const errors = uniqueErrors(pageErrors);
-    completed = completed && errors.length === 0;
+    const onlyRecoverableTruncation = state.truncated
+      && errors.every((error) =>
+        error.stage === "browser"
+        && error.code === "BROWSER_LIMIT_EXCEEDED");
+    continuationAllowed = observationsAdmitted
+      && this.#contextUsable
+      && !this.#domainSignal.aborted
+      && this.#slot.browser.isConnected()
+      && this.#slot.proxy.getFailure() === null
+      && !this.#unhealthy
+      && (errors.length === 0 || onlyRecoverableTruncation);
+    completed = completed && errors.length === 0 && continuationAllowed;
     if (!completed) {
       this.#hadCollectionFailure = true;
     }
     this.#errors.push(...errors);
     return Object.freeze({
       completed,
+      observationsAdmitted,
+      continuationAllowed,
       errors,
       navigationLinks: admittedNavigationLinks,
     });
@@ -3070,7 +3094,7 @@ class BrowserDomainSessionImpl implements BrowserDomainSession {
     return this.#contextClosePromise;
   }
 
-  async #closePageBounded(page: Page): Promise<void> {
+  async #closePageBounded(page: Page): Promise<boolean> {
     const closed = await settleWithin(
       page.close({ reason: "Browser page collection finished" }),
       CLEANUP_WATCHDOG_MS,
@@ -3083,6 +3107,7 @@ class BrowserDomainSessionImpl implements BrowserDomainSession {
         reason: "Browser page cleanup exceeded its deadline",
       }).catch(() => undefined);
     }
+    return closed;
   }
 
   #errorForFailure(

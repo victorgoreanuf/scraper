@@ -612,6 +612,9 @@ class FakePage {
   }
 
   async close(): Promise<void> {
+    if (this.context.rejectPageClose) {
+      throw new Error("Fake page close failed");
+    }
     this.closed = true;
   }
 }
@@ -631,6 +634,7 @@ class FakeContext {
   readonly topRedirects: readonly string[];
   readonly collectionGate: Promise<void>;
   readonly rejectClose: boolean;
+  rejectPageClose = false;
   readonly pages: FakePage[] = [];
   closed = false;
   readonly cookieCalls: string[][] = [];
@@ -1569,12 +1573,52 @@ test("keeps browser safety-limit details out of persisted error context", async 
       allowTopLevelUrl: () => true,
     });
     assert.equal(collection.completed, false);
+    assert.equal(collection.observationsAdmitted, true);
+    assert.equal(collection.continuationAllowed, true);
     assert.equal(collection.errors.some(
       ({ code }) => code === "BROWSER_LIMIT_EXCEEDED",
     ), true);
     assert.equal(collection.errors.every(({ limit }) => limit === null), true);
-    await session.close();
+    const result = await session.finish();
+    assert.equal(result.completed, false);
+    assert.equal(result.pages.length, 1);
+    assert.equal(result.pages[0]?.truncated, true);
   }
+});
+
+test("preserves an admitted draft but stops after page cleanup fails", async (t) => {
+  const runtime = fakeRuntime();
+  const pool = await createBrowserPool(
+    runtime.transport,
+    browserConfig(),
+    runtime.launcher,
+  );
+  t.after(() => pool.close());
+  const session = await pool.openDomain();
+  const context = runtime.browsers[0]?.contexts[1];
+  assert.notEqual(context, undefined);
+  if (context !== undefined) {
+    context.rejectPageClose = true;
+  }
+
+  const collection = await session.collectPage({
+    pageId: "p1",
+    url: "https://merchant-site.org/",
+    inspectionPlan,
+    allowTopLevelUrl: () => true,
+  });
+
+  assert.equal(collection.completed, false);
+  assert.equal(collection.observationsAdmitted, true);
+  assert.equal(collection.continuationAllowed, false);
+  assert.equal(
+    collection.errors.some(({ code }) => code === "BROWSER_UNAVAILABLE"),
+    true,
+  );
+  const result = await session.finish();
+  assert.equal(result.completed, false);
+  assert.equal(result.pages.length, 1);
+  assert.equal(pool.isAvailable(), true);
 });
 
 test("replaces one crashed Chromium process and then degrades unavailable", async (t) => {
@@ -1773,6 +1817,25 @@ test("collects a controlled page through the real protected Chromium path", asyn
       response.end();
       return;
     }
+    if (request.url === "/truncated") {
+      response.writeHead(200, {
+        "Content-Type": "text/html; charset=utf-8",
+        Connection: "close",
+      });
+      response.end(`<!doctype html><body>${Array.from(
+        { length: 25 },
+        (_, index) => `<div>Item ${index}</div>`,
+      ).join("")}<a href="/truncated-next">Next</a></body>`);
+      return;
+    }
+    if (request.url === "/truncated-next") {
+      response.writeHead(200, {
+        "Content-Type": "text/html; charset=utf-8",
+        Connection: "close",
+      });
+      response.end("<!doctype html><body><div>Next page</div></body>");
+      return;
+    }
     response.writeHead(200, {
       "Content-Type": "text/html; charset=utf-8",
       "Set-Cookie": "technology_cookie=enabled; Path=/; SameSite=Lax",
@@ -1874,6 +1937,52 @@ test("collects a controlled page through the real protected Chromium path", asyn
   assert.equal(harness.connectCalls.every((call) => call.address === publicAddress), true);
   assert.equal(requestedUrls.includes("/redirect-script.js"), true);
   assert.equal(requestedUrls.includes("/app.js"), true);
+
+  const wildcardPlan: CatalogInspectionPlan = Object.freeze({
+    dom: Object.freeze([Object.freeze({
+      selector: "*",
+      facts: Object.freeze([Object.freeze({
+        kind: "attribute" as const,
+        name: "q:version",
+        locator: "*:q:version",
+        demand: Object.freeze({ presence: false, value: true }),
+      })]),
+    })]),
+    javascript: Object.freeze([]),
+    probePaths: Object.freeze([]),
+    dnsRecordTypes: Object.freeze([]),
+    tlsIssuer: false,
+  });
+  const truncatedSession = await pool.openDomain();
+  const truncatedCollection = await truncatedSession.collectPage({
+    pageId: "p1",
+    url: "http://browser-target.org/truncated",
+    inspectionPlan: wildcardPlan,
+    allowTopLevelUrl: () => true,
+  });
+  assert.equal(truncatedCollection.completed, false);
+  assert.equal(truncatedCollection.observationsAdmitted, true);
+  assert.equal(truncatedCollection.continuationAllowed, true);
+  assert.equal(
+    truncatedCollection.errors.some(
+      ({ code }) => code === "BROWSER_LIMIT_EXCEEDED",
+    ),
+    true,
+  );
+  const nextCollection = await truncatedSession.collectPage({
+    pageId: "p2",
+    url: "http://browser-target.org/truncated-next",
+    inspectionPlan: wildcardPlan,
+    allowTopLevelUrl: () => true,
+  });
+  assert.equal(nextCollection.completed, true);
+  assert.equal(nextCollection.observationsAdmitted, true);
+  assert.equal(nextCollection.continuationAllowed, true);
+  const truncatedResult = await truncatedSession.finish();
+  assert.equal(truncatedResult.completed, false);
+  assert.equal(truncatedResult.pages.length, 2);
+  assert.equal(truncatedResult.pages[0]?.truncated, true);
+  assert.equal(truncatedResult.pages[1]?.truncated, false);
 
   const deniedSession = await pool.openDomain();
   const deniedCollection = await deniedSession.collectPage({

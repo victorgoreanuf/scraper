@@ -331,6 +331,8 @@ function scanError(
 interface FakeBrowserScenario {
   readonly navigationLinks?: Partial<Record<PageId, readonly string[]>>;
   readonly pageErrors?: Partial<Record<PageId, ScanError>>;
+  readonly admittedPages?: readonly PageId[];
+  readonly continuationPages?: readonly PageId[];
   readonly finishErrors?: readonly ScanError[];
   readonly throwOnPage?: PageId;
   readonly onClose?: () => void;
@@ -346,6 +348,7 @@ class FakeBrowserSession implements BrowserDomainSession {
   finishCount = 0;
   closeCount = 0;
   readonly #scenario: FakeBrowserScenario;
+  readonly #admittedPageIds = new Set<PageId>();
 
   constructor(scenario: FakeBrowserScenario = {}) {
     this.#scenario = scenario;
@@ -359,11 +362,20 @@ class FakeBrowserSession implements BrowserDomainSession {
     }
 
     const error = this.#scenario.pageErrors?.[input.pageId];
+    const observationsAdmitted = error === undefined
+      || this.#scenario.admittedPages?.includes(input.pageId) === true;
+    const continuationAllowed = error === undefined
+      || this.#scenario.continuationPages?.includes(input.pageId) === true;
+    if (observationsAdmitted) {
+      this.#admittedPageIds.add(input.pageId);
+    }
     const navigationLinks = Object.freeze([
       ...(this.#scenario.navigationLinks?.[input.pageId] ?? []),
     ]);
     return Object.freeze({
       completed: error === undefined,
+      observationsAdmitted,
+      continuationAllowed,
       errors: error === undefined ? Object.freeze([]) : Object.freeze([error]),
       navigationLinks,
     });
@@ -371,8 +383,9 @@ class FakeBrowserSession implements BrowserDomainSession {
 
   async finish(): Promise<BrowserDomainResult> {
     this.finishCount += 1;
-    const pages: BrowserPageObservations[] = this.inputs.map((input) =>
-      Object.freeze({
+    const pages: BrowserPageObservations[] = this.inputs
+      .filter((input) => this.#admittedPageIds.has(input.pageId))
+      .map((input) => Object.freeze({
         pageId: input.pageId,
         finalUrl: input.url,
         dom: Object.freeze([]),
@@ -386,8 +399,7 @@ class FakeBrowserSession implements BrowserDomainSession {
           ...(this.#scenario.navigationLinks?.[input.pageId] ?? []),
         ]),
         truncated: this.#scenario.pageErrors?.[input.pageId] !== undefined,
-      })
-    );
+      }));
     const pageErrors = this.inputs.flatMap((input) => {
       const error = this.#scenario.pageErrors?.[input.pageId];
       return error === undefined ? [] : [error];
@@ -798,6 +810,142 @@ test("orchestrates p1-p3 once and combines HTTP, browser, TLS, usage, and proven
     suppressedDirect: 0,
     retainedDirect: 0,
   });
+  assertValidResult(result, config, true);
+});
+
+test("continues the browser prefix after admitting a truncated browser draft", async () => {
+  const config = configWith();
+  const catalog = catalogWith();
+  const listingUrl = `${ENTRY_URL}collections/all`;
+  const detailUrl = `${ENTRY_URL}products/widget`;
+  const browserLimit = scanError(
+    "browser",
+    "BROWSER_LIMIT_EXCEEDED",
+    "p1",
+    "The browser observation exceeded a safety limit.",
+  );
+  const transport = new ScriptedTransport([
+    [ENTRY_URL, htmlResponse(
+      ENTRY_URL,
+      `<html><body><a href="${detailUrl}">Detail</a></body></html>`,
+    )],
+    [listingUrl, htmlResponse(listingUrl, "<html><body>Listing</body></html>")],
+    [detailUrl, htmlResponse(detailUrl, "<html><body>Detail</body></html>")],
+  ]);
+  const browserPool = new FakeBrowserPool({
+    navigationLinks: { p1: [listingUrl] },
+    pageErrors: { p1: browserLimit },
+    admittedPages: ["p1"],
+    continuationPages: ["p1"],
+  });
+
+  const result = await scanDomain(DOMAIN, {
+    runId: RUN_ID,
+    config,
+    provenance: provenanceFor(config, catalog),
+    transport,
+    robots: new FakeRobotsService(),
+    browserPool,
+    detectorPool: new RecordingDetectorPool(catalog),
+    catalog,
+  }, deterministicOptions());
+
+  assert.equal(result.status, "partial");
+  assert.deepEqual(result.pages, [
+    {
+      id: "p1",
+      role: "entry",
+      url: ENTRY_URL,
+      httpStatus: 200,
+      collectors: ["http", "browser"],
+    },
+    {
+      id: "p2",
+      role: "listing",
+      url: listingUrl,
+      httpStatus: 200,
+      collectors: ["http", "browser"],
+    },
+    {
+      id: "p3",
+      role: "detail",
+      url: detailUrl,
+      httpStatus: 200,
+      collectors: ["http", "browser"],
+    },
+  ]);
+  assert.deepEqual(
+    browserPool.session.inputs.map(({ pageId, url }) => ({ pageId, url })),
+    [
+      { pageId: "p1", url: ENTRY_URL },
+      { pageId: "p2", url: listingUrl },
+      { pageId: "p3", url: detailUrl },
+    ],
+  );
+  assert.deepEqual(
+    result.errors.map(({ stage, code }) => [stage, code]),
+    [["browser", "BROWSER_LIMIT_EXCEEDED"]],
+  );
+  assertValidResult(result, config, true);
+});
+
+test("keeps an admitted browser draft but closes the prefix after a terminal failure", async () => {
+  const config = configWith();
+  const catalog = catalogWith();
+  const listingUrl = `${ENTRY_URL}collections/all`;
+  const proxyFailure = scanError(
+    "browser",
+    "BROWSER_PROXY_FAILED",
+    "p1",
+    "The protected browser proxy failed.",
+    true,
+  );
+  const transport = new ScriptedTransport([
+    [ENTRY_URL, htmlResponse(ENTRY_URL, "<html><body>Entry</body></html>")],
+    [listingUrl, htmlResponse(listingUrl, "<html><body>Listing</body></html>")],
+  ]);
+  const browserPool = new FakeBrowserPool({
+    navigationLinks: { p1: [listingUrl] },
+    pageErrors: { p1: proxyFailure },
+    admittedPages: ["p1"],
+  });
+
+  const result = await scanDomain(DOMAIN, {
+    runId: RUN_ID,
+    config,
+    provenance: provenanceFor(config, catalog),
+    transport,
+    robots: new FakeRobotsService(),
+    browserPool,
+    detectorPool: new RecordingDetectorPool(catalog),
+    catalog,
+  }, deterministicOptions());
+
+  assert.equal(result.status, "partial");
+  assert.deepEqual(result.pages, [
+    {
+      id: "p1",
+      role: "entry",
+      url: ENTRY_URL,
+      httpStatus: 200,
+      collectors: ["http", "browser"],
+    },
+    {
+      id: "p2",
+      role: "listing",
+      url: listingUrl,
+      httpStatus: 200,
+      collectors: ["http"],
+    },
+  ]);
+  assert.deepEqual(
+    browserPool.session.inputs.map(({ pageId, url }) => ({ pageId, url })),
+    [{ pageId: "p1", url: ENTRY_URL }],
+  );
+  assert.deepEqual(
+    result.errors.map(({ stage, code }) => [stage, code]),
+    [["browser", "BROWSER_PROXY_FAILED"]],
+  );
   assertValidResult(result, config, true);
 });
 

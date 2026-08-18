@@ -750,6 +750,15 @@ aborted waiter cannot consume a pool slot. Collection waits for
 `DOMContentLoaded` and a bounded two-second settle window, never unbounded
 `networkidle`.
 
+An inspection, cookie, network-observation, or script-body limit retains the
+bounded browser draft, records `BROWSER_LIMIT_EXCEEDED`, marks the page
+truncated, and keeps the ordered browser prefix eligible for the next selected
+page. `PageRecord.collectors` therefore includes `browser` for both complete
+and truncated admitted drafts. A failure before observation admission produces
+no usable draft; a terminal proxy, timeout, navigation, policy, lifecycle, or
+cleanup failure always closes the prefix even when the current page's earlier
+bounded draft remains admissible.
+
 The browser keeps its sandbox and CSP, has no permissions, blocks service
 workers, disables downloads, and never clicks, scrolls, submits forms, accepts
 consent, authenticates, or bypasses access controls. `GET`, `HEAD`, and
@@ -1125,8 +1134,9 @@ path as a non-null key. Evidence `pageId`,
 `key`, `pattern`, and `version` are the only nullable evidence scalars.
 `match.value` is nullable under the redaction rules below.
 
-`PageRecord.collectors` lists only collectors which completed for that page;
-failures are linked by `pageId`. Error `stage` is one of `target`, `robots`,
+`PageRecord.collectors` lists only collectors which admitted a bounded page
+draft, including a truncated HTTP or browser draft; failures are linked by
+`pageId`. Error `stage` is one of `target`, `robots`,
 `http`, `dns`, `tls`, `browser`, or `detect`. `usage.httpRequests` excludes
 browser traffic, while `usage.browserRequests` counts requests admitted or
 explicitly aborted by browser policy. Every candidate, robots fetch, redirect

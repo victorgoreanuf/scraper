@@ -825,11 +825,14 @@ export async function scanDomain(
           "p1",
           entry.page.response.finalNetworkUrl,
         );
-        if (collected === null || !collected.completed) {
+        if (collected === null) {
           browserPrefixOpen = false;
-        } else {
+        } else if (collected.observationsAdmitted) {
           pages[0] = withBrowser(pages[0] as PageRecord);
           renderedLinks = collected.navigationLinks;
+        }
+        if (collected !== null && !collected.continuationAllowed) {
+          browserPrefixOpen = false;
         }
         if (collected !== null) errors.push(...collected.errors);
       } else {
@@ -921,11 +924,14 @@ export async function scanDomain(
             pageId,
             pageResult.page.response.finalNetworkUrl,
           );
-          if (collected === null || !collected.completed) {
+          if (collected === null) {
             browserPrefixOpen = false;
-          } else {
+          } else if (collected.observationsAdmitted) {
             page = withBrowser(page);
             pages[pages.length - 1] = page;
+          }
+          if (collected !== null && !collected.continuationAllowed) {
+            browserPrefixOpen = false;
           }
           if (collected !== null) errors.push(...collected.errors);
         } else {

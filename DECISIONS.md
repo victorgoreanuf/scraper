@@ -608,6 +608,12 @@ O pagină statică eșuată nu poate deveni browser-only. Navigările browser fo
 un prefix ordonat: după un gap nu deschidem o pagină browser ulterioară, deși un
 `p2`/`p3` deja selectat poate păstra observațiile HTTP. Un entry final non-HTML
 urmează terminalul `partial` deja decis și nu pornește pagini interne.
+O limită de observație browser păstrează draftul bounded, eroarea și statusul
+`partial`, dar nu creează un gap: pagina primește collectorul browser, iar
+`p2`/`p3` rămân eligibile. Admiterea draftului decide provenance-ul paginii,
+separat de reutilizarea contextului: o eroare terminală de navigare, timeout,
+proxy, policy, lifecycle ori cleanup închide prefixul chiar dacă draftul bounded
+al paginii curente rămâne admis.
 
 `targetMs` măsoară selecția entry, `robotsMs` acumulează lucrul robots, iar
 `httpMs` include paginile și probele, dar exclude robots inclus în colectarea
