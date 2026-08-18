@@ -400,6 +400,35 @@ test("resume rejects corruption without modifying the result prefix", async (t) 
   }
 });
 
+test("resume rejects an older scanner version without modifying the result", async (t) => {
+  const directory = await temporaryDirectory(t);
+  const resultPath = join(directory, "older-scanner.jsonl");
+  const config = configWithRecordLimit();
+  const previousProvenance = provenanceFor(config);
+  const currentProvenance: Provenance = {
+    ...previousProvenance,
+    scannerVersion: "0.1.1",
+  };
+  const runId = "37937a78-f39d-49ed-a51d-6d398ae45a20";
+  const bytes = Buffer.from(
+    `${JSON.stringify(
+      failedResult(runId, "version.vendor.com", previousProvenance),
+    )}\n{"incomplete":true}`,
+  );
+  await writeFile(resultPath, bytes, { mode: 0o600 });
+
+  await expectWriterError(
+    openResultWriter({
+      resultPath,
+      mode: "resume",
+      config,
+      provenance: currentProvenance,
+    }),
+    "OUTPUT_CONTEXT_MISMATCH",
+  );
+  assert.deepEqual(await readFile(resultPath), bytes);
+});
+
 test("append and resume enforce persisted semantic and configuration invariants", async (t) => {
   const directory = await temporaryDirectory(t);
   const config = configWithRecordLimit();

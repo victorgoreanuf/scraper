@@ -673,6 +673,12 @@ După eliminarea fragmentului final permis, un fișier fără niciun record comp
 nu are identitate persistată; resume generează un UUID nou și continuă ca run
 gol în același fișier validat.
 
+În v1, `scannerVersion` din manifest este identitatea buildului persistată de
+resume. Orice schimbare de cod care poate modifica crawl, detectare, validare sau
+output cere bump de versiune înaintea unui run persistent; artefactele de
+dezvoltare produse de commituri diferite nu se combină doar pentru că au același
+catalog și același config digest.
+
 Writerul validează modul înainte de orice mutație și acceptă ca rezultat
 existent numai un fișier regular, non-symlink, cu un singur hard link, verificat
 și prin descriptor. Summary-ul pereche trebuie să fie regular și non-symlink,

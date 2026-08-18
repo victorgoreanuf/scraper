@@ -1097,7 +1097,7 @@ A representative direct detection is shown below.
     "browserTransferredBytes": 130000
   },
   "provenance": {
-    "scannerVersion": "0.1.0",
+    "scannerVersion": "0.1.1",
     "runtime": {
       "node": "24.19.0",
       "playwright": "1.62.1",
@@ -1578,6 +1578,12 @@ JSONL. The paired summary replaces a terminal `.jsonl` with `.summary.json`
 an appended `.summary.json`. It carries the same `runId`, complete
 runtime/browser versions, scan configuration and limits, and catalog
 provenance. Version 1 has no independent summary-path override.
+
+The manifest scanner version is the persisted build identity for v1. Any code
+change that can affect crawling, detection, validation, or output must bump that
+version before producing or resuming persistent results; development artifacts
+from different commits must never be merged only because their catalog and
+configuration digests match.
 
 `--resume` and `--force` are mutually exclusive. An invalid writer mode fails
 before any output mutation. The writer canonicalizes the existing parent
