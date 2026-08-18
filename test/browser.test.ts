@@ -1305,35 +1305,31 @@ test("never requests more than twenty ranked script bodies", async (t) => {
   assert.equal(session.getUsage().scriptBodiesInspected, 20);
 });
 
-test("attributes browser script and cookie limits to the exhausted budget", async (t) => {
+test("keeps browser safety-limit details out of persisted error context", async (t) => {
   const cases = [
     {
       replacements: [[
         ["limits", "scripts", "totalBodyBytesPerDomain"],
         1,
       ]] as const,
-      expectedLimit: "scripts.totalBodyBytesPerDomain",
     },
     {
       replacements: [[
         ["limits", "cookies", "nameCodeUnits"],
         1,
       ]] as const,
-      expectedLimit: "cookies.nameCodeUnits",
     },
     {
       replacements: [[
         ["limits", "cookies", "valueBytes"],
         1,
       ]] as const,
-      expectedLimit: "cookies.valueBytes",
     },
     {
       replacements: [[
         ["limits", "cookies", "totalBytesPerDomain"],
         1,
       ]] as const,
-      expectedLimit: "cookies.totalBytesPerDomain",
     },
   ];
 
@@ -1353,10 +1349,10 @@ test("attributes browser script and cookie limits to the exhausted budget", asyn
       allowTopLevelUrl: () => true,
     });
     assert.equal(collection.completed, false);
-    assert.equal(
-      collection.errors.some(({ limit }) => limit === testCase.expectedLimit),
-      true,
-    );
+    assert.equal(collection.errors.some(
+      ({ code }) => code === "BROWSER_LIMIT_EXCEEDED",
+    ), true);
+    assert.equal(collection.errors.every(({ limit }) => limit === null), true);
     await session.close();
   }
 });

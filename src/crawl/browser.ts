@@ -294,7 +294,6 @@ function comparePageId(left: PageId, right: PageId): number {
 function browserError(
   code: BrowserErrorCode,
   pageId: PageId | null,
-  limit: string | null = null,
   retryableOverride?: boolean,
 ): ScanError {
   return Object.freeze({
@@ -310,7 +309,7 @@ function browserError(
     message: BROWSER_MESSAGES[code],
     ruleId: null,
     signal: null,
-    limit,
+    limit: null,
     catalogRevision: null,
   });
 }
@@ -2188,7 +2187,6 @@ class BrowserDomainSessionImpl implements BrowserDomainSession {
           state.errors.push(browserError(
             "BROWSER_NAVIGATION_FAILED",
             state.input.pageId,
-            null,
             policyDenied ? false : undefined,
           ));
         },
@@ -2234,7 +2232,6 @@ class BrowserDomainSessionImpl implements BrowserDomainSession {
         state.errors.push(browserError(
           "BROWSER_NAVIGATION_FAILED",
           state.input.pageId,
-          null,
           false,
         ));
         void admittedPage.close({
@@ -2279,7 +2276,6 @@ class BrowserDomainSessionImpl implements BrowserDomainSession {
         pageErrors.push(browserError(
           "BROWSER_LIMIT_EXCEEDED",
           input.pageId,
-          "inspection",
         ));
       }
 
@@ -2518,7 +2514,6 @@ class BrowserDomainSessionImpl implements BrowserDomainSession {
           state.errors.push(browserError(
             "BROWSER_NAVIGATION_FAILED",
             state.input.pageId,
-            null,
             false,
           ));
         }
@@ -2746,7 +2741,6 @@ class BrowserDomainSessionImpl implements BrowserDomainSession {
         state.errors.push(browserError(
           "BROWSER_LIMIT_EXCEEDED",
           pageId,
-          limit,
         ));
         continue;
       }
@@ -2778,7 +2772,6 @@ class BrowserDomainSessionImpl implements BrowserDomainSession {
         state.errors.push(browserError(
           "BROWSER_LIMIT_EXCEEDED",
           state.input.pageId,
-          "browser.networkHostnamesPerDomain",
         ));
       }
     }
@@ -2795,7 +2788,6 @@ class BrowserDomainSessionImpl implements BrowserDomainSession {
         state.errors.push(browserError(
           "BROWSER_LIMIT_EXCEEDED",
           state.input.pageId,
-          "browser.requestsPerDomain",
         ));
       }
     }
@@ -2861,9 +2853,6 @@ class BrowserDomainSessionImpl implements BrowserDomainSession {
             state.errors.push(browserError(
               "BROWSER_LIMIT_EXCEEDED",
               state.input.pageId,
-              byteBudgetExhausted
-                ? "scripts.totalBodyBytesPerDomain"
-                : "scripts.bodiesPerDomain",
             ));
           }
         }
@@ -3045,7 +3034,6 @@ class BrowserDomainSessionImpl implements BrowserDomainSession {
       return browserError(
         "BROWSER_NAVIGATION_FAILED",
         pageId,
-        null,
         false,
       );
     }
@@ -3060,7 +3048,6 @@ class BrowserDomainSessionImpl implements BrowserDomainSession {
       return browserError(
         "BROWSER_NAVIGATION_FAILED",
         pageId,
-        null,
         false,
       );
     }
