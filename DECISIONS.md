@@ -426,6 +426,12 @@ din catalog, are tipurile comune deținute de `src/model.ts` și cere numai fapt
 DOM și pathuri JavaScript bounded; `crawl` nu importă `detect`, nu emite o
 enumerare a DOM-ului și nu enumeră `window` complet.
 
+Pentru o inspecție formată exclusiv din fapte attribute, capul per selector
+numără numai elementele care corespund selectorului și au cel puțin unul dintre
+atributele cerute. Elementele irelevante sunt traversate streaming, dar nu
+consumă bugetul de observații; inspecțiile existence, text, property și mixte
+păstrează contabilizarea match-urilor brute ale selectorului.
+
 Metodele mutabile și WebSocket sunt observate ca tentative, apoi blocate.
 Playwright routing decide și numără requesturile inițiale. Pentru redirecturile
 automate, un gate CDP `Fetch` oprește atât response stage, cât și următorul

@@ -1817,7 +1817,7 @@ test("collects a controlled page through the real protected Chromium path", asyn
       response.end();
       return;
     }
-    if (request.url === "/truncated") {
+    if (request.url === "/attribute-after-irrelevant") {
       response.writeHead(200, {
         "Content-Type": "text/html; charset=utf-8",
         Connection: "close",
@@ -1825,15 +1825,61 @@ test("collects a controlled page through the real protected Chromium path", asyn
       response.end(`<!doctype html><body>${Array.from(
         { length: 25 },
         (_, index) => `<div>Item ${index}</div>`,
-      ).join("")}<a href="/truncated-next">Next</a></body>`);
+      ).join("")}<span q:version="after-irrelevant"></span></body>`);
       return;
     }
-    if (request.url === "/truncated-next") {
+    if (request.url === "/attribute-none") {
       response.writeHead(200, {
         "Content-Type": "text/html; charset=utf-8",
         Connection: "close",
       });
-      response.end("<!doctype html><body><div>Next page</div></body>");
+      response.end(`<!doctype html><body>${Array.from(
+        { length: 25 },
+        (_, index) => `<div>Item ${index}</div>`,
+      ).join("")}</body>`);
+      return;
+    }
+    if (request.url === "/attribute-union") {
+      response.writeHead(200, {
+        "Content-Type": "text/html; charset=utf-8",
+        Connection: "close",
+      });
+      response.end(`<!doctype html><body>${Array.from(
+        { length: 25 },
+        (_, index) => `<div>Item ${index}</div>`,
+      ).join("")}<span data-first=""></span><span data-second="two"></span></body>`);
+      return;
+    }
+    if (request.url === "/attribute-exact-limit") {
+      response.writeHead(200, {
+        "Content-Type": "text/html; charset=utf-8",
+        Connection: "close",
+      });
+      response.end(`<!doctype html><body>${Array.from(
+        { length: 20 },
+        (_, index) => `<div q:version="version-${index}"></div>`,
+      ).join("")}</body>`);
+      return;
+    }
+    if (request.url === "/attribute-over-limit") {
+      response.writeHead(200, {
+        "Content-Type": "text/html; charset=utf-8",
+        Connection: "close",
+      });
+      response.end(`<!doctype html><body>${Array.from(
+        { length: 21 },
+        (_, index) => `<div q:version="version-${index}"></div>`,
+      ).join("")}<a href="/attribute-next">Next</a></body>`);
+      return;
+    }
+    if (request.url === "/attribute-next") {
+      response.writeHead(200, {
+        "Content-Type": "text/html; charset=utf-8",
+        Connection: "close",
+      });
+      response.end(
+        '<!doctype html><body><div q:version="next"></div></body>',
+      );
       return;
     }
     response.writeHead(200, {
@@ -1953,10 +1999,135 @@ test("collects a controlled page through the real protected Chromium path", asyn
     dnsRecordTypes: Object.freeze([]),
     tlsIssuer: false,
   });
+  const afterIrrelevantSession = await pool.openDomain();
+  const afterIrrelevantCollection = await afterIrrelevantSession.collectPage({
+    pageId: "p1",
+    url: "http://browser-target.org/attribute-after-irrelevant",
+    inspectionPlan: wildcardPlan,
+    allowTopLevelUrl: () => true,
+  });
+  assert.equal(afterIrrelevantCollection.completed, true);
+  assert.equal(afterIrrelevantCollection.observationsAdmitted, true);
+  assert.equal(afterIrrelevantCollection.continuationAllowed, true);
+  const afterIrrelevantResult = await afterIrrelevantSession.finish();
+  assert.deepEqual(afterIrrelevantResult.pages[0]?.dom, [{
+    pageId: "p1",
+    locator: "*:q:version",
+    fact: { kind: "value", value: "after-irrelevant" },
+  }]);
+  assert.equal(afterIrrelevantResult.pages[0]?.truncated, false);
+
+  const noAttributeSession = await pool.openDomain();
+  const noAttributeCollection = await noAttributeSession.collectPage({
+    pageId: "p1",
+    url: "http://browser-target.org/attribute-none",
+    inspectionPlan: wildcardPlan,
+    allowTopLevelUrl: () => true,
+  });
+  assert.equal(noAttributeCollection.completed, true);
+  const noAttributeResult = await noAttributeSession.finish();
+  assert.deepEqual(noAttributeResult.pages[0]?.dom, []);
+  assert.equal(noAttributeResult.pages[0]?.truncated, false);
+
+  const attributeUnionPlan: CatalogInspectionPlan = Object.freeze({
+    ...wildcardPlan,
+    dom: Object.freeze([Object.freeze({
+      selector: "*",
+      facts: Object.freeze([
+        Object.freeze({
+          kind: "attribute" as const,
+          name: "data-first",
+          locator: "*:data-first",
+          demand: Object.freeze({ presence: true, value: false }),
+        }),
+        Object.freeze({
+          kind: "attribute" as const,
+          name: "data-second",
+          locator: "*:data-second",
+          demand: Object.freeze({ presence: false, value: true }),
+        }),
+      ]),
+    })]),
+  });
+  const attributeUnionSession = await pool.openDomain();
+  const attributeUnionCollection = await attributeUnionSession.collectPage({
+    pageId: "p1",
+    url: "http://browser-target.org/attribute-union",
+    inspectionPlan: attributeUnionPlan,
+    allowTopLevelUrl: () => true,
+  });
+  assert.equal(attributeUnionCollection.completed, true);
+  const attributeUnionResult = await attributeUnionSession.finish();
+  assert.deepEqual(attributeUnionResult.pages[0]?.dom, [
+    {
+      pageId: "p1",
+      locator: "*:data-first",
+      fact: { kind: "presence" },
+    },
+    {
+      pageId: "p1",
+      locator: "*:data-second",
+      fact: { kind: "value", value: "two" },
+    },
+  ]);
+
+  const mixedPlan: CatalogInspectionPlan = Object.freeze({
+    ...wildcardPlan,
+    dom: Object.freeze([Object.freeze({
+      selector: "*",
+      facts: Object.freeze([
+        ...(wildcardPlan.dom[0]?.facts ?? []),
+        Object.freeze({
+          kind: "text" as const,
+          name: null,
+          locator: "*:text",
+          demand: Object.freeze({ presence: false, value: true }),
+        }),
+      ]),
+    })]),
+  });
+  const mixedSession = await pool.openDomain();
+  const mixedCollection = await mixedSession.collectPage({
+    pageId: "p1",
+    url: "http://browser-target.org/attribute-none",
+    inspectionPlan: mixedPlan,
+    allowTopLevelUrl: () => true,
+  });
+  assert.equal(mixedCollection.completed, false);
+  assert.equal(mixedCollection.observationsAdmitted, true);
+  assert.equal(
+    mixedCollection.errors.some(
+      ({ code }) => code === "BROWSER_LIMIT_EXCEEDED",
+    ),
+    true,
+  );
+  const mixedResult = await mixedSession.finish();
+  assert.equal(mixedResult.pages[0]?.truncated, true);
+
+  const exactLimitSession = await pool.openDomain();
+  const exactLimitCollection = await exactLimitSession.collectPage({
+    pageId: "p1",
+    url: "http://browser-target.org/attribute-exact-limit",
+    inspectionPlan: wildcardPlan,
+    allowTopLevelUrl: () => true,
+  });
+  assert.equal(exactLimitCollection.completed, true);
+  assert.equal(exactLimitCollection.observationsAdmitted, true);
+  assert.equal(exactLimitCollection.continuationAllowed, true);
+  const exactLimitResult = await exactLimitSession.finish();
+  assert.deepEqual(
+    exactLimitResult.pages[0]?.dom.map(({ fact }) => fact),
+    Array.from(
+      { length: 20 },
+      (_, index) => ({ kind: "value", value: `version-${index}` }),
+    ),
+  );
+  assert.equal(exactLimitResult.pages[0]?.truncated, false);
+
   const truncatedSession = await pool.openDomain();
   const truncatedCollection = await truncatedSession.collectPage({
     pageId: "p1",
-    url: "http://browser-target.org/truncated",
+    url: "http://browser-target.org/attribute-over-limit",
     inspectionPlan: wildcardPlan,
     allowTopLevelUrl: () => true,
   });
@@ -1971,7 +2142,7 @@ test("collects a controlled page through the real protected Chromium path", asyn
   );
   const nextCollection = await truncatedSession.collectPage({
     pageId: "p2",
-    url: "http://browser-target.org/truncated-next",
+    url: "http://browser-target.org/attribute-next",
     inspectionPlan: wildcardPlan,
     allowTopLevelUrl: () => true,
   });
@@ -1983,6 +2154,18 @@ test("collects a controlled page through the real protected Chromium path", asyn
   assert.equal(truncatedResult.pages.length, 2);
   assert.equal(truncatedResult.pages[0]?.truncated, true);
   assert.equal(truncatedResult.pages[1]?.truncated, false);
+  assert.deepEqual(
+    truncatedResult.pages[0]?.dom.map(({ fact }) => fact),
+    Array.from(
+      { length: 20 },
+      (_, index) => ({ kind: "value", value: `version-${index}` }),
+    ),
+  );
+  assert.deepEqual(truncatedResult.pages[1]?.dom, [{
+    pageId: "p2",
+    locator: "*:q:version",
+    fact: { kind: "value", value: "next" },
+  }]);
 
   const deniedSession = await pool.openDomain();
   const deniedCollection = await deniedSession.collectPage({

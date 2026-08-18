@@ -560,6 +560,7 @@ function inspectRenderedPage(input: EvaluationInput): EvaluationOutput {
   const boundedMatches = (
     selector: string,
     maximum: number,
+    demandedAttributes: readonly string[] | null,
   ): readonly ElementLike[] => {
     const root = pageGlobal.document.documentElement;
     if (root === null) {
@@ -569,8 +570,15 @@ function inspectRenderedPage(input: EvaluationInput): EvaluationOutput {
     const matches: ElementLike[] = [];
     let element: ElementLike | null = root;
     while (element !== null) {
-      if (element.matches(selector)) {
-        matches.push(element);
+      const candidate = element;
+      if (
+        candidate.matches(selector)
+        && (
+          demandedAttributes === null
+          || demandedAttributes.some((name) => candidate.hasAttribute(name))
+        )
+      ) {
+        matches.push(candidate);
         if (matches.length > maximum) {
           break;
         }
@@ -630,11 +638,21 @@ function inspectRenderedPage(input: EvaluationInput): EvaluationOutput {
   };
 
   for (const inspection of input.dom) {
+    const demandedAttributes: string[] = [];
+    let attributeOnly = inspection.facts.length > 0;
+    for (const fact of inspection.facts) {
+      if (fact.kind !== "attribute" || fact.name === null) {
+        attributeOnly = false;
+        break;
+      }
+      demandedAttributes.push(fact.name);
+    }
     let elements: readonly ElementLike[];
     try {
       elements = boundedMatches(
         inspection.selector,
         input.matchesPerSelector,
+        attributeOnly ? demandedAttributes : null,
       );
     } catch {
       truncated = true;

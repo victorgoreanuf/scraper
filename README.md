@@ -972,6 +972,11 @@ shared types are owned by `src/model.ts`; `crawl` therefore does not depend on
 `detect`. The browser evaluates only the requested DOM facts and safe
 JavaScript-property paths under their configured caps. It emits no serialized
 DOM and never enumerates, calls, or stringifies the complete `window` object.
+For a DOM inspection containing only attribute facts, the per-selector match
+cap counts only selector-matching elements that carry at least one requested
+attribute. Irrelevant elements are traversed but do not consume the observation
+budget; existence, text, property, and mixed inspections retain raw selector
+match accounting.
 
 ## Result and evidence contract v1
 
@@ -1459,7 +1464,7 @@ These are starting values, not final performance claims:
 | Extracted link/resource URLs | 5,000 per page |
 | Extracted metadata pairs | 5,000 per page |
 | Extracted visible text | 512 KiB per page |
-| DOM inspection | 5,000 selectors; 1,024 code units each; 20 matches per selector |
+| DOM inspection | 5,000 selectors; 1,024 code units each; 20 qualifying matches per selector |
 | JavaScript inspection | 10,000 paths; 512 code units each |
 | DOM + JavaScript returned values | 8 KiB each / 2 MiB total per page |
 | Catalog names / categories | 256-code-point technology name; 128-code-point category name; category IDs 1–1,000,000; 32 categories per technology; 1,024 categories total |
