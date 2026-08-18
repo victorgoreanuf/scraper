@@ -42,7 +42,10 @@ import {
 installTransportRuntimeHook();
 
 const { createBrowserPool } = await import("../src/crawl/browser.ts");
-const { createProtectedHttpTransport } = await import(
+const {
+  createProtectedHttpTransport,
+  ProtectedTransportError: TransportFailure,
+} = await import(
   "../src/crawl/transport.ts"
 );
 
@@ -133,6 +136,8 @@ class FakeBrowserProxy implements ProtectedBrowserProxy {
   closed = false;
   readonly #rejectCanary: boolean;
   #failureController = new AbortController();
+  #failure: ProtectedTransportError | null = null;
+  #failureOnAttempt: ProtectedTransportError | null = null;
   #activePage: PageId | null = null;
   #activeDomain = false;
   #domainRequests = 0;
@@ -145,6 +150,7 @@ class FakeBrowserProxy implements ProtectedBrowserProxy {
     signal?.throwIfAborted();
     assert.equal(this.#activeDomain, false);
     this.#failureController = new AbortController();
+    this.#failure = null;
     this.#activeDomain = true;
     this.#domainRequests = 0;
     this.domains += 1;
@@ -162,6 +168,12 @@ class FakeBrowserProxy implements ProtectedBrowserProxy {
     assert.equal(this.#activePage, attempt.pageId);
     this.attempts.push(Object.freeze({ ...attempt }));
     this.#domainRequests += 1;
+    if (this.#failureOnAttempt !== null) {
+      const failure = this.#failureOnAttempt;
+      this.#failureOnAttempt = null;
+      this.fail(failure);
+      throw failure;
+    }
   }
 
   async finishPage(pageId: PageId): Promise<void> {
@@ -187,11 +199,20 @@ class FakeBrowserProxy implements ProtectedBrowserProxy {
   }
 
   getFailure(): ProtectedTransportError | null {
-    return null;
+    return this.#failure;
   }
 
   getFailureSignal(): AbortSignal {
     return this.#failureController.signal;
+  }
+
+  fail(error: ProtectedTransportError): void {
+    this.#failure = error;
+    this.#failureController.abort(error);
+  }
+
+  failOnNextAttempt(error: ProtectedTransportError): void {
+    this.#failureOnAttempt = error;
   }
 
   async prepareCanary(): Promise<ProtectedBrowserProxyCanary> {
@@ -1126,6 +1147,43 @@ test("enforces ordered page ids, one origin, FIFO admission, and abort cleanup",
   assert.equal(runtime.proxies[0]?.finishedDomains, 2);
 });
 
+test("reuses a healthy browser after repeated domain-scoped proxy limits", async (t) => {
+  const runtime = fakeRuntime();
+  const pool = await createBrowserPool(
+    runtime.transport,
+    browserConfig(),
+    runtime.launcher,
+  );
+  t.after(() => pool.close());
+
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const session = await pool.openDomain();
+    runtime.proxies[0]?.failOnNextAttempt(new TransportFailure(
+      "BROWSER_LIMIT_EXCEEDED",
+      "browser",
+      false,
+    ));
+    await assert.rejects(
+      session.collectPage({
+        pageId: "p1",
+        url: "https://merchant-site.org/",
+        inspectionPlan,
+        allowTopLevelUrl: () => true,
+      }),
+      (error: unknown) =>
+        error instanceof TransportFailure
+        && error.code === "BROWSER_LIMIT_EXCEEDED",
+    );
+    await session.close();
+    assert.equal(pool.isAvailable(), true);
+  }
+
+  assert.equal(runtime.browsers.length, 1);
+  assert.equal(runtime.proxies.length, 1);
+  assert.equal(runtime.proxies[0]?.domains, 4);
+  assert.equal(runtime.proxies[0]?.finishedDomains, 4);
+});
+
 test("replaces a slot aborted during delayed domain-context initialization", async (t) => {
   let releaseDomainContext: (() => void) | undefined;
   const domainContextGate = new Promise<void>((resolve) => {
@@ -1277,6 +1335,168 @@ test("abandons a stuck collection and preserves FIFO admission on a replacement 
     "finishPage:p1",
     "finishDomain:2",
   ]);
+});
+
+test("replaces a Chromium process disconnected during active collection", async (t) => {
+  let releaseCollection: (() => void) | undefined;
+  const collectionGate = new Promise<void>((resolve) => {
+    releaseCollection = resolve;
+  });
+  const runtime = fakeRuntime(
+    undefined,
+    1,
+    false,
+    [],
+    false,
+    collectionGate,
+  );
+  const pool = await createBrowserPool(
+    runtime.transport,
+    browserConfig(),
+    runtime.launcher,
+  );
+  t.after(() => pool.close());
+  const session = await pool.openDomain();
+  const collecting = session.collectPage({
+    pageId: "p1",
+    url: "https://merchant-site.org/",
+    inspectionPlan,
+    allowTopLevelUrl: () => true,
+  });
+  for (
+    let attempt = 0;
+    attempt < 20 && (runtime.proxies[0]?.attempts.length ?? 0) < 8;
+    attempt += 1
+  ) {
+    await waitForImmediate();
+  }
+  assert.equal(runtime.proxies[0]?.attempts.length, 8);
+
+  runtime.browsers[0]?.crash();
+  await assert.rejects(collecting, /unavailable/i);
+  releaseCollection?.();
+  await session.close();
+
+  assert.equal(runtime.browsers.length, 2);
+  assert.equal(runtime.browsers[0]?.connected, false);
+  assert.equal(runtime.proxies[0]?.closed, true);
+  assert.equal(pool.isAvailable(), true);
+
+  const replacement = await pool.openDomain();
+  const replacementCollection = await replacement.collectPage({
+    pageId: "p1",
+    url: "https://merchant-site.org/",
+    inspectionPlan,
+    allowTopLevelUrl: () => true,
+  });
+  assert.equal(replacementCollection.completed, true);
+  await replacement.finish();
+});
+
+test("bounds a hung browser close before admitting a replacement", async (t) => {
+  const runtime = fakeRuntime();
+  const pool = await createBrowserPool(
+    runtime.transport,
+    browserConfig(),
+    runtime.launcher,
+  );
+  t.after(() => pool.close());
+  const hungClose = new Promise<void>(() => {});
+  const firstBrowser = runtime.browsers[0];
+  assert.notEqual(firstBrowser, undefined);
+  firstBrowser!.close = async (): Promise<void> => hungClose;
+
+  firstBrowser!.crash();
+  const waiterController = new AbortController();
+  const queued = pool.openDomain(waiterController.signal);
+  const outcome = await Promise.race([
+    queued,
+    waitForTimeout(2_500, "timed-out" as const),
+  ]);
+  if (outcome === "timed-out") {
+    waiterController.abort(new Error("replacement remained blocked"));
+    assert.fail("A hung browser close blocked its bounded replacement");
+  }
+
+  assert.equal(runtime.browsers.length, 2);
+  assert.equal(runtime.proxies[0]?.closed, true);
+  const collection = await outcome.collectPage({
+    pageId: "p1",
+    url: "https://merchant-site.org/",
+    inspectionPlan,
+    allowTopLevelUrl: () => true,
+  });
+  assert.equal(collection.completed, true);
+  await outcome.finish();
+});
+
+test("bounds a replacement that stalls during browser preflight", async (t) => {
+  const stalledPreflight = new Promise<void>(() => {});
+  const runtime = fakeRuntime(async (index, browser) => {
+    if (index === 1) {
+      browser.newContext = async (): Promise<BrowserContext> => {
+        await stalledPreflight;
+        throw new Error("The stalled preflight unexpectedly resumed");
+      };
+    }
+  });
+  const pool = await createBrowserPool(
+    runtime.transport,
+    browserConfig([[["limits", "timeMs", "browserPage"], 50]]),
+    runtime.launcher,
+  );
+  t.after(() => pool.close());
+
+  runtime.browsers[0]?.crash();
+  const waiterController = new AbortController();
+  const queued = pool.openDomain(waiterController.signal).then(
+    () => "opened" as const,
+    (error: unknown) => error,
+  );
+  const outcome = await Promise.race([
+    queued,
+    waitForTimeout(1_000, "timed-out" as const),
+  ]);
+  if (outcome === "timed-out") {
+    waiterController.abort(new Error("replacement preflight remained blocked"));
+    assert.fail("A stalled replacement preflight blocked the pool");
+  }
+  assert.notEqual(outcome, "opened");
+  assert.match(String(outcome), /unavailable/i);
+  assert.equal(pool.isAvailable(), false);
+  assert.equal(runtime.browsers.length, 2);
+  assert.equal(runtime.browsers[1]?.connected, false);
+  assert.equal(runtime.proxies[1]?.closed, true);
+});
+
+test("closes a browser that resolves after slot preflight expires", async () => {
+  let releaseLaunch: (() => void) | undefined;
+  const launchGate = new Promise<void>((resolve) => {
+    releaseLaunch = resolve;
+  });
+  const runtime = fakeRuntime(async () => launchGate);
+
+  await assert.rejects(
+    createBrowserPool(
+      runtime.transport,
+      browserConfig([[["limits", "timeMs", "browserPage"], 50]]),
+      runtime.launcher,
+    ),
+    /unavailable/i,
+  );
+  assert.equal(runtime.browsers.length, 1);
+  assert.equal(runtime.browsers[0]?.connected, true);
+  assert.equal(runtime.proxies[0]?.closed, true);
+
+  releaseLaunch?.();
+  for (
+    let attempt = 0;
+    attempt < 20 && runtime.browsers[0]?.connected === true;
+    attempt += 1
+  ) {
+    await waitForImmediate();
+  }
+  assert.equal(runtime.browsers[0]?.connected, false);
 });
 
 test("never requests more than twenty ranked script bodies", async (t) => {

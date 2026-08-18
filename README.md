@@ -736,6 +736,12 @@ reported by those processes. A disconnected process receives at most one
 replacement; other slots continue at reduced capacity, while loss of every slot
 latches the pool unavailable instead of spawning indefinitely.
 
+The complete startup or replacement preflight for a slot is bounded by
+`limits.timeMs.browserPage`. Page, context, browser-process, proxy, and canary
+teardown uses a fixed one-second watchdog, so a wedged Playwright close cannot
+hold FIFO admission indefinitely. A replacement that cannot complete its own
+preflight is removed rather than retried in a spawn loop.
+
 Every selected 2xx HTML page in `full` mode is rendered in a non-persistent
 Chromium context dedicated to that domain. The same context is reused
 sequentially for its ordered `p1` through `p3` pages and then destroyed; only
@@ -798,7 +804,8 @@ must receive zero connections. Any failed launch, control, version, proxy, or
 canary preflight stops `full` mode before domain processing or output creation.
 At production scale, host/container egress rules also restrict Chromium to the
 local proxy. A proxy failure during a domain scan closes the context and yields
-a partial result.
+a partial result without treating the reusable Chromium process as unhealthy;
+only a browser disconnect or cleanup failure consumes the slot replacement.
 
 ### DNS and TLS infrastructure signals v1
 

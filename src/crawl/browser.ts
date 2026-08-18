@@ -1636,7 +1636,7 @@ class BrowserPoolImpl implements BrowserPool {
     try {
       for (let id = 0; id < config.limits.concurrency.fullScans; id += 1) {
         signal?.throwIfAborted();
-        const slot = await pool.#createSlot(id, false);
+        const slot = await pool.#createSlot(id, false, signal);
         if (signal?.aborted === true) {
           await pool.#destroySlot(slot);
           signal.throwIfAborted();
@@ -1916,33 +1916,60 @@ class BrowserPoolImpl implements BrowserPool {
     }
   }
 
-  async #createSlot(id: number, replacementUsed: boolean): Promise<BrowserSlot> {
-    const proxy = await this.#transport.createBrowserProxy();
+  async #createSlot(
+    id: number,
+    replacementUsed: boolean,
+    callerSignal?: AbortSignal,
+  ): Promise<BrowserSlot> {
+    const preflightTimeout = AbortSignal.timeout(
+      this.#config.limits.timeMs.browserPage,
+    );
+    const preflightSignal = callerSignal === undefined
+      ? preflightTimeout
+      : AbortSignal.any([callerSignal, preflightTimeout]);
+    const proxyPromise = this.#transport.createBrowserProxy();
+    let proxy: ProtectedBrowserProxy | undefined;
     let canary: ProtectedBrowserProxyCanary | undefined;
+    let browserPromise: Promise<Browser> | undefined;
     let browser: Browser | undefined;
     let context: BrowserContext | undefined;
     let page: Page | undefined;
     try {
-      canary = await proxy.prepareCanary();
-      browser = await this.#launcher(
+      proxy = await awaitWithSignal(proxyPromise, preflightSignal);
+      canary = await awaitWithSignal(
+        proxy.prepareCanary(),
+        preflightSignal,
+      );
+      browserPromise = this.#launcher(
         safeLaunchOptions(proxy, canary.chromiumHostResolverArg, this.#config),
       );
-      context = await browser.newContext(safeContextOptions(proxy, this.#config));
-      page = await context.newPage();
+      browser = await awaitWithSignal(
+        browserPromise,
+        preflightSignal,
+      );
+      context = await awaitWithSignal(
+        browser.newContext(safeContextOptions(proxy, this.#config)),
+        preflightSignal,
+      );
+      page = await awaitWithSignal(context.newPage(), preflightSignal);
       try {
-        await page.goto(canary.targetUrl, {
-          waitUntil: "domcontentloaded",
-          timeout: this.#config.limits.timeMs.browserPage,
-        });
+        await awaitWithSignal(
+          page.goto(canary.targetUrl, {
+            waitUntil: "domcontentloaded",
+            timeout: this.#config.limits.timeMs.browserPage,
+          }),
+          preflightSignal,
+        );
       } catch {
         // A protected canary navigation is expected to fail at the proxy.
       }
+      preflightSignal.throwIfAborted();
       canary.verify();
-      await page.close();
+      await awaitWithSignal(page.close(), preflightSignal);
       page = undefined;
-      await context.close();
+      await awaitWithSignal(context.close(), preflightSignal);
       context = undefined;
-      await canary.close();
+      await awaitWithSignal(canary.close(), preflightSignal);
       const slot: BrowserSlot = {
         id,
         proxy,
@@ -1959,13 +1986,35 @@ class BrowserPoolImpl implements BrowserPool {
       browser.on("disconnected", disconnectHandler);
       return slot;
     } catch (error) {
-      await Promise.allSettled([
-        page?.close() ?? Promise.resolve(),
-        context?.close() ?? Promise.resolve(),
-        canary?.close() ?? Promise.resolve(),
-        browser?.close() ?? Promise.resolve(),
-        proxy.close(),
-      ]);
+      if (proxy === undefined) {
+        void proxyPromise.then(async (lateProxy) => {
+          await settleWithin(
+            lateProxy.close(),
+            CLEANUP_WATCHDOG_MS,
+          );
+        }, () => undefined);
+      }
+      if (browser === undefined && browserPromise !== undefined) {
+        void browserPromise.then(async (lateBrowser) => {
+          await settleWithin(
+            lateBrowser.close({
+              reason: "Browser slot preflight expired during launch",
+            }),
+            CLEANUP_WATCHDOG_MS,
+          );
+        }, () => undefined);
+      }
+      await settleWithin(
+        Promise.allSettled([
+          page?.close() ?? Promise.resolve(),
+          context?.close() ?? Promise.resolve(),
+          canary?.close() ?? Promise.resolve(),
+          browser?.close() ?? Promise.resolve(),
+          proxy?.close() ?? Promise.resolve(),
+        ]).then(() => undefined),
+        CLEANUP_WATCHDOG_MS,
+      );
+      callerSignal?.throwIfAborted();
       throw new BrowserLifecycleFailure("BROWSER_UNAVAILABLE", { cause: error });
     }
   }
@@ -1975,10 +2024,13 @@ class BrowserPoolImpl implements BrowserPool {
       slot.browser.off("disconnected", slot.disconnectHandler);
       slot.disconnectHandler = null;
     }
-    await Promise.allSettled([
-      slot.browser.close({ reason: "Protected browser slot closed" }),
-      slot.proxy.close(),
-    ]);
+    await settleWithin(
+      Promise.allSettled([
+        slot.browser.close({ reason: "Protected browser slot closed" }),
+        slot.proxy.close(),
+      ]).then(() => undefined),
+      CLEANUP_WATCHDOG_MS,
+    );
   }
 }
 
@@ -2065,17 +2117,21 @@ class BrowserDomainSessionImpl implements BrowserDomainSession {
         "The browser domain session is already finalized or collecting",
       ));
     }
-    const operation = awaitWithSignal(
-      this.#collectPageInternal(input),
-      this.#domainSignal,
+    const collection = this.#collectPageInternal(input);
+    this.#activeCollectionPromise = collection;
+    void collection.then(
+      () => {
+        if (this.#activeCollectionPromise === collection) {
+          this.#activeCollectionPromise = null;
+        }
+      },
+      () => {
+        if (this.#activeCollectionPromise === collection) {
+          this.#activeCollectionPromise = null;
+        }
+      },
     );
-    const tracked = operation.finally(() => {
-      if (this.#activeCollectionPromise === tracked) {
-        this.#activeCollectionPromise = null;
-      }
-    });
-    this.#activeCollectionPromise = tracked;
-    return tracked;
+    return awaitWithSignal(collection, this.#domainSignal);
   }
 
   async #collectPageInternal(
@@ -2449,8 +2505,6 @@ class BrowserDomainSessionImpl implements BrowserDomainSession {
     });
     this.#domainAbortListener = (): void => {
       this.#contextUsable = false;
-      this.#unhealthy = true;
-      this.#slot.failed = true;
       void this.#closeContextBounded("Browser domain aborted");
     };
     this.#domainSignal.addEventListener("abort", this.#domainAbortListener, {
@@ -2937,7 +2991,17 @@ class BrowserDomainSessionImpl implements BrowserDomainSession {
         );
       }
       await this.#closeContextBounded("Browser domain closed while collecting");
-      await Promise.allSettled([activeCollection]);
+      const collectionSettled = await settleWithin(
+        activeCollection.then(() => undefined, () => undefined),
+        CLEANUP_WATCHDOG_MS,
+      );
+      if (!collectionSettled) {
+        this.#unhealthy = true;
+        this.#slot.failed = true;
+        void this.#slot.browser.close({
+          reason: "Browser collection cleanup exceeded its deadline",
+        }).catch(() => undefined);
+      }
     }
     await this.#finalizeResources();
   }

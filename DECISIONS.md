@@ -409,6 +409,15 @@ proces pierdut primește maximum o înlocuire; pool-ul continuă degradat cât t
 mai există un slot sănătos și devine indisponibil fără spawn loop când le pierde
 pe toate.
 
+Preflightul complet al unui slot inițial sau replacement este bounded de
+`limits.timeMs.browserPage`. Cleanup-ul paginii, contextului, procesului,
+proxy-ului și canary-ului are watchdog fix de o secundă, astfel un apel
+Playwright blocat nu poate ține coada FIFO nelimitat. Un replacement care nu-și
+termină preflightul este eliminat, nu relansat într-un spawn loop. Abortul local
+al domeniului produs de o limită sau eroare proxy închide contextul, dar nu
+consumă replacement-ul procesului; numai disconnectul Chromium ori cleanup-ul
+eșuat marchează slotul nesănătos.
+
 Fiecare domeniu primește un context Chromium nepersistent, reutilizat secvențial
 pentru `p1`–`p3`, cu maximum o pagină activă și exact același origin. Sandboxul
 și CSP rămân active, service workers și downloads sunt dezactivate și nu există
