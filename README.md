@@ -2172,7 +2172,7 @@ Remaining implementation slices:
 
 Completion and evaluation gates:
 
-- [ ] Run deterministic tests and a small real-site smoke test.
+- [x] Run deterministic tests and a small real-site smoke test.
 - [ ] Scan all 200 domains and analyze misses and false positives.
 - [ ] Produce final results and complete the debate topics.
 
