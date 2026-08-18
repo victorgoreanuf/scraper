@@ -1781,6 +1781,7 @@ test("collects a controlled page through the real protected Chromium path", asyn
     response.end(`<!doctype html>
       <div id="app">Rendered</div>
       <a href="/next#fragment">Next</a>
+      <a href="/next#fragment">Repeated next</a>
       <script src="/redirect-script.js"></script>
       <script>
         window.Shopify = { theme: { name: "Dawn" } };
@@ -1813,6 +1814,9 @@ test("collects a controlled page through the real protected Chromium path", asyn
     },
   });
   assert.equal(collection.completed, true);
+  assert.deepEqual(collection.navigationLinks, [
+    "http://browser-target.org/next",
+  ]);
   const result = await session.finish();
 
   assert.equal(result.completed, true);

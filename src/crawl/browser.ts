@@ -893,15 +893,21 @@ function validateEvaluationOutput(
   if (!Array.isArray(output.links) || output.links.length > config.limits.pages.extractedUrlsPerPage) {
     throw new TypeError("Browser returned too many navigation links");
   }
-  const links = [...new Set(output.links.filter((link) =>
-    typeof link === "string"
-    && link.isWellFormed()
-    && link.length <= config.limits.url.codeUnits))].sort(compareString);
+  for (const link of output.links) {
+    if (
+      typeof link !== "string"
+      || !link.isWellFormed()
+      || link.length > config.limits.url.codeUnits
+    ) {
+      throw new TypeError("Browser returned an invalid navigation link");
+    }
+  }
+  const links = [...new Set(output.links)].sort(compareString);
   return {
     dom: Object.freeze(dom),
     javascript: Object.freeze(javascript),
     links: Object.freeze(links),
-    truncated: output.truncated || links.length !== output.links.length,
+    truncated: output.truncated,
   };
 }
 
