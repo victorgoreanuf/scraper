@@ -10,6 +10,9 @@ import {
   type Evidence,
   type EvidenceSource,
   type HttpEntryResult,
+  type HttpPageResult,
+  type HttpRobotsObservation,
+  type HttpResponseObservations,
   type InfrastructureObservations,
   type Inference,
   type PageId,
@@ -30,6 +33,8 @@ export interface DetectHttpContext {
   readonly catalog: CompiledFingerprintCatalog;
   readonly pool: DetectorPool;
   readonly config: ScanConfig;
+  readonly httpPages?: readonly HttpPageResult[];
+  readonly robots?: readonly HttpRobotsObservation[];
   readonly browserPages?: readonly BrowserPageObservations[];
   readonly infrastructure?: InfrastructureObservations;
   readonly signal?: AbortSignal;
@@ -213,6 +218,8 @@ function candidateIdentity(candidate: CandidateDraft): string {
 
 function collectCandidates(
   input: HttpEntryResult,
+  httpPages: readonly HttpPageResult[],
+  additionalRobots: readonly HttpRobotsObservation[],
   browserPages: readonly BrowserPageObservations[],
   infrastructure: InfrastructureObservations | undefined,
   config: ScanConfig,
@@ -228,10 +235,14 @@ function collectCandidates(
   ): void => {
     candidates.push({ collector, kind, source, pageId, key, value });
   };
-  const response = input.kind === "html" ? input.page.response : input.response;
-
-  if (response !== null) {
-    const pageId = input.kind === "html" ? "p1" : null;
+  const scriptUrls: Array<{
+    readonly pageId: PageId;
+    readonly url: string;
+  }> = [];
+  const addResponse = (
+    response: HttpResponseObservations,
+    pageId: PageId | null,
+  ): void => {
     add("http", "value", "url", pageId, null, response.finalNetworkUrl);
     for (const redirect of response.redirects) {
       add("http", "value", "url", pageId, null, redirect.fromUrl);
@@ -243,25 +254,61 @@ function collectCandidates(
     for (const cookie of response.cookies) {
       add("http", "value", "cookie", pageId, cookie.name, cookie.value);
     }
+  };
+  const addHtmlPage = (
+    page: Extract<HttpPageResult, { readonly kind: "html" }>["page"],
+  ): void => {
+    addResponse(page.response, page.pageId);
+    add("http", "value", "html", page.pageId, null, page.html);
+    add("http", "value", "text", page.pageId, null, page.text);
+    for (const item of page.metadata) {
+      add("http", "value", "meta", page.pageId, item.key.toLowerCase(), item.value);
+    }
+    for (const resource of page.resources) {
+      if (resource.kind === "script") {
+        scriptUrls.push({ pageId: page.pageId, url: resource.url });
+      }
+    }
+  };
+  if (input.kind === "html") {
+    addHtmlPage(input.page);
+  } else if (input.response !== null) {
+    addResponse(input.response, null);
   }
 
-  if (input.kind === "html") {
-    add("http", "value", "html", "p1", null, input.page.html);
-    add("http", "value", "text", "p1", null, input.page.text);
-    for (const item of input.page.metadata) {
-      add("http", "value", "meta", "p1", item.key.toLowerCase(), item.value);
+  for (const result of httpPages) {
+    if (result.kind === "html") {
+      addHtmlPage(result.page);
+    } else if (
+      (result.kind === "non-html" || result.kind === "failed")
+      && result.response !== null
+    ) {
+      addResponse(result.response, result.pageId);
     }
-    const scriptUrls = [...new Set(
-      input.page.resources
-        .filter((resource) => resource.kind === "script")
-        .map((resource) => resource.url),
-    )].sort(compareString).slice(0, config.limits.scripts.urlCandidatesPerDomain);
-    for (const url of scriptUrls) {
-      add("http", "value", "script_url", "p1", "src", url);
+    for (const robots of result.robots) {
+      add("http", "value", "robots", null, null, robots.text);
     }
+  }
+
+  const uniqueScriptUrls = new Map<string, {
+    readonly pageId: PageId;
+    readonly url: string;
+  }>();
+  for (const item of scriptUrls) {
+    uniqueScriptUrls.set(`${item.pageId}\0${item.url}`, item);
+  }
+  for (const item of [...uniqueScriptUrls.values()]
+    .sort((left, right) =>
+      compareString(left.pageId, right.pageId)
+      || compareString(left.url, right.url))
+    .slice(0, config.limits.scripts.urlCandidatesPerDomain)) {
+    add("http", "value", "script_url", item.pageId, "src", item.url);
   }
 
   for (const robots of input.robots) {
+    add("http", "value", "robots", null, null, robots.text);
+  }
+  for (const robots of additionalRobots) {
     add("http", "value", "robots", null, null, robots.text);
   }
 
@@ -1149,6 +1196,8 @@ export async function detectHttp(
   }
   const candidates = collectCandidates(
     input,
+    context.httpPages ?? [],
+    context.robots ?? [],
     context.browserPages ?? [],
     context.infrastructure,
     context.config,

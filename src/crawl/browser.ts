@@ -79,6 +79,7 @@ export interface BrowserPageInput {
 export interface BrowserPageCollection {
   readonly completed: boolean;
   readonly errors: readonly ScanError[];
+  readonly navigationLinks: readonly string[];
 }
 
 export interface BrowserDomainResult {
@@ -98,7 +99,10 @@ export interface BrowserDomainSession {
 
 export interface BrowserPool {
   readonly runtime: BrowserRuntimeIdentity;
-  openDomain(signal?: AbortSignal): Promise<BrowserDomainSession>;
+  openDomain(
+    signal?: AbortSignal,
+    onAdmitted?: () => void,
+  ): Promise<BrowserDomainSession>;
   isAvailable(): boolean;
   close(): Promise<void>;
 }
@@ -265,7 +269,7 @@ class BrowserAccessDeniedMarker extends Error {
   }
 }
 
-class BrowserLifecycleFailure extends Error {
+export class BrowserLifecycleFailure extends Error {
   readonly code: "BROWSER_UNAVAILABLE" | "BROWSER_PROXY_FAILED";
 
   constructor(
@@ -501,6 +505,31 @@ async function settleWithin<T>(promise: Promise<T>, milliseconds: number): Promi
     promise.then(() => true, () => false),
     timeout,
   ]);
+}
+
+function awaitWithSignal<T>(
+  promise: Promise<T>,
+  signal: AbortSignal | undefined,
+): Promise<T> {
+  if (signal === undefined) return promise;
+  signal.throwIfAborted();
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => {
+      signal.removeEventListener("abort", onAbort);
+      reject(signal.reason);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    void promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
 }
 
 function inspectRenderedPage(input: EvaluationInput): EvaluationOutput {
@@ -1637,36 +1666,52 @@ class BrowserPoolImpl implements BrowserPool {
     return this.#runtime;
   }
 
-  async openDomain(signal?: AbortSignal): Promise<BrowserDomainSession> {
+  async openDomain(
+    signal?: AbortSignal,
+    onAdmitted?: () => void,
+  ): Promise<BrowserDomainSession> {
     signal?.throwIfAborted();
     if (this.#closing || this.#unavailable) {
       throw new BrowserLifecycleFailure("BROWSER_UNAVAILABLE");
     }
     const slot = await this.#acquire(signal);
     let context: BrowserContext | undefined;
+    let domainActivated = false;
+    let initializationPhase: "context" | "session" | null = null;
     try {
       signal?.throwIfAborted();
+      onAdmitted?.();
+      signal?.throwIfAborted();
       slot.proxy.activateDomain(signal);
+      domainActivated = true;
       const failureController = new AbortController();
       const proxySignal = slot.proxy.getFailureSignal();
       const combinedSignal = signal === undefined
         ? AbortSignal.any([failureController.signal, proxySignal])
         : AbortSignal.any([signal, failureController.signal, proxySignal]);
-      context = await slot.browser.newContext(
-        safeContextOptions(slot.proxy, this.#config),
+      initializationPhase = "context";
+      context = await awaitWithSignal(
+        slot.browser.newContext(safeContextOptions(slot.proxy, this.#config)),
+        signal,
       );
-      const session = await BrowserDomainSessionImpl.create(
-        this,
-        slot,
-        context,
-        this.#config,
-        combinedSignal,
-        failureController,
+      initializationPhase = "session";
+      const session = await awaitWithSignal(
+        BrowserDomainSessionImpl.create(
+          this,
+          slot,
+          context,
+          this.#config,
+          combinedSignal,
+          failureController,
+        ),
+        signal,
       );
+      initializationPhase = null;
       slot.active = session;
       return session;
     } catch (error) {
-      slot.failed = !slot.browser.isConnected()
+      slot.failed = (signal?.aborted === true && initializationPhase !== null)
+        || !slot.browser.isConnected()
         || slot.proxy.getFailure() !== null;
       if (context !== undefined) {
         const closed = await settleWithin(
@@ -1677,10 +1722,12 @@ class BrowserPoolImpl implements BrowserPool {
           slot.failed = true;
         }
       }
-      try {
-        await slot.proxy.finishDomain();
-      } catch {
-        slot.failed = true;
+      if (domainActivated) {
+        try {
+          await slot.proxy.finishDomain();
+        } catch {
+          slot.failed = true;
+        }
       }
       await this.release(slot, slot.failed);
       throw error;
@@ -2012,7 +2059,10 @@ class BrowserDomainSessionImpl implements BrowserDomainSession {
         "The browser domain session is already finalized or collecting",
       ));
     }
-    const operation = this.#collectPageInternal(input);
+    const operation = awaitWithSignal(
+      this.#collectPageInternal(input),
+      this.#domainSignal,
+    );
     const tracked = operation.finally(() => {
       if (this.#activeCollectionPromise === tracked) {
         this.#activeCollectionPromise = null;
@@ -2060,7 +2110,11 @@ class BrowserDomainSessionImpl implements BrowserDomainSession {
       );
       this.#errors.push(error);
       this.#hadCollectionFailure = true;
-      return Object.freeze({ completed: false, errors: [error] });
+      return Object.freeze({
+        completed: false,
+        errors: [error],
+        navigationLinks: Object.freeze([]),
+      });
     }
 
     const pageErrors: ScanError[] = [];
@@ -2097,6 +2151,7 @@ class BrowserDomainSessionImpl implements BrowserDomainSession {
     let tracker: PageScriptTracker | null = null;
     let onFrameNavigated: ((frame: Frame) => void) | null = null;
     let completed = false;
+    let admittedNavigationLinks: readonly string[] = Object.freeze([]);
 
     try {
       this.#slot.proxy.startPage(input.pageId);
@@ -2252,6 +2307,7 @@ class BrowserDomainSessionImpl implements BrowserDomainSession {
         navigationLinks,
         truncated: state.truncated,
       }));
+      admittedNavigationLinks = navigationLinks;
       completed = pageErrors.length === 0;
       if (!completed) {
         this.#hadCollectionFailure = true;
@@ -2308,7 +2364,11 @@ class BrowserDomainSessionImpl implements BrowserDomainSession {
       this.#hadCollectionFailure = true;
     }
     this.#errors.push(...errors);
-    return Object.freeze({ completed, errors });
+    return Object.freeze({
+      completed,
+      errors,
+      navigationLinks: admittedNavigationLinks,
+    });
   }
 
   finish(): Promise<BrowserDomainResult> {
@@ -2349,7 +2409,10 @@ class BrowserDomainSessionImpl implements BrowserDomainSession {
       return this.#closePromise;
     }
     if (this.#finishPromise !== null) {
-      this.#closePromise = this.#finishPromise.then(() => undefined);
+      this.#closePromise = this.#finishPromise.then(
+        () => undefined,
+        async () => this.#closeInternal(),
+      );
       return this.#closePromise;
     }
     this.#finished = true;
@@ -2383,6 +2446,8 @@ class BrowserDomainSessionImpl implements BrowserDomainSession {
     });
     this.#domainAbortListener = (): void => {
       this.#contextUsable = false;
+      this.#unhealthy = true;
+      this.#slot.failed = true;
       void this.#closeContextBounded("Browser domain aborted");
     };
     this.#domainSignal.addEventListener("abort", this.#domainAbortListener, {

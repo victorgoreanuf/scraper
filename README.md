@@ -3,9 +3,9 @@
 > Project status: the application foundation, protected HTTP/browser transports,
 > fail-closed robots policy, static HTTP collector, fingerprint compiler,
 > isolated detector, protected Playwright/Chromium collector and pool, and
-> bounded DNS/TLS infrastructure collection are implemented and tested.
-> Pipeline/output integration and the runnable CLI remain separate roadmap
-> slices.
+> bounded DNS/TLS infrastructure collection and pipeline orchestration are
+> implemented and tested. Catalog-probe collection is the next roadmap slice;
+> output integration and the runnable CLI remain separate later slices.
 
 ## Goal
 
@@ -205,7 +205,7 @@ Collect the entry page with HTTP and the isolated browser
         ↓
 Select at most two eligible internal pages deterministically
         ↓
-Collect the selected pages, DNS, TLS, scripts, and bounded probes
+Collect the selected pages, DNS, TLS, and browser script observations
         ↓
 Match direct fingerprints in the isolated detector pool
         ↓
@@ -223,6 +223,11 @@ robots policy for that scheme and authority is then evaluated for the new path
 before the next page request. A cross-authority redirect therefore receives its
 own robots policy, while a same-authority redirect still receives a new path
 decision.
+
+Catalog probe paths are already validated and compiled as non-executable data,
+but this pipeline slice does not fetch them. Probe collection remains a
+separate roadmap slice; until it is implemented, `usage.probesIssued` is always
+`0`.
 
 ## Parquet input contract v1
 
@@ -439,10 +444,12 @@ effective read-only abort signal, which combines the configured active-domain
 deadline with caller cancellation; retry waits, decode, and extraction use that
 same signal. The collector owns deterministic entry-target candidates, page
 redirects, one transient retry, content admission, and static extraction. It
-neither creates nor closes the session. This collector still handles only `p1`;
-the later pipeline/page-selection slice will combine its static links with the
-rendered links now exposed by `crawl/browser.ts` before scheduling internal
-pages.
+neither creates nor closes the session. Entry collection owns the ordered
+target-alias fallback and emits `p1`; the page-aware internal operation receives
+one already selected exact-origin URL plus `p2` or `p3`, never tries an alias,
+and links every page error to that ID. The pipeline combines the entry page's
+static links with the rendered links exposed by `crawl/browser.ts` before it
+schedules those internal operations.
 
 Robots is evaluated before every candidate request, retry, and page redirect
 destination. A denial or unavailable policy stops target resolution;
@@ -609,21 +616,49 @@ The scanner visits at most three top-level pages:
 3. one discovered collection/category/shop `listing`, or a useful `content`
    fallback.
 
-Candidates come only from links observed on the static or rendered entry page;
-the crawler does not guess paths or recurse through internal pages. They must
-use the exact final origin, have no credentials or query string, pass robots,
-and be safe `GET` targets. Authentication, account, admin, cart, checkout,
-logout, search, legal/privacy, fragments, files, and duplicates are excluded.
-A fixed path-class rank followed by shortest normalized path and UTF-16
-code-unit order makes the same entry observation select the same pages. If a
-`detail` candidate is absent, that slot stays empty. If a `listing` candidate is
-absent, the shortest remaining useful internal page may fill only that slot as
-`content`; the two internal slots never cross-fill or produce duplicate roles.
+Page-selection policy v1 takes the set union of navigation links observed by
+static HTTP and by the rendered `p1`; it never guesses a path, reads links from
+`p2`/`p3`, or crawls recursively. Each candidate must parse as canonical
+HTTP(S), use exactly the final entry origin (scheme, hostname, and effective
+port), have empty credentials, query, and fragment, fit the configured URL
+limit, and differ from both the final entry URL and the origin root. Canonical
+duplicates are removed before classification.
 
-Catalog probes do not count as pages. At most five unique probes are allowed;
-each must be a validated relative path on the exact final origin, contain no
-query or fragment, use `GET`, pass robots, and remain inside the separate
-request and byte budgets.
+Classification uses lowercase canonical path segments. Any segment equal to
+`auth`, `login`, `log-in`, `signin`, `sign-in`, `signup`, `register`,
+`account`, `admin`, `wp-admin`, `cart`, `basket`, `bag`, `checkout`, `logout`,
+`search`, `legal`, `privacy`, `terms`, `policy`, `cookie`, or `cookies` rejects
+the URL. A candidate is also rejected as file-like when its final non-empty
+segment ends in a dot followed by one or more ASCII alphanumeric characters.
+A `detail` candidate contains `product`, `products`, `item`, or `items` with at
+least one following non-empty segment. Otherwise a `listing` candidate contains
+`shop`, `store`, `catalog`, `category`, `categories`, `collection`,
+`collections`, or `product-category`; every other eligible non-root path is a
+`content` candidate.
+
+Within each class, the token order written above is the fixed class rank, then
+the shorter canonical pathname wins, then the complete canonical URL in direct
+ascending UTF-16 code-unit order. Policy v1 keeps at most one `detail` and one
+`listing`; only when no listing exists may one `content` candidate occupy the
+listing slot; `content` has one fixed class rank. An absent detail never receives
+a different role. The structural choices are sorted by complete canonical
+network URL, then the configured page cap keeps the first at most
+`topLevelPerDomain - 1` internal candidates.
+
+Only after this bounded structural choice does the orchestrator perform robots
+checks, at most two in total. A denied or unavailable candidate is removed
+without backfilling from the discarded link set. Each survivor is then
+sanitized for publication, collisions with the entry page or another survivor
+are removed, and the survivors are sorted by that public URL before receiving
+compact IDs `p2` and `p3`; therefore sanitization cannot invalidate wire order
+and a removed first candidate cannot leave an ID gap.
+
+Catalog probes do not count as pages. The compiler already retains at most five
+unique validated relative paths for a future collector, but the current
+pipeline issues none. That collector is deferred to a separate slice and will
+have to use the exact final origin, no query or fragment, `GET`, robots, and the
+separate request and byte budgets before `usage.probesIssued` may become
+non-zero.
 
 ### Browser behavior
 
@@ -657,7 +692,12 @@ Protocol `Fetch` gate additionally pauses both response and request stages for
 automatic redirects. At the response stage it validates exactly one usable
 `Location`, the URL/method/resource policy, loop and depth limits, and, for a
 top-level document, the exact selected origin plus a synchronous
-`allowTopLevelUrl(url) === true` robots decision. At the following request stage
+`allowTopLevelUrl(url) === true` robots decision. The pipeline warms that policy
+through the asynchronous protected robots check before navigation; the browser
+gate then uses only `RobotsPolicyService.allowsCached(url)`. A missing, pending,
+expired, invalid, or unavailable cache entry returns exactly `false`: the CDP
+pause path never starts network I/O, awaits a Promise, or treats an unknown
+answer as permission. At the following request stage
 it requires the matching `redirectedRequestId` and expected target before it
 records and grants that hop exactly once. A mismatch, asynchronous/non-boolean
 robots decision, or denied hop fails before the redirected target reaches the
@@ -743,6 +783,72 @@ and overflow emits non-retryable `TLS_LIMIT_EXCEEDED`. Version 1 deliberately
 does not expose DNSSEC state, TLS protocol, cipher, certificate subject, SANs,
 serial numbers, validity dates, or cryptographic material as detector evidence.
 These rules are fixed by `policyVersions.infrastructure: 1`.
+
+### Pipeline orchestration contract v1
+
+`scanDomain(domain, runtimeContext)` coordinates one domain and remains
+independent of the input reader and output writer. The run-owned context binds
+the immutable validated configuration and provenance to the compiled catalog,
+detector pool, browser pool, protected transport, and robots service. Catalog,
+runtime, digest, and pool-availability mismatches fail preflight rather than
+starting a partially identified scan. A domain scan closes only the transport
+and browser sessions it opened; it does not close or clear run-owned pools or
+the shared robots cache.
+
+The FIFO wait for a `full` browser-scan slot happens before the active-domain
+clock starts. Caller cancellation remains effective while queued, but the
+`activeDomain` timer is dormant; only after slot admission does the pipeline set
+`scannedAt`, start monotonic `totalMs`, arm that timer, and create the protected
+transport session with the combined signal. HTTP scheduler waits, robots work,
+retry backoff, browser navigation, DNS/TLS, detection, and cleanup after that
+point are inside the active-domain deadline. Caller cancellation is propagated
+after bounded cleanup and does not fabricate a `DOMAIN_DEADLINE_EXCEEDED`
+record; that code is reserved for the pipeline-owned active timer. The proxy
+and transport retain same-duration local fail-safe timers for standalone use,
+but in `scanDomain()` they receive the already armed pipeline signal, which is
+the first and authoritative deadline.
+
+The admitted scan performs these bounded steps:
+
+1. collect the selected target as HTTP `p1`, with robots checked for the
+   candidate and every redirect;
+2. for a complete or truncated 2xx HTML `p1`, collect the same URL in the
+   browser and immediately combine its rendered navigation links with the
+   static navigation links;
+3. apply page-selection policy v1, perform at most two asynchronous robots
+   checks, assign compact `p2`/`p3`, and collect each survivor with exact-origin
+   HTTP followed by browser only when its HTTP page is browser-eligible;
+4. after all static page requests, collect the catalog-requested DNS records
+   and reuse the final verified HTTPS issuer, so infrastructure admission does
+   not race static HTTP on the shared session budget;
+5. finish the browser session, then invoke the detector pool exactly once with
+   the complete bounded HTTP `p1`–`p3`, browser, robots, DNS, and TLS
+   observations; relationships and exclusions therefore also run once over the
+   combined candidate set;
+6. sanitize, deduplicate, sort, enforce result caps, and pass the complete
+   `DomainResult` through the semantic validator before returning it.
+
+Every successfully admitted robots body from entry collection, structural
+prechecks, or internal-page collection remains a detector signal with
+`pageId: null`, even when the associated page is later skipped or fails. Exact
+duplicates are collapsed by the detector, and any retained robots body counts
+as an admitted signal for `partial` versus `failed` status.
+
+A failed static page is never presented as browser-only success. Browser pages
+form an ordered prefix of eligible `p1`–`p3`; once an earlier browser page
+cannot be collected, the pipeline does not create a later browser-page gap,
+although already selected later pages may still contribute static HTTP
+observations. A final entry 2xx non-HTML response still follows its documented
+terminal partial-result path and schedules no internal pages. Catalog probes
+are not part of these steps: compiled probe paths remain unused and
+`probesIssued` remains `0` for every result from pipeline v1.
+
+Stage timings use the same monotonic clock. `targetMs` covers entry target
+selection, `robotsMs` accumulates robots work, and `httpMs` covers static HTTP
+work excluding the robots time nested inside it; `browserMs`, `dnsMs`, `tlsMs`,
+and `detectMs` cover only started stages. Named stages may overlap and are
+clamped to `totalMs`. A skipped stage is `null`, and a completed
+sub-millisecond stage may be `0`.
 
 ## Observation and detection boundaries
 
@@ -930,22 +1036,24 @@ failures are linked by `pageId`. Error `stage` is one of `target`, `robots`,
 `http`, `dns`, `tls`, `browser`, or `detect`. `usage.httpRequests` excludes
 browser traffic, while `usage.browserRequests` counts requests admitted or
 explicitly aborted by browser policy. Every candidate, robots fetch, redirect
-hop, retry, page, and probe which reaches the HTTP transport increments
+hop, retry, and page which reaches the HTTP transport increments
 `httpRequests`; `retries` counts only additional attempts. `pagesVisited` equals
-the number of emitted `PageRecord` values, `probesIssued` counts probes which
-reach transport, and `scriptBodiesInspected` counts bounded bodies admitted to
-detection.
+the number of emitted `PageRecord` values. `probesIssued` is reserved for probe
+requests which reach transport and is exactly `0` in the current pipeline slice;
+`scriptBodiesInspected` counts bounded bodies admitted to detection.
 
 `staticTransferredBytes` counts compressed response-body bytes read by the
 protected Node transport. `browserTransferredBytes` counts downstream bytes at
 the browser proxy; for HTTPS CONNECT this is conservative encrypted tunnel
 traffic, not a claim about decoded response-body size. `scannedAt` is the UTC
-wall-clock time at which the domain receives its active slot. `totalMs` and all
-seven named stage timings are non-negative integer milliseconds measured with a
-monotonic clock; stage times measure active wall time and may overlap, so they
-need not sum to total. A skipped or never-started stage is `null`, while a
-completed sub-millisecond stage may be `0`. Usage values are non-negative
-integers and remain `0` when the corresponding work is skipped.
+wall-clock time at which the domain leaves the FIFO `full`-scan queue and
+receives its active slot; queue wait is excluded from the active-domain
+deadline and timings. `totalMs` and all seven named stage timings are
+non-negative integer milliseconds measured with a monotonic clock; stage times
+measure active wall time and may overlap, so they need not sum to total. A
+skipped or never-started stage is `null`, while a completed sub-millisecond
+stage may be `0`. Usage values are non-negative integers and remain `0` when the
+corresponding work is skipped.
 
 A technology has exactly `name`, `categories`, `version`, `confidence`, `type`,
 `pageIds`, `evidence`, and `inferredFrom`; only its scalar `version` is
@@ -1211,10 +1319,10 @@ These are starting values, not final performance claims:
 | Browser page including settle | 15 seconds |
 | Canonical target candidates | 4 |
 | Redirects per chain | 5 |
-| Static HTTP transactions per domain | 40 total, including robots, candidates, redirects, retries, pages, and probes |
+| Static HTTP transactions per domain | 40 total, including robots, candidates, redirects, retries, pages, and future probes |
 | Transient retry | 1 per request, still inside the 40-transaction total |
 | Top-level pages | 3 |
-| Catalog probes | 5 |
+| Catalog probes | 5 reserved; current pipeline issues 0 |
 | Input hostname | 2,048 UTF-16 code units |
 | Any fetched or persisted URL | 2,048 UTF-16 code units |
 | Header fields / total header bytes | 100 / 64 KiB |
@@ -1361,7 +1469,9 @@ The final summary should include at least:
   which appear only after canonicalization.
 - Unit tests cover target normalization, candidate boundaries, and
   public-address validation.
-- Robots status/rule semantics and deterministic page-selection tests.
+- Robots status/rule semantics, fail-closed synchronous cache gating, and exact
+  deterministic page-selection tests, including static/rendered union,
+  exclusions, no-backfill denial, URL ordering, and compact IDs.
 - Fingerprint catalog validation and isolated regex compilation tests.
 - Catastrophic regex, watchdog termination, worker replacement, checkpoint,
   replay accounting, per-domain timeout, crash, whole-pool loss, remaining
@@ -1372,7 +1482,10 @@ The final summary should include at least:
 - Relationship fixtures cover a unilateral `A -> B -> C` exclusion chain,
   an external edge breaking a cycle, gate-then-exclude of a base technology,
   and pruning an inference whose only parent was suppressed.
-- Pipeline tests against a local HTTP server, not unstable public websites.
+- Pipeline tests use injected deterministic collectors or controlled local
+  servers, never unstable public websites, and cover one combined detector
+  call, HTTP/browser `p1`–`p3`, DNS/TLS, queue/deadline separation, cleanup,
+  partial/failed results, deterministic error merge, and `probesIssued: 0`.
 - `browser-proxy.test.ts` covers one-use HTTP grants, CONNECT authority/port
   policy, mixed and non-public DNS, peer pinning, late-DNS/page cleanup,
   request/byte limits, and a zero-hit loopback canary.
@@ -1611,11 +1724,15 @@ therefore uses the complete bounded in-memory request URL, while evidence emits
 only its canonical sanitized form. `network_hostname` remains a separate
 bounded observation for safe public hostnames and is not presented as complete
 XHR coverage. Stylesheet, image, iframe, generic link, navigation-link, and
-HTTP-status observations are deliberately not detector candidates in v1. HTTP
-HTML observations use `p1`; browser evidence retains its exact p1/p2/p3; a
-non-HTML response and robots use `pageId: null`. Exact candidate duplicates are
-removed and HTTP candidates rank before the additional browser tier when a
-domain work cap admits only a prefix.
+HTTP-status observations are deliberately not detector candidates in v1.
+Page-scoped HTTP observations retain their exact `p1`, `p2`, or `p3`, as
+browser evidence already does. A terminal non-HTML entry response and robots
+use `pageId: null`; an already selected internal response remains linked to its
+assigned `p2`/`p3`. Exact candidate duplicates are removed and HTTP candidates
+rank before the additional browser tier when a domain work cap admits only a
+prefix. The pipeline submits the complete bounded HTTP/browser/infrastructure
+set to the detector once per domain instead of merging independently detected
+page results.
 
 Workers match raw bounded candidates, while the parent materializes only
 sanitized evidence. Cookie, HTML, text, and robots matches are always redacted;
@@ -1842,7 +1959,18 @@ are recorded in `THIRD_PARTY_NOTICES.md`.
 - [x] Implement the fingerprint catalog compiler and HTTP/browser detector.
 - [x] Implement the protected browser collector and bounded Chromium pool.
 - [x] Add bounded DNS/TLS infrastructure signals.
+- [x] Implement `scanDomain()`, deterministic internal-page selection, and
+  combined HTTP/browser/DNS/TLS detection.
+
+Remaining implementation slices:
+
+- [ ] Add bounded declarative catalog-probe collection.
 - [ ] Add incremental output, resume, and summary generation.
+- [ ] Add the runnable CLI that connects Parquet input, the bounded local
+  worker pool, `scanDomain()`, and incremental output.
+
+Completion and evaluation gates:
+
 - [ ] Run deterministic tests and a small real-site smoke test.
 - [ ] Scan all 200 domains and analyze misses and false positives.
 - [ ] Produce final results and complete the debate topics.
@@ -1871,5 +1999,6 @@ Coding starts only after these decisions are explicit:
 The readiness gate, application foundation, protected HTTP/browser transports,
 robots policy, static and rendered observation collectors, fingerprint
 compiler, isolated detector, bounded Chromium pool, and DNS/TLS infrastructure
-collector are complete. Pipeline/output integration and the runnable CLI remain
-separate slices.
+collector are complete, as is pipeline orchestration. Catalog probes are the
+current unchecked slice; output integration and the runnable CLI remain
+separate later slices.

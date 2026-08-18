@@ -237,7 +237,7 @@ export interface InfrastructureResult {
 }
 
 export interface HttpPageObservations {
-  readonly pageId: "p1";
+  readonly pageId: PageId;
   readonly response: HttpResponseObservations;
   readonly html: string;
   readonly text: string;
@@ -249,6 +249,37 @@ export interface HttpPageObservations {
   readonly urlsTruncated: boolean;
   readonly collectionState: "complete" | "truncated" | "failed";
 }
+
+export type HttpPageResult =
+  | {
+      readonly kind: "html";
+      readonly page: HttpPageObservations;
+      readonly robots: readonly HttpRobotsObservation[];
+      readonly errors: readonly ScanError[];
+    }
+  | {
+      readonly kind: "non-html";
+      readonly pageId: PageId;
+      readonly requestedUrl: string;
+      readonly response: HttpResponseObservations;
+      readonly robots: readonly HttpRobotsObservation[];
+      readonly errors: readonly ScanError[];
+    }
+  | {
+      readonly kind: "failed";
+      readonly pageId: PageId;
+      readonly requestedUrl: string;
+      readonly response: HttpResponseObservations | null;
+      readonly robots: readonly HttpRobotsObservation[];
+      readonly errors: readonly [ScanError];
+    }
+  | {
+      readonly kind: "skipped";
+      readonly pageId: PageId;
+      readonly requestedUrl: string;
+      readonly robots: readonly HttpRobotsObservation[];
+      readonly errors: readonly [];
+    };
 
 export type HttpEntryResult =
   | {

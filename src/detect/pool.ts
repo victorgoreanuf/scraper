@@ -457,16 +457,18 @@ class DetectorPoolImplementation implements DetectorPool {
 
   #buildWork(candidates: readonly DetectorCandidate[]): {
     readonly work: readonly DetectorWorkItem[];
+    readonly candidates: readonly DetectorCandidate[];
+    readonly candidateOrdinals: readonly number[];
     readonly truncated: boolean;
     readonly truncatedSource: EvidenceSource | null;
-    readonly admittedCandidates: number;
   } {
     const byRule = new Map<number, number[]>();
+    const dispatchedCandidates: DetectorCandidate[] = [];
+    const candidateOrdinals: number[] = [];
     let executions = 0;
     let workPairs = 0;
     let truncated = false;
     let truncatedSource: EvidenceSource | null = null;
-    let admittedCandidates = 0;
     const limit = this.#config.limits.detector.executionsPerDomain;
     const matchSentinel = Math.min(
       limit,
@@ -504,12 +506,17 @@ class DetectorPoolImplementation implements DetectorPool {
       }
       executions += candidateCost;
       workPairs += applicable.length;
+      if (applicable.length === 0) {
+        continue;
+      }
+      const dispatchedOrdinal = dispatchedCandidates.length;
+      dispatchedCandidates.push(candidate);
+      candidateOrdinals.push(candidateOrdinal);
       for (const ruleOrdinal of applicable) {
         const list = byRule.get(ruleOrdinal) ?? [];
-        list.push(candidateOrdinal);
+        list.push(dispatchedOrdinal);
         byRule.set(ruleOrdinal, list);
       }
-      admittedCandidates = candidateOrdinal + 1;
     }
 
     return {
@@ -532,9 +539,10 @@ class DetectorPoolImplementation implements DetectorPool {
           }
           return chunks;
         }),
+      candidates: dispatchedCandidates,
+      candidateOrdinals,
       truncated,
       truncatedSource,
-      admittedCandidates,
     };
   }
 
@@ -783,9 +791,7 @@ class DetectorPoolImplementation implements DetectorPool {
       this.#config.limits.detector.checkpointRules,
       Math.min(workLimit, materializedMatchLimit + 1),
     );
-    const inputTruncated = inputCandidates.length > workLimit;
-    const inputTruncatedSource = inputCandidates[workLimit]?.source ?? null;
-    const candidates = inputCandidates.slice(0, workLimit).sort((left, right) =>
+    const candidates = inputCandidates.slice().sort((left, right) =>
       compareString(left.id, right.id));
     let slot: WorkerSlot;
     try {
@@ -813,8 +819,7 @@ class DetectorPoolImplementation implements DetectorPool {
     const executionBuffer = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
     const executionCounter = new Int32Array(executionBuffer);
     const plan = this.#buildWork(candidates);
-    const planTruncated = inputTruncated || plan.truncated;
-    const dispatchedCandidates = candidates.slice(0, plan.admittedCandidates);
+    const planTruncated = plan.truncated;
     if (planTruncated) {
       errors.push({
         ...makeDetectError(
@@ -824,7 +829,7 @@ class DetectorPoolImplementation implements DetectorPool {
           null,
           `${workLimit} rule-candidate pairs`,
         ),
-        signal: plan.truncatedSource ?? inputTruncatedSource,
+        signal: plan.truncatedSource,
       });
     }
     const taskId = this.#nextTaskId;
@@ -841,7 +846,7 @@ class DetectorPoolImplementation implements DetectorPool {
         const attempt = await this.#runAttempt(slot, {
           type: "match",
           taskId,
-          candidates: dispatchedCandidates,
+          candidates: plan.candidates,
           work: plan.work,
           startWorkIndex,
           skipRuleOrdinals: [...skipped].sort((left, right) => left - right),
@@ -1022,9 +1027,14 @@ class DetectorPoolImplementation implements DetectorPool {
     }
 
     return {
-      matches: [...confirmed.values()].sort((left, right) =>
-        left.ruleOrdinal - right.ruleOrdinal
-        || left.candidateOrdinal - right.candidateOrdinal),
+      matches: [...confirmed.values()]
+        .map((match) => ({
+          ...match,
+          candidateOrdinal: plan.candidateOrdinals[match.candidateOrdinal]!,
+        }))
+        .sort((left, right) =>
+          left.ruleOrdinal - right.ruleOrdinal
+          || left.candidateOrdinal - right.candidateOrdinal),
       errors,
       completed,
       executions: Atomics.load(executionCounter, 0),

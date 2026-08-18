@@ -745,6 +745,33 @@ test("reuses the verified HTTPS response issuer and handshake timing", async (t)
   );
 });
 
+test("records a started TLS stage when verified response metadata is invalid", async (t) => {
+  const config = configWith();
+  const session = createSession(t, config);
+
+  await runWithInfrastructureRuntime(
+    { resolve: () => assert.fail("TLS reuse must not perform DNS.") },
+    async () => {
+      const result = await collectInfrastructure("shop.vendor.tld", {
+        config,
+        session,
+        inspectionPlan: inspectionPlan([], true),
+        httpResult: httpResult(
+          "https://shop.vendor.tld/",
+          "C=US\nO=Example Verified CA",
+          null,
+        ),
+      });
+
+      assert.equal(result.observations.tlsIssuer, null);
+      assert.deepEqual(errorCodes(result), ["TLS_CONNECTION_FAILED"]);
+      assert.equal(result.errors[0]?.retryable, false);
+      assert.equal(result.tlsMs, 0);
+      assert.equal(result.completed, false);
+    },
+  );
+});
+
 test("skips TLS without error for HTTP, no final response, or no catalog demand", async (t) => {
   const fixtures = [
     {

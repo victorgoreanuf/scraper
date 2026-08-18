@@ -32,7 +32,7 @@ import {
 
 installTransportRuntimeHook();
 
-const { collectHttpEntry } = await import("../src/crawl/http.ts");
+const { collectHttpEntry, collectHttpPage } = await import("../src/crawl/http.ts");
 const {
   createProtectedHttpTransport,
   ProtectedTransportError,
@@ -207,6 +207,9 @@ function robotsService(
         ownerOrigin: origin,
         fetchedUrl: `${origin}/robots.txt`,
       });
+    },
+    allowsCached(url): boolean {
+      return options.decide?.(url) ?? true;
     },
     clear(): void {},
   };
@@ -651,6 +654,163 @@ test("uses the session signal for preflight and mid-decode cancellation", async 
   assert.equal(decoded.page.collectionState, "failed");
   assert.equal(decoded.page.response.finalNetworkUrl, entryUrl);
   assert.deepEqual(errorCodes(decoded), ["DOMAIN_DEADLINE_EXCEEDED"]);
+});
+
+test("collects a p2 HTML page through same-origin redirects", async () => {
+  const requestedUrl = "https://shop.vendor.tld/products/widget";
+  const redirectedUrl = "https://shop.vendor.tld/products/widget/";
+  const checks: string[] = [];
+  const session = new ScriptedSession([
+    deliveredStep(response(requestedUrl, 301, { redirectUrl: redirectedUrl })),
+    deliveredStep(response(redirectedUrl, 200, {
+      headers: [["content-type", "text/html; charset=utf-8"]],
+      body: "<body>Widget detail</body>",
+    })),
+  ]);
+  const result = await collectHttpPage(requestedUrl, "p2", {
+    config: configWith(),
+    session,
+    robots: robotsService({ checks }),
+  });
+
+  if (result.kind !== "html") {
+    assert.fail(`Expected HTML, received ${result.kind}.`);
+  }
+
+  assert.equal(result.page.pageId, "p2");
+  assert.equal(result.page.response.finalNetworkUrl, redirectedUrl);
+  assert.deepEqual(result.page.response.redirects, [{
+    fromUrl: requestedUrl,
+    statusCode: 301,
+    toUrl: redirectedUrl,
+  }]);
+  assert.deepEqual(checks, [requestedUrl, redirectedUrl]);
+  assert.deepEqual(
+    session.calls.map((call) => call.url),
+    [requestedUrl, redirectedUrl],
+  );
+  assert.deepEqual(result.errors, []);
+});
+
+test("rejects a cross-origin internal redirect before the next request", async () => {
+  const requestedUrl = "https://shop.vendor.tld/products/widget";
+  const redirectedUrl = "https://cdn.vendor.tld/products/widget";
+  const checks: string[] = [];
+  const session = new ScriptedSession([
+    deliveredStep(response(requestedUrl, 302, { redirectUrl: redirectedUrl })),
+  ]);
+  const result = await collectHttpPage(requestedUrl, "p2", {
+    config: configWith(),
+    session,
+    robots: robotsService({ checks }),
+  });
+
+  if (result.kind !== "failed") {
+    assert.fail("Expected a failed internal-page result.");
+  }
+
+  assert.equal(result.pageId, "p2");
+  assert.equal(result.requestedUrl, requestedUrl);
+  assert.equal(result.response, null);
+  assert.deepEqual(errorCodes(result), ["TARGET_REDIRECT_INVALID"]);
+  assert.equal(result.errors[0].pageId, "p2");
+  assert.deepEqual(checks, [requestedUrl]);
+  assert.deepEqual(session.calls.map((call) => call.url), [requestedUrl]);
+});
+
+test("skips an internal page disallowed by robots without requesting it", async () => {
+  const requestedUrl = "https://shop.vendor.tld/products/private";
+  const checks: string[] = [];
+  const session = new ScriptedSession([]);
+  const result = await collectHttpPage(requestedUrl, "p2", {
+    config: configWith(),
+    session,
+    robots: robotsService({ checks, decide: () => false }),
+  });
+
+  assert.deepEqual(result, {
+    kind: "skipped",
+    pageId: "p2",
+    requestedUrl,
+    robots: [],
+    errors: [],
+  });
+  assert.deepEqual(checks, [requestedUrl]);
+  assert.equal(session.calls.length, 0);
+});
+
+test("keeps page identity on non-HTML responses and HTTP failures", async () => {
+  const nonHtmlUrl = "https://shop.vendor.tld/catalog/feed";
+  const nonHtml = await collectHttpPage(nonHtmlUrl, "p2", {
+    config: configWith(),
+    session: new ScriptedSession([
+      deliveredStep(response(nonHtmlUrl, 200, {
+        headers: [["content-type", "application/json"]],
+        body: "{}",
+      })),
+    ]),
+    robots: robotsService(),
+  });
+
+  if (nonHtml.kind !== "non-html") {
+    assert.fail("Expected a non-HTML internal-page result.");
+  }
+
+  assert.equal(nonHtml.pageId, "p2");
+  assert.equal(nonHtml.requestedUrl, nonHtmlUrl);
+  assert.equal(nonHtml.response.finalNetworkUrl, nonHtmlUrl);
+  assert.deepEqual(errorCodes(nonHtml), ["UNSUPPORTED_CONTENT_TYPE"]);
+  assert.equal(nonHtml.errors[0]?.pageId, "p2");
+
+  const failedUrl = "https://shop.vendor.tld/catalog/missing";
+  const failed = await collectHttpPage(failedUrl, "p3", {
+    config: configWith(),
+    session: new ScriptedSession([
+      deliveredStep(response(failedUrl, 404)),
+    ]),
+    robots: robotsService(),
+  });
+
+  if (failed.kind !== "failed") {
+    assert.fail("Expected a failed internal-page result.");
+  }
+
+  assert.equal(failed.pageId, "p3");
+  assert.equal(failed.requestedUrl, failedUrl);
+  assert.equal(failed.response?.finalNetworkUrl, failedUrl);
+  assert.equal(failed.response?.statusCode, 404);
+  assert.deepEqual(errorCodes(failed), ["HTTP_REQUEST_FAILED"]);
+  assert.equal(failed.errors[0].pageId, "p3");
+});
+
+test("preserves p2 when HTML body decoding fails", async () => {
+  const requestedUrl = "https://shop.vendor.tld/products/invalid-encoding";
+  const unreadableBody = {
+    byteLength: 1,
+    subarray(): Uint8Array {
+      throw new Error("Synthetic body decode failure.");
+    },
+  } as unknown as Uint8Array;
+  const result = await collectHttpPage(requestedUrl, "p2", {
+    config: configWith(),
+    session: new ScriptedSession([
+      deliveredStep(response(requestedUrl, 200, {
+        headers: [["content-type", "text/html; charset=utf-8"]],
+        body: unreadableBody,
+      })),
+    ]),
+    robots: robotsService(),
+  });
+
+  if (result.kind !== "html") {
+    assert.fail(`Expected incomplete HTML, received ${result.kind}.`);
+  }
+
+  assert.equal(result.page.pageId, "p2");
+  assert.equal(result.page.response.finalNetworkUrl, requestedUrl);
+  assert.equal(result.page.collectionState, "failed");
+  assert.deepEqual(errorCodes(result), ["HTTP_REQUEST_FAILED"]);
+  assert.equal(result.errors[0]?.pageId, "p2");
 });
 
 test("integrates with the protected transport through a controlled HTTP server", async (t) => {

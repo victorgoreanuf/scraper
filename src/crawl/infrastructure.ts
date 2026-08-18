@@ -522,7 +522,7 @@ function collectTls(
     return {
       issuer: null,
       error: scanError("tls", "TLS_CONNECTION_FAILED", false),
-      tlsMs: null,
+      tlsMs: 0,
     };
   }
   if (

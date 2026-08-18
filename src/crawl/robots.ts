@@ -39,6 +39,7 @@ export interface RobotsPolicyService {
     session: ProtectedTransportSession,
     url: string,
   ): Promise<RobotsCheck>;
+  allowsCached(url: string): boolean;
   clear(): void;
 }
 
@@ -85,6 +86,7 @@ interface CachedRobotsPolicy {
 interface RobotsCacheEntry {
   readonly promise: Promise<CachedRobotsPolicy>;
   readonly expiresAt: number;
+  readonly policy: CachedRobotsPolicy | null;
 }
 
 function robotsError(
@@ -384,6 +386,42 @@ function enforceMatchingWork(
   }
 }
 
+function evaluatePolicy(
+  policy: CachedRobotsPolicy,
+  canonicalUrl: string,
+  config: ScanConfig,
+): boolean {
+  const normalized = matchingUrlAndPath(canonicalUrl);
+  enforceMatchingWork(
+    policy.relevantRules,
+    normalized.path,
+    config.limits.robots.matchingStatesPerUrl,
+  );
+
+  if (policy.parser === null) {
+    return true;
+  }
+
+  try {
+    const result = policy.parser.isAllowed(
+      normalized.matchingUrl,
+      config.security.robots.productToken,
+    );
+
+    if (result === undefined) {
+      throw robotsError("ROBOTS_UNAVAILABLE", false);
+    }
+
+    return result;
+  } catch (error) {
+    if (error instanceof RobotsPolicyError) {
+      throw error;
+    }
+
+    throw robotsError("ROBOTS_UNAVAILABLE", false);
+  }
+}
+
 async function fetchRobotsPolicy(
   config: ScanConfig,
   session: ProtectedTransportSession,
@@ -491,6 +529,7 @@ export function createRobotsPolicyService(
     const pendingEntry: RobotsCacheEntry = {
       promise,
       expiresAt: Number.POSITIVE_INFINITY,
+      policy: null,
     };
     cache.set(key, pendingEntry);
 
@@ -501,6 +540,7 @@ export function createRobotsPolicyService(
         cache.set(key, {
           promise: Promise.resolve(policy),
           expiresAt: currentTime(now) + config.limits.timeMs.robotsCache,
+          policy,
         });
       }
 
@@ -526,35 +566,7 @@ export function createRobotsPolicyService(
       );
       const target = new URL(canonicalUrl);
       const policy = await policyFor(session, target.origin);
-      const normalized = matchingUrlAndPath(canonicalUrl);
-      enforceMatchingWork(
-        policy.relevantRules,
-        normalized.path,
-        config.limits.robots.matchingStatesPerUrl,
-      );
-
-      let allowed = true;
-
-      if (policy.parser !== null) {
-        try {
-          const result = policy.parser.isAllowed(
-            normalized.matchingUrl,
-            config.security.robots.productToken,
-          );
-
-          if (result === undefined) {
-            throw robotsError("ROBOTS_UNAVAILABLE", false);
-          }
-
-          allowed = result;
-        } catch (error) {
-          if (error instanceof RobotsPolicyError) {
-            throw error;
-          }
-
-          throw robotsError("ROBOTS_UNAVAILABLE", false);
-        }
-      }
+      const allowed = evaluatePolicy(policy, canonicalUrl, config);
 
       return Object.freeze({
         allowed,
@@ -562,6 +574,35 @@ export function createRobotsPolicyService(
         ownerOrigin: policy.ownerOrigin,
         fetchedUrl: policy.fetchedUrl,
       });
+    },
+
+    allowsCached(url: string): boolean {
+      try {
+        const canonicalUrl = resolveRedirectTarget(
+          url,
+          url,
+          config.limits.url.codeUnits,
+        );
+        const target = new URL(canonicalUrl);
+        const key = `${target.origin}\0${config.security.robots.productToken}`;
+        const entry = cache.get(key);
+        const time = currentTime(now);
+
+        if (
+          entry === undefined
+          || entry.policy === null
+          || entry.expiresAt <= time
+        ) {
+          if (entry !== undefined && entry.expiresAt <= time) {
+            cache.delete(key);
+          }
+          return false;
+        }
+
+        return evaluatePolicy(entry.policy, canonicalUrl, config);
+      } catch {
+        return false;
+      }
     },
 
     clear(): void {

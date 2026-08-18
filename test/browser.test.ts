@@ -732,31 +732,38 @@ class FakeBrowser extends EventEmitter {
   readonly scriptCount: number;
   readonly rejectDomainClose: boolean;
   readonly topRedirects: readonly string[];
-  readonly collectionGate: Promise<void>;
+  collectionGate: Promise<void>;
+  readonly domainContextGate: Promise<void>;
 
   constructor(
     scriptCount = 1,
     rejectDomainClose = false,
     topRedirects: readonly string[] = [],
     collectionGate: Promise<void> = Promise.resolve(),
+    domainContextGate: Promise<void> = Promise.resolve(),
   ) {
     super();
     this.scriptCount = scriptCount;
     this.rejectDomainClose = rejectDomainClose;
     this.topRedirects = topRedirects;
     this.collectionGate = collectionGate;
+    this.domainContextGate = domainContextGate;
   }
 
   async newContext(options?: unknown): Promise<BrowserContext> {
     this.contextOptions.push(structuredClone(options));
+    const canary = this.contexts.length === 0;
     const context = new FakeContext(
-      this.contexts.length === 0,
+      canary,
       this.scriptCount,
-      this.contexts.length > 0 && this.rejectDomainClose,
+      !canary && this.rejectDomainClose,
       this.topRedirects,
       this.collectionGate,
     );
     this.contexts.push(context);
+    if (!canary) {
+      await this.domainContextGate;
+    }
     return context as unknown as BrowserContext;
   }
 
@@ -785,6 +792,7 @@ function fakeRuntime(
   topRedirects: readonly string[] = [],
   rejectCanary = false,
   collectionGate: Promise<void> = Promise.resolve(),
+  domainContextGate: Promise<void> = Promise.resolve(),
 ) {
   const proxies: FakeBrowserProxy[] = [];
   const browsers: FakeBrowser[] = [];
@@ -803,6 +811,7 @@ function fakeRuntime(
       rejectDomainClose,
       topRedirects,
       collectionGate,
+      domainContextGate,
     );
     browsers.push(browser);
     await beforeLaunch?.(browsers.length - 1, browser);
@@ -867,6 +876,10 @@ test("preflights a safe reusable slot and collects bounded browser facts", async
   });
   assert.equal(collection.completed, true);
   assert.deepEqual(collection.errors, []);
+  assert.deepEqual(collection.navigationLinks, [
+    "https://merchant-site.org/next",
+  ]);
+  assert.equal(Object.isFrozen(collection.navigationLinks), true);
   const result = await session.finish();
 
   assert.equal(result.completed, true);
@@ -919,6 +932,10 @@ test("preflights a safe reusable slot and collects bounded browser facts", async
     navigationLinks: ["https://merchant-site.org/next"],
     truncated: false,
   });
+  assert.equal(
+    collection.navigationLinks,
+    result.pages[0]?.navigationLinks,
+  );
   assert.equal(session.getUsage().browserRequests, 8);
   assert.equal(session.getUsage().scriptBodiesInspected, 1);
   assert.deepEqual(
@@ -973,6 +990,8 @@ test("fails closed when a runtime caller returns a promise from the robots gate"
     allowTopLevelUrl: invalidGate,
   });
   assert.equal(collection.completed, false);
+  assert.deepEqual(collection.navigationLinks, []);
+  assert.equal(Object.isFrozen(collection.navigationLinks), true);
   assert.equal(runtime.proxies[0]?.attempts[0]?.forward, false);
   const result = await session.finish();
   assert.equal(result.completed, false);
@@ -1107,13 +1126,75 @@ test("enforces ordered page ids, one origin, FIFO admission, and abort cleanup",
   assert.equal(runtime.proxies[0]?.finishedDomains, 2);
 });
 
-test("close waits for the active page cleanup before releasing the slot", async (t) => {
-  let releaseCollection: (() => void) | undefined;
-  const collectionGate = new Promise<void>((resolve) => {
-    releaseCollection = resolve;
+test("replaces a slot aborted during delayed domain-context initialization", async (t) => {
+  let releaseDomainContext: (() => void) | undefined;
+  const domainContextGate = new Promise<void>((resolve) => {
+    releaseDomainContext = resolve;
   });
   const runtime = fakeRuntime(
     undefined,
+    1,
+    false,
+    [],
+    false,
+    Promise.resolve(),
+    domainContextGate,
+  );
+  const pool = await createBrowserPool(
+    runtime.transport,
+    browserConfig(),
+    runtime.launcher,
+  );
+  t.after(() => pool.close());
+  const controller = new AbortController();
+  const cancellation = new Error(
+    "cancelled during browser context initialization",
+  );
+  let admissions = 0;
+  const opening = pool.openDomain(controller.signal, () => {
+    admissions += 1;
+    queueMicrotask(() => controller.abort(cancellation));
+  });
+
+  await assert.rejects(opening, (error: unknown) => error === cancellation);
+
+  assert.equal(admissions, 1);
+  assert.equal(runtime.browsers.length, 2);
+  assert.equal(runtime.browsers[0]?.connected, false);
+  assert.equal(runtime.proxies[0]?.finishedDomains, 1);
+  assert.equal(runtime.proxies[0]?.closed, true);
+  assert.equal(pool.isAvailable(), true);
+  const lateContext = runtime.browsers[0]?.contexts[1];
+  assert.notEqual(lateContext, undefined);
+  assert.equal(lateContext?.pages.length, 0);
+
+  releaseDomainContext?.();
+  await waitForImmediate();
+
+  const replacementSession = await pool.openDomain();
+  const replacementCollection = await replacementSession.collectPage({
+    pageId: "p1",
+    url: "https://merchant-site.org/",
+    inspectionPlan,
+    allowTopLevelUrl: () => true,
+  });
+  assert.equal(replacementCollection.completed, true);
+  const replacementContext = runtime.browsers[1]?.contexts[1];
+  assert.notEqual(replacementContext, undefined);
+  assert.notEqual(replacementContext, lateContext);
+  assert.equal(replacementContext?.pages.length, 1);
+  assert.equal(lateContext?.pages.length, 0);
+  await replacementSession.finish();
+  assert.equal(runtime.proxies[1]?.domains, 1);
+  assert.equal(runtime.proxies[1]?.finishedDomains, 1);
+});
+
+test("abandons a stuck collection and preserves FIFO admission on a replacement slot", async (t) => {
+  const collectionGate = new Promise<void>(() => {});
+  const runtime = fakeRuntime(
+    async (index, browser) => {
+      if (index > 0) browser.collectionGate = Promise.resolve();
+    },
     1,
     false,
     [],
@@ -1126,13 +1207,15 @@ test("close waits for the active page cleanup before releasing the slot", async 
     runtime.launcher,
   );
   t.after(() => pool.close());
-  const first = await pool.openDomain();
+  const controller = new AbortController();
+  const first = await pool.openDomain(controller.signal);
   const collecting = first.collectPage({
     pageId: "p1",
     url: "https://merchant-site.org/",
     inspectionPlan,
     allowTopLevelUrl: () => true,
   });
+  void collecting.catch(() => undefined);
   for (
     let attempt = 0;
     attempt < 20 && (runtime.proxies[0]?.attempts.length ?? 0) < 8;
@@ -1142,28 +1225,58 @@ test("close waits for the active page cleanup before releasing the slot", async 
   }
   assert.equal(runtime.proxies[0]?.attempts.length, 8);
 
-  const queued = pool.openDomain();
-  let queuedActivated = false;
-  void queued.then(() => {
-    queuedActivated = true;
+  const firstQueued = pool.openDomain();
+  const secondQueued = pool.openDomain();
+  let secondQueuedActivated = false;
+  void secondQueued.then(() => {
+    secondQueuedActivated = true;
   });
+  controller.abort(new Error("cancelled stuck browser collection"));
   const closing = first.close();
-  await waitForImmediate();
-  assert.equal(queuedActivated, false);
-  assert.equal(runtime.proxies[0]?.finishedDomains, 0);
+  const closeOutcome = await Promise.race([
+    closing.then(() => "closed" as const),
+    waitForTimeout(2_500, "timed-out" as const),
+  ]);
+  assert.equal(closeOutcome, "closed");
+  assert.equal(runtime.browsers.length, 2);
+  assert.equal(runtime.browsers[0]?.connected, false);
+  assert.equal(runtime.proxies[0]?.closed, true);
+  assert.equal(runtime.proxies[0]?.attempts.length, 8);
 
-  releaseCollection?.();
-  const collection = await collecting;
-  assert.equal(collection.completed, false);
-  await closing;
-  const second = await queued;
-  const lifecycle = runtime.proxies[0]?.lifecycle ?? [];
-  assert.equal(
-    lifecycle.indexOf("finishPage:p1")
-      < lifecycle.indexOf("activateDomain:2"),
-    true,
-  );
-  await second.close();
+  const replacementFirst = await firstQueued;
+  assert.equal(secondQueuedActivated, false);
+  const firstReplacementCollection = await replacementFirst.collectPage({
+    pageId: "p1",
+    url: "https://merchant-site.org/",
+    inspectionPlan,
+    allowTopLevelUrl: () => true,
+  });
+  assert.equal(firstReplacementCollection.completed, true);
+  await replacementFirst.finish();
+
+  const replacementSecond = await secondQueued;
+  const secondReplacementCollection = await replacementSecond.collectPage({
+    pageId: "p1",
+    url: "https://merchant-site.org/",
+    inspectionPlan,
+    allowTopLevelUrl: () => true,
+  });
+  assert.equal(secondReplacementCollection.completed, true);
+  await replacementSecond.finish();
+
+  assert.equal(runtime.proxies.length, 2);
+  assert.equal(runtime.proxies[0]?.attempts.length, 8);
+  assert.equal(runtime.proxies[1]?.attempts.length, 16);
+  assert.deepEqual(runtime.proxies[1]?.lifecycle, [
+    "activateDomain:1",
+    "startPage:p1",
+    "finishPage:p1",
+    "finishDomain:1",
+    "activateDomain:2",
+    "startPage:p1",
+    "finishPage:p1",
+    "finishDomain:2",
+  ]);
 });
 
 test("never requests more than twenty ranked script bodies", async (t) => {

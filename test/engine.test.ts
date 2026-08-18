@@ -29,6 +29,7 @@ import {
   type DomainResult,
   type HttpEntryResult,
   type HttpPageObservations,
+  type HttpPageResult,
   type HttpResponseObservations,
   type InfrastructureObservations,
   type ScanError,
@@ -401,6 +402,148 @@ test("maps, normalizes, deduplicates, and ranks only supported HTTP candidates",
   assert.deepEqual(
     observed.map((item) => item.id),
     [...observed.map((item) => item.id)].sort(),
+  );
+});
+
+test("maps p2 and p3 HTTP variants with stable page-linked candidates", async () => {
+  const fingerprintCatalog = catalog(
+    [technology("P2 technology"), technology("P3 technology")],
+    [
+      rule(100, "P2 technology", {
+        source: "meta",
+        locator: "generator",
+        pattern: "Fixture Generator",
+      }),
+      rule(101, "P3 technology", {
+        locator: "server",
+        pattern: "Fixture failure",
+      }),
+    ],
+  );
+  const p2Base = htmlEntry({
+    response: response({
+      finalNetworkUrl: "https://shop.vendor.tld/products/fixture",
+      headers: [{ name: "X-Powered-By", value: "Fixture HTML" }],
+      cookies: [{ name: "framework", value: "fixture-cookie" }],
+    }),
+    html: "<html>Product fixture</html>",
+    text: "Product fixture",
+    metadata: [{ key: "Generator", value: "Fixture Generator" }],
+    resources: [{ kind: "script", url: "https://shop.vendor.tld/p2.js" }],
+  });
+  assert.equal(p2Base.kind, "html");
+  const p2: HttpPageResult = {
+    kind: "html",
+    page: { ...p2Base.page, pageId: "p2" },
+    robots: [],
+    errors: [],
+  };
+  const p3NonHtml: HttpPageResult = {
+    kind: "non-html",
+    pageId: "p3",
+    requestedUrl: "https://shop.vendor.tld/feed",
+    response: response({
+      finalNetworkUrl: "https://shop.vendor.tld/feed.xml",
+      headers: [{ name: "Content-Type", value: "application/xml" }],
+    }),
+    robots: [],
+    errors: [],
+  };
+  const p3Failed: HttpPageResult = {
+    kind: "failed",
+    pageId: "p3",
+    requestedUrl: "https://shop.vendor.tld/broken-request",
+    response: response({
+      finalNetworkUrl: "https://shop.vendor.tld/broken",
+      statusCode: 503,
+      headers: [{ name: "Server", value: "Fixture failure" }],
+    }),
+    robots: [],
+    errors: [{
+      stage: "http",
+      code: "HTTP_REQUEST_FAILED",
+      pageId: "p3",
+      retryable: true,
+      message: "The static request failed.",
+      ruleId: null,
+      signal: null,
+      limit: null,
+      catalogRevision: null,
+    }],
+  };
+  const skipped: HttpPageResult = {
+    kind: "skipped",
+    pageId: "p2",
+    requestedUrl: "https://shop.vendor.tld/private",
+    robots: [],
+    errors: [],
+  };
+  type PageLinkedCandidate = DetectorCandidate & {
+    readonly pageId: HttpPageObservations["pageId"] | null;
+  };
+  const run = async (
+    httpPages: readonly HttpPageResult[],
+  ) => {
+    let observed: readonly PageLinkedCandidate[] = [];
+    const result = await detectHttp(htmlEntry(), {
+      catalog: fingerprintCatalog,
+      pool: fakePool(fingerprintCatalog, (candidates) => {
+        observed = candidates as readonly PageLinkedCandidate[];
+        return emptyMatchResult({
+          matches: [
+            workerMatch(candidates, 0, (candidate) =>
+              candidate.source === "meta"
+              && candidate.key === "generator"
+              && candidate.value === "Fixture Generator"),
+            workerMatch(candidates, 1, (candidate) =>
+              candidate.source === "header"
+              && candidate.key === "server"
+              && candidate.value === "Fixture failure"),
+          ],
+        });
+      }),
+      config: defaultConfig,
+      httpPages,
+    });
+    assert.equal(result.completed, true);
+    return { observed, result };
+  };
+
+  const pages = [skipped, p3Failed, p3NonHtml, p2] as const;
+  const first = await run(pages);
+  const reversed = await run([...pages].reverse());
+  const observed = first.observed;
+  assert.deepEqual(reversed.observed, observed);
+  assert.deepEqual(reversed.result, first.result);
+  assert.deepEqual(
+    first.result.technologies.map((item) => [item.name, item.evidence[0]?.pageId]),
+    [["P2 technology", "p2"], ["P3 technology", "p3"]],
+  );
+  assert.deepEqual(
+    observed
+      .filter((candidate) => candidate.pageId === "p2" || candidate.pageId === "p3")
+      .map(({ source, pageId, key, value }) => [source, pageId, key, value]),
+    [
+      ["url", "p2", null, "https://shop.vendor.tld/products/fixture"],
+      ["url", "p3", null, "https://shop.vendor.tld/broken"],
+      ["url", "p3", null, "https://shop.vendor.tld/feed.xml"],
+      ["header", "p2", "x-powered-by", "Fixture HTML"],
+      ["header", "p3", "content-type", "application/xml"],
+      ["header", "p3", "server", "Fixture failure"],
+      ["cookie", "p2", "framework", "fixture-cookie"],
+      ["html", "p2", null, "<html>Product fixture</html>"],
+      ["text", "p2", null, "Product fixture"],
+      ["meta", "p2", "generator", "Fixture Generator"],
+      ["script_url", "p2", "src", "https://shop.vendor.tld/p2.js"],
+    ],
+  );
+  assert.equal(
+    observed.some((candidate) => candidate.value.includes("/private")),
+    false,
+  );
+  assert.equal(
+    observed.some((candidate) => candidate.value.includes("broken-request")),
+    false,
   );
 });
 

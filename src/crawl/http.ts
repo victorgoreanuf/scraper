@@ -11,12 +11,14 @@ import {
   type HttpEntryResult,
   type HttpHeaderObservation,
   type HttpMetadataObservation,
+  type HttpPageResult,
   type HttpPageObservations,
   type HttpRedirectObservation,
   type HttpResourceKind,
   type HttpResourceObservation,
   type HttpResponseObservations,
   type HttpRobotsObservation,
+  type PageId,
   type ScanError,
 } from "../model.ts";
 import { createTargetCandidates, TargetPolicyError } from "../network-policy.ts";
@@ -63,6 +65,8 @@ export interface CollectHttpEntryOptions {
   readonly robots: RobotsPolicyService;
 }
 
+export type CollectHttpPageOptions = CollectHttpEntryOptions;
+
 interface ParsedMediaType {
   readonly essence: string;
   readonly charset: string | null;
@@ -103,7 +107,7 @@ function scanError(
   code: ErrorCode,
   retryable: boolean,
   message: string,
-  pageId: "p1" | null = null,
+  pageId: PageId | null = null,
 ): ScanError {
   return Object.freeze({
     stage,
@@ -122,14 +126,14 @@ function localError(
   stage: ErrorStage,
   code: keyof typeof LOCAL_MESSAGES,
   retryable = false,
-  pageId: "p1" | null = null,
+  pageId: PageId | null = null,
 ): ScanError {
   return scanError(stage, code, retryable, LOCAL_MESSAGES[code], pageId);
 }
 
 function observedError(
   error: ProtectedTransportError | RobotsPolicyError,
-  pageId: "p1" | null = null,
+  pageId: PageId | null = null,
 ): ScanError {
   return scanError(
     error.stage,
@@ -142,7 +146,7 @@ function observedError(
 
 function deadlineError(
   stage: ErrorStage,
-  pageId: "p1" | null = null,
+  pageId: PageId | null = null,
 ): ScanError {
   return localError(stage, "DOMAIN_DEADLINE_EXCEEDED", true, pageId);
 }
@@ -849,9 +853,10 @@ function extractDocument(
 function incompletePage(
   response: HttpResponseObservations,
   html: string,
+  pageId: PageId = "p1",
 ): HttpPageObservations {
   return Object.freeze({
-    pageId: "p1" as const,
+    pageId,
     response,
     html,
     text: "",
@@ -900,7 +905,7 @@ function errorForCaught(
   error: unknown,
   stage: ErrorStage,
   signal: AbortSignal,
-  pageId: "p1" | null = null,
+  pageId: PageId | null = null,
 ): ScanError {
   if (error instanceof ProtectedTransportError || error instanceof RobotsPolicyError) {
     return observedError(error, pageId);
@@ -911,18 +916,17 @@ function errorForCaught(
   }
 
   if (stage === "robots") {
-    return localError("robots", "ROBOTS_UNAVAILABLE");
+    return localError("robots", "ROBOTS_UNAVAILABLE", false, pageId);
   }
 
-  return localError(stage, "HTTP_REQUEST_FAILED");
+  return localError(stage, "HTTP_REQUEST_FAILED", false, pageId);
 }
 
 export async function collectHttpEntry(
   domain: string,
   options: CollectHttpEntryOptions,
 ): Promise<HttpEntryResult> {
-  const { config, session, robots } = options;
-  const signal = session.getSignal();
+  const signal = options.session.getSignal();
   let candidates: readonly string[];
 
   if (signal.aborted) {
@@ -932,7 +936,7 @@ export async function collectHttpEntry(
   try {
     candidates = createTargetCandidates(domain).slice(
       0,
-      config.limits.target.candidates,
+      options.config.limits.target.candidates,
     );
   } catch (error) {
     if (error instanceof TargetPolicyError) {
@@ -943,306 +947,548 @@ export async function collectHttpEntry(
   }
 
   for (const candidate of candidates) {
-    const candidateRobots: HttpRobotsObservation[] = [];
-    const seenRobots = new Set<string>();
-    const redirects: HttpRedirectObservation[] = [];
-    const seenUrls = new Set<string>([candidate]);
-    let currentUrl = candidate;
-    let softFailure = false;
+    const result = await collectCandidate(candidate, "p1", options, "entry");
 
-    while (true) {
-      let response: ProtectedTransportResponse | undefined;
-      let acceptedHead: ProtectedTransportResponseHead | null = null;
+    if (result.kind === "soft" || result.kind === "skipped") {
+      continue;
+    }
 
-      for (
-        let retry = 0;
-        retry <= config.limits.http.transientRetriesPerRequest;
-        retry += 1
-      ) {
-        let robotsCheck: RobotsCheck;
+    if (result.kind === "failed") {
+      return failedResult(result.robots, result.error, result.response);
+    }
 
-        try {
-          robotsCheck = await robots.check(session, currentUrl);
-        } catch (error) {
-          return failedResult(
-            candidateRobots,
-            errorForCaught(error, "robots", signal),
-          );
-        }
-
-        recordRobotsObservation(robotsCheck, candidateRobots, seenRobots);
-
-        if (!robotsCheck.allowed) {
-          return failedResult(
-            candidateRobots,
-            localError("robots", "ROBOTS_DISALLOWED"),
-          );
-        }
-
-        try {
-          acceptedHead = null;
-          response = await session.requestHop({
-            url: currentUrl,
-            purpose: "page",
-            isRetry: retry > 0,
-            acceptBody: (head) => {
-              acceptedHead = head;
-              return admitsHtmlBody(head);
-            },
-          });
-        } catch (error) {
-          if (
-            error instanceof ProtectedTransportError
-            && error.retryable
-            && error.code !== "DOMAIN_DEADLINE_EXCEEDED"
-            && retry < config.limits.http.transientRetriesPerRequest
-          ) {
-            try {
-              await waitBeforeRetry(RETRY_BACKOFF_MS, signal);
-            } catch {
-              return failedResult(candidateRobots, deadlineError("http"));
-            }
-
-            continue;
-          }
-
-          const failedHead = acceptedHead as ProtectedTransportResponseHead | null;
-
-          if (
-            failedHead !== null
-            && failedHead.statusCode >= 200
-            && failedHead.statusCode <= 299
-            && admitsHtmlBody(failedHead)
-          ) {
-            const headResponse = htmlHeadResponse(
-              failedHead,
-              redirects,
-              config,
-            );
-            const failure = errorForCaught(error, "http", signal, "p1");
-            const errors = headResponse.cookiesTruncated
-              && failure.code !== "HTTP_RESPONSE_LIMIT_EXCEEDED"
-              ? [
-                  localError("http", "HTTP_RESPONSE_LIMIT_EXCEEDED", false, "p1"),
-                  failure,
-                ]
-              : [failure];
-            return htmlResult(
-              incompletePage(headResponse, ""),
-              candidateRobots,
-              errors,
-            );
-          }
-
-          if (
-            error instanceof ProtectedTransportError
-            && error.retryable
-            && error.code !== "DOMAIN_DEADLINE_EXCEEDED"
-          ) {
-            softFailure = true;
-            break;
-          }
-
-          return failedResult(
-            candidateRobots,
-            errorForCaught(error, "http", signal),
-          );
-        }
-
-        if (shouldRetryStatus(response.statusCode)) {
-          if (retry < config.limits.http.transientRetriesPerRequest) {
-            const milliseconds = response.statusCode === 429
-              ? retryAfterMilliseconds(response, config)
-              : RETRY_BACKOFF_MS;
-
-            try {
-              await waitBeforeRetry(milliseconds, signal);
-            } catch {
-              return failedResult(candidateRobots, deadlineError("http"));
-            }
-
-            continue;
-          }
-
-          if (response.statusCode === 429) {
-            return failedResult(
-              candidateRobots,
-              localError("target", "TARGET_ACCESS_DENIED"),
-            );
-          }
-
-          softFailure = true;
-        }
-
-        break;
-      }
-
-      if (softFailure || response === undefined) {
-        break;
-      }
-
-      if (isRedirectStatus(response.statusCode)) {
-        const nextUrl = response.redirectUrl;
-
-        if (nextUrl === null) {
-          return failedResult(
-            candidateRobots,
-            localError("target", "TARGET_REDIRECT_INVALID"),
-          );
-        }
-
-        if (
-          redirects.length >= config.limits.target.redirectsPerChain
-          || seenUrls.has(nextUrl)
-        ) {
-          return failedResult(
-            candidateRobots,
-            localError("target", "TARGET_REDIRECT_LIMIT_EXCEEDED"),
-          );
-        }
-
-        redirects.push(Object.freeze({
-          fromUrl: response.url,
-          statusCode: response.statusCode,
-          toUrl: nextUrl,
-        }));
-        seenUrls.add(nextUrl);
-        currentUrl = nextUrl;
-        continue;
-      }
-
-      if (response.statusCode >= 300 && response.statusCode <= 399) {
-        return failedResult(
-          candidateRobots,
-          localError("target", "TARGET_REDIRECT_INVALID"),
-        );
-      }
-
-      if (DENIAL_STATUS_CODES.has(response.statusCode)) {
-        return failedResult(
-          candidateRobots,
-          localError("target", "TARGET_ACCESS_DENIED"),
-        );
-      }
-
-      if (response.statusCode >= 400 && response.statusCode <= 499) {
-        softFailure = true;
-        break;
-      }
-
-      if (response.statusCode < 200 || response.statusCode > 299) {
-        softFailure = true;
-        break;
-      }
-
-      const observedResponse = responseObservations(response, redirects, config);
-      const mediaType = mediaTypeFor(response.headers);
-      const extractionErrors: ScanError[] = [];
-
-      if (
-        response.statusCode === 204
-        || response.statusCode === 205
-        || mediaType === null
-        || !HTML_MEDIA_TYPES.has(mediaType.essence)
-      ) {
-        if (observedResponse.cookiesTruncated) {
-          extractionErrors.push(
-            localError("http", "HTTP_RESPONSE_LIMIT_EXCEEDED"),
-          );
-        }
-
-        extractionErrors.push(localError("http", "UNSUPPORTED_CONTENT_TYPE"));
-        return Object.freeze({
-          kind: "non-html" as const,
-          response: observedResponse,
-          robots: Object.freeze([...candidateRobots]),
-          errors: Object.freeze(extractionErrors),
-        });
-      }
-
-      if (observedResponse.cookiesTruncated) {
-        extractionErrors.push(
-          localError("http", "HTTP_RESPONSE_LIMIT_EXCEEDED", false, "p1"),
-        );
-      }
-
-      let decoded: DecodedDocument;
-
-      try {
-        decoded = await decodeHtml(
-          response.body,
-          mediaType,
-          response.url,
-          signal,
-        );
-      } catch (error) {
-        const partialHtml = error instanceof HtmlDecodeError ? error.partialHtml : "";
-        return htmlResult(
-          incompletePage(observedResponse, partialHtml),
-          candidateRobots,
-          [
-            ...extractionErrors,
-            errorForCaught(error, "http", signal, "p1"),
-          ],
-        );
-      }
-
-      let extracted: ExtractedDocument;
-
-      try {
-        extracted = extractDocument(
-          decoded.$,
-          response.url,
-          config,
-          signal,
-        );
-      } catch (error) {
-        return htmlResult(
-          incompletePage(observedResponse, decoded.html),
-          candidateRobots,
-          [
-            ...extractionErrors,
-            errorForCaught(error, "http", signal, "p1"),
-          ],
-        );
-      }
-
-      const truncated =
-        observedResponse.cookiesTruncated
-        || extracted.metadataTruncated
-        || extracted.urlsTruncated
-        || extracted.textTruncated;
-
-      if (
-        truncated
-        && !extractionErrors.some((error) => error.code === "HTTP_RESPONSE_LIMIT_EXCEEDED")
-      ) {
-        extractionErrors.push(
-          localError("http", "HTTP_RESPONSE_LIMIT_EXCEEDED", false, "p1"),
-        );
-      }
-
-      const page: HttpPageObservations = Object.freeze({
-        pageId: "p1" as const,
-        response: observedResponse,
-        html: decoded.html,
-        text: extracted.text,
-        textTruncated: extracted.textTruncated,
-        metadata: extracted.metadata,
-        metadataTruncated: extracted.metadataTruncated,
-        resources: extracted.resources,
-        navigationLinks: extracted.navigationLinks,
-        urlsTruncated: extracted.urlsTruncated,
-        collectionState: truncated ? "truncated" as const : "complete" as const,
+    if (result.kind === "non-html") {
+      return Object.freeze({
+        kind: "non-html" as const,
+        response: result.response,
+        robots: result.robots,
+        errors: result.errors,
       });
-
-      return htmlResult(page, candidateRobots, extractionErrors);
     }
 
-    if (!softFailure) {
-      break;
-    }
+    return htmlResult(result.page, result.robots, result.errors);
   }
 
   return failedResult([], localError("target", "TARGET_NOT_FOUND"));
+}
+
+type CandidateResult =
+  | {
+      readonly kind: "html";
+      readonly page: HttpPageObservations;
+      readonly robots: readonly HttpRobotsObservation[];
+      readonly errors: readonly ScanError[];
+    }
+  | {
+      readonly kind: "non-html";
+      readonly response: HttpResponseObservations;
+      readonly robots: readonly HttpRobotsObservation[];
+      readonly errors: readonly ScanError[];
+    }
+  | {
+      readonly kind: "failed";
+      readonly response: HttpResponseObservations | null;
+      readonly robots: readonly HttpRobotsObservation[];
+      readonly error: ScanError;
+    }
+  | {
+      readonly kind: "soft";
+      readonly robots: readonly HttpRobotsObservation[];
+    }
+  | {
+      readonly kind: "skipped";
+      readonly robots: readonly HttpRobotsObservation[];
+    };
+
+function freezeRobots(
+  observations: readonly HttpRobotsObservation[],
+): readonly HttpRobotsObservation[] {
+  return Object.freeze([...observations]);
+}
+
+function candidateFailure(
+  robots: readonly HttpRobotsObservation[],
+  error: ScanError,
+  response: HttpResponseObservations | null = null,
+): CandidateResult {
+  return Object.freeze({
+    kind: "failed" as const,
+    response,
+    robots: freezeRobots(robots),
+    error,
+  });
+}
+
+async function collectCandidate(
+  candidate: string,
+  pageId: PageId,
+  options: CollectHttpPageOptions,
+  mode: "entry" | "internal",
+): Promise<CandidateResult> {
+  const { config, session, robots } = options;
+  const signal = session.getSignal();
+  const candidateRobots: HttpRobotsObservation[] = [];
+  const seenRobots = new Set<string>();
+  const redirects: HttpRedirectObservation[] = [];
+  const seenUrls = new Set<string>([candidate]);
+  const initialOrigin = new URL(candidate).origin;
+  const failurePageId = mode === "internal" ? pageId : null;
+  let currentUrl = candidate;
+
+  while (true) {
+    let response: ProtectedTransportResponse | undefined;
+    let acceptedHead: ProtectedTransportResponseHead | null = null;
+    let retryExhausted = false;
+
+    for (
+      let retry = 0;
+      retry <= config.limits.http.transientRetriesPerRequest;
+      retry += 1
+    ) {
+      let robotsCheck: RobotsCheck;
+
+      try {
+        robotsCheck = await robots.check(session, currentUrl);
+      } catch (error) {
+        return candidateFailure(
+          candidateRobots,
+          errorForCaught(error, "robots", signal, failurePageId),
+        );
+      }
+
+      recordRobotsObservation(robotsCheck, candidateRobots, seenRobots);
+
+      if (!robotsCheck.allowed) {
+        if (mode === "internal") {
+          return Object.freeze({
+            kind: "skipped" as const,
+            robots: freezeRobots(candidateRobots),
+          });
+        }
+
+        return candidateFailure(
+          candidateRobots,
+          localError("robots", "ROBOTS_DISALLOWED"),
+        );
+      }
+
+      try {
+        acceptedHead = null;
+        response = await session.requestHop({
+          url: currentUrl,
+          purpose: "page",
+          isRetry: retry > 0,
+          acceptBody: (head) => {
+            acceptedHead = head;
+            return admitsHtmlBody(head);
+          },
+        });
+      } catch (error) {
+        if (
+          error instanceof ProtectedTransportError
+          && error.retryable
+          && error.code !== "DOMAIN_DEADLINE_EXCEEDED"
+          && retry < config.limits.http.transientRetriesPerRequest
+        ) {
+          try {
+            await waitBeforeRetry(RETRY_BACKOFF_MS, signal);
+          } catch {
+            return candidateFailure(
+              candidateRobots,
+              deadlineError("http", failurePageId),
+            );
+          }
+
+          continue;
+        }
+
+        const failedHead = acceptedHead as ProtectedTransportResponseHead | null;
+
+        if (
+          failedHead !== null
+          && failedHead.statusCode >= 200
+          && failedHead.statusCode <= 299
+          && admitsHtmlBody(failedHead)
+        ) {
+          const headResponse = htmlHeadResponse(failedHead, redirects, config);
+          const failure = errorForCaught(error, "http", signal, pageId);
+          const errors = headResponse.cookiesTruncated
+            && failure.code !== "HTTP_RESPONSE_LIMIT_EXCEEDED"
+            ? [
+                localError(
+                  "http",
+                  "HTTP_RESPONSE_LIMIT_EXCEEDED",
+                  false,
+                  pageId,
+                ),
+                failure,
+              ]
+            : [failure];
+          return Object.freeze({
+            kind: "html" as const,
+            page: incompletePage(headResponse, "", pageId),
+            robots: freezeRobots(candidateRobots),
+            errors: Object.freeze(errors),
+          });
+        }
+
+        if (
+          mode === "entry"
+          && error instanceof ProtectedTransportError
+          && error.retryable
+          && error.code !== "DOMAIN_DEADLINE_EXCEEDED"
+        ) {
+          return Object.freeze({
+            kind: "soft" as const,
+            robots: freezeRobots(candidateRobots),
+          });
+        }
+
+        return candidateFailure(
+          candidateRobots,
+          errorForCaught(error, "http", signal, failurePageId),
+        );
+      }
+
+      if (shouldRetryStatus(response.statusCode)) {
+        if (retry < config.limits.http.transientRetriesPerRequest) {
+          const milliseconds = response.statusCode === 429
+            ? retryAfterMilliseconds(response, config)
+            : RETRY_BACKOFF_MS;
+
+          try {
+            await waitBeforeRetry(milliseconds, signal);
+          } catch {
+            return candidateFailure(
+              candidateRobots,
+              deadlineError("http", failurePageId),
+            );
+          }
+
+          continue;
+        }
+
+        if (response.statusCode === 429) {
+          return candidateFailure(
+            candidateRobots,
+            localError(
+              "target",
+              "TARGET_ACCESS_DENIED",
+              false,
+              failurePageId,
+            ),
+            responseObservations(response, redirects, config),
+          );
+        }
+
+        retryExhausted = true;
+      }
+
+      break;
+    }
+
+    if (response === undefined || retryExhausted) {
+      if (mode === "entry") {
+        return Object.freeze({
+          kind: "soft" as const,
+          robots: freezeRobots(candidateRobots),
+        });
+      }
+
+      return candidateFailure(
+        candidateRobots,
+        localError("http", "HTTP_REQUEST_FAILED", true, pageId),
+        response === undefined
+          ? null
+          : responseObservations(response, redirects, config),
+      );
+    }
+
+    if (isRedirectStatus(response.statusCode)) {
+      const nextUrl = response.redirectUrl;
+
+      if (nextUrl === null) {
+        return candidateFailure(
+          candidateRobots,
+          localError(
+            "target",
+            "TARGET_REDIRECT_INVALID",
+            false,
+            failurePageId,
+          ),
+        );
+      }
+
+      if (mode === "internal" && new URL(nextUrl).origin !== initialOrigin) {
+        return candidateFailure(
+          candidateRobots,
+          localError(
+            "target",
+            "TARGET_REDIRECT_INVALID",
+            false,
+            pageId,
+          ),
+        );
+      }
+
+      if (
+        redirects.length >= config.limits.target.redirectsPerChain
+        || seenUrls.has(nextUrl)
+      ) {
+        return candidateFailure(
+          candidateRobots,
+          localError(
+            "target",
+            "TARGET_REDIRECT_LIMIT_EXCEEDED",
+            false,
+            failurePageId,
+          ),
+        );
+      }
+
+      redirects.push(Object.freeze({
+        fromUrl: response.url,
+        statusCode: response.statusCode,
+        toUrl: nextUrl,
+      }));
+      seenUrls.add(nextUrl);
+      currentUrl = nextUrl;
+      continue;
+    }
+
+    if (response.statusCode >= 300 && response.statusCode <= 399) {
+      return candidateFailure(
+        candidateRobots,
+        localError(
+          "target",
+          "TARGET_REDIRECT_INVALID",
+          false,
+          failurePageId,
+        ),
+      );
+    }
+
+    if (DENIAL_STATUS_CODES.has(response.statusCode)) {
+      return candidateFailure(
+        candidateRobots,
+        localError(
+          "target",
+          "TARGET_ACCESS_DENIED",
+          false,
+          failurePageId,
+        ),
+        responseObservations(response, redirects, config),
+      );
+    }
+
+    if (
+      response.statusCode >= 400
+      || response.statusCode < 200
+      || response.statusCode > 299
+    ) {
+      if (mode === "entry") {
+        return Object.freeze({
+          kind: "soft" as const,
+          robots: freezeRobots(candidateRobots),
+        });
+      }
+
+      return candidateFailure(
+        candidateRobots,
+        localError("http", "HTTP_REQUEST_FAILED", false, pageId),
+        responseObservations(response, redirects, config),
+      );
+    }
+
+    const observedResponse = responseObservations(response, redirects, config);
+    const mediaType = mediaTypeFor(response.headers);
+    const extractionErrors: ScanError[] = [];
+
+    if (
+      response.statusCode === 204
+      || response.statusCode === 205
+      || mediaType === null
+      || !HTML_MEDIA_TYPES.has(mediaType.essence)
+    ) {
+      if (observedResponse.cookiesTruncated) {
+        extractionErrors.push(
+          localError(
+            "http",
+            "HTTP_RESPONSE_LIMIT_EXCEEDED",
+            false,
+            mode === "internal" ? pageId : null,
+          ),
+        );
+      }
+
+      extractionErrors.push(
+        localError(
+          "http",
+          "UNSUPPORTED_CONTENT_TYPE",
+          false,
+          mode === "internal" ? pageId : null,
+        ),
+      );
+      return Object.freeze({
+        kind: "non-html" as const,
+        response: observedResponse,
+        robots: freezeRobots(candidateRobots),
+        errors: Object.freeze(extractionErrors),
+      });
+    }
+
+    if (observedResponse.cookiesTruncated) {
+      extractionErrors.push(
+        localError(
+          "http",
+          "HTTP_RESPONSE_LIMIT_EXCEEDED",
+          false,
+          pageId,
+        ),
+      );
+    }
+
+    let decoded: DecodedDocument;
+
+    try {
+      decoded = await decodeHtml(response.body, mediaType, response.url, signal);
+    } catch (error) {
+      const partialHtml = error instanceof HtmlDecodeError ? error.partialHtml : "";
+      return Object.freeze({
+        kind: "html" as const,
+        page: incompletePage(observedResponse, partialHtml, pageId),
+        robots: freezeRobots(candidateRobots),
+        errors: Object.freeze([
+          ...extractionErrors,
+          errorForCaught(error, "http", signal, pageId),
+        ]),
+      });
+    }
+
+    let extracted: ExtractedDocument;
+
+    try {
+      extracted = extractDocument(decoded.$, response.url, config, signal);
+    } catch (error) {
+      return Object.freeze({
+        kind: "html" as const,
+        page: incompletePage(observedResponse, decoded.html, pageId),
+        robots: freezeRobots(candidateRobots),
+        errors: Object.freeze([
+          ...extractionErrors,
+          errorForCaught(error, "http", signal, pageId),
+        ]),
+      });
+    }
+
+    const truncated = observedResponse.cookiesTruncated
+      || extracted.metadataTruncated
+      || extracted.urlsTruncated
+      || extracted.textTruncated;
+
+    if (
+      truncated
+      && !extractionErrors.some(
+        (error) => error.code === "HTTP_RESPONSE_LIMIT_EXCEEDED",
+      )
+    ) {
+      extractionErrors.push(
+        localError(
+          "http",
+          "HTTP_RESPONSE_LIMIT_EXCEEDED",
+          false,
+          pageId,
+        ),
+      );
+    }
+
+    const page: HttpPageObservations = Object.freeze({
+      pageId,
+      response: observedResponse,
+      html: decoded.html,
+      text: extracted.text,
+      textTruncated: extracted.textTruncated,
+      metadata: extracted.metadata,
+      metadataTruncated: extracted.metadataTruncated,
+      resources: extracted.resources,
+      navigationLinks: extracted.navigationLinks,
+      urlsTruncated: extracted.urlsTruncated,
+      collectionState: truncated ? "truncated" as const : "complete" as const,
+    });
+
+    return Object.freeze({
+      kind: "html" as const,
+      page,
+      robots: freezeRobots(candidateRobots),
+      errors: Object.freeze(extractionErrors),
+    });
+  }
+}
+
+export async function collectHttpPage(
+  url: string,
+  pageId: PageId,
+  options: CollectHttpPageOptions,
+): Promise<HttpPageResult> {
+  let canonicalUrl: string;
+
+  try {
+    canonicalUrl = resolveRedirectTarget(
+      url,
+      url,
+      options.config.limits.url.codeUnits,
+    );
+  } catch {
+    return Object.freeze({
+      kind: "failed" as const,
+      pageId,
+      requestedUrl: url,
+      response: null,
+      robots: Object.freeze([]),
+      errors: Object.freeze([
+        localError("target", "TARGET_REDIRECT_INVALID", false, pageId),
+      ]) as readonly [ScanError],
+    });
+  }
+
+  const result = await collectCandidate(canonicalUrl, pageId, options, "internal");
+
+  if (result.kind === "html") {
+    return Object.freeze({
+      kind: "html" as const,
+      page: result.page,
+      robots: result.robots,
+      errors: result.errors,
+    });
+  }
+
+  if (result.kind === "non-html") {
+    return Object.freeze({
+      kind: "non-html" as const,
+      pageId,
+      requestedUrl: canonicalUrl,
+      response: result.response,
+      robots: result.robots,
+      errors: result.errors,
+    });
+  }
+
+  if (result.kind === "skipped" || result.kind === "soft") {
+    return Object.freeze({
+      kind: "skipped" as const,
+      pageId,
+      requestedUrl: canonicalUrl,
+      robots: result.robots,
+      errors: Object.freeze([]) as readonly [],
+    });
+  }
+
+  return Object.freeze({
+    kind: "failed" as const,
+    pageId,
+    requestedUrl: canonicalUrl,
+    response: result.response,
+    robots: result.robots,
+    errors: Object.freeze([result.error]) as readonly [ScanError],
+  });
 }

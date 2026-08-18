@@ -182,8 +182,53 @@ test("applies the exact product group and caches decisions per origin", async (t
     (await policies.check(session, "http://shop.vendor.tld/other")).allowed,
     true,
   );
+  assert.equal(
+    policies.allowsCached("http://shop.vendor.tld/private"),
+    false,
+  );
+  assert.equal(
+    policies.allowsCached("http://shop.vendor.tld/private/public"),
+    true,
+  );
   assert.equal(requests, 1);
   assert.equal(session.getUsage().httpRequests, 1);
+});
+
+test("fails closed for missing, pending, and invalid cached decisions", async (t) => {
+  const config = configWith();
+  const responseGate = Promise.withResolvers<void>();
+  const controlled = await createControlledSession(t, config, (_request, response) => {
+    void responseGate.promise.then(() => {
+      response.writeHead(200);
+      response.end("User-agent: *\nDisallow: /private");
+    });
+  });
+  controlled.activate();
+  const { session } = controlled;
+  const policies = createRobotsPolicyService(config);
+
+  assert.equal(
+    policies.allowsCached("http://missing.vendor.tld/"),
+    false,
+  );
+  assert.equal(policies.allowsCached("not a URL"), false);
+
+  const pending = policies.check(session, "http://shop.vendor.tld/public");
+  const pendingDecision = policies.allowsCached(
+    "http://shop.vendor.tld/public",
+  );
+  responseGate.resolve();
+
+  assert.equal(pendingDecision, false);
+  assert.equal((await pending).allowed, true);
+  assert.equal(
+    policies.allowsCached("http://shop.vendor.tld/private"),
+    false,
+  );
+  assert.equal(
+    policies.allowsCached("http://shop.vendor.tld/public"),
+    true,
+  );
 });
 
 test("normalizes unreserved escapes without decoding reserved escapes", async (t) => {
@@ -502,9 +547,17 @@ test("bounds matching work without corrupting the cached policy", async (t) => {
     (await policies.check(session, "http://shop.vendor.tld/x")).allowed,
     true,
   );
+  assert.equal(
+    policies.allowsCached("http://shop.vendor.tld/x"),
+    true,
+  );
   await expectRobotsError(
     () => policies.check(session, "http://shop.vendor.tld/xx"),
     "ROBOTS_LIMIT_EXCEEDED",
+    false,
+  );
+  assert.equal(
+    policies.allowsCached("http://shop.vendor.tld/xx"),
     false,
   );
   assert.equal(
@@ -625,6 +678,7 @@ test("coalesces cache misses, expires exactly, and clears run state", async (t) 
   ]);
   assert.equal(first.allowed, true);
   assert.equal(second.allowed, true);
+  assert.equal(policies.allowsCached("http://shop.vendor.tld/one"), true);
   assert.equal(requests, 1);
 
   now = 9;
@@ -632,10 +686,12 @@ test("coalesces cache misses, expires exactly, and clears run state", async (t) 
   assert.equal(requests, 1);
 
   now = 10;
+  assert.equal(policies.allowsCached("http://shop.vendor.tld/four"), false);
   await policies.check(session, "http://shop.vendor.tld/four");
   assert.equal(requests, 2);
 
   policies.clear();
+  assert.equal(policies.allowsCached("http://shop.vendor.tld/five"), false);
   await policies.check(session, "http://shop.vendor.tld/five");
   assert.equal(requests, 3);
 });

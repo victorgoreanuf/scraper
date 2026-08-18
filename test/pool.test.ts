@@ -475,6 +475,45 @@ test("presence and literal rules consume the bounded rule-candidate work budget"
   }
 });
 
+test("inapplicable candidates do not consume work or worker payload capacity", async () => {
+  let dispatched: DetectorWorkerRequest | undefined;
+  const factory: DetectorWorkerFactory = (_moduleUrl, options) =>
+    asWorker(new FakeWorker(options, "ready", (worker, request) => {
+      dispatched = request;
+      worker.emit("message", {
+        type: "complete",
+        taskId: request.taskId,
+        nextWorkIndex: request.work.length,
+        matches: [match(0)],
+      } satisfies DetectorWorkerResponse);
+    }));
+  const pool = await createDetectorPool(
+    testCatalog([{ pattern: "a" }]),
+    testConfig({ executionsPerDomain: 1 }),
+    factory,
+  );
+
+  try {
+    const ignored = {
+      ...identifiedCandidate("0001", "ignored"),
+      source: "url" as const,
+    };
+    const applicable = identifiedCandidate("0002", "a");
+    const result = await pool.match([ignored, applicable]);
+
+    assert.deepEqual(dispatched?.candidates, [applicable]);
+    assert.deepEqual(dispatched?.work, [{
+      ruleOrdinal: 0,
+      candidateOrdinals: [0],
+    }]);
+    assert.deepEqual(result.matches, [match(0, 1)]);
+    assert.deepEqual(result.errors, []);
+    assert.equal(result.completed, true);
+  } finally {
+    await pool.close();
+  }
+});
+
 test("match materialization stops at the evidence limit with one bounded sentinel", async () => {
   const pool = await createDetectorPool(
     testCatalog([{ pattern: null, matchMode: "presence" }]),
