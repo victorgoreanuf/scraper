@@ -1106,7 +1106,7 @@ A representative direct detection is shown below.
     "browserTransferredBytes": 130000
   },
   "provenance": {
-    "scannerVersion": "0.1.2",
+    "scannerVersion": "0.1.3",
     "runtime": {
       "node": "24.19.0",
       "playwright": "1.62.1",

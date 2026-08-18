@@ -406,11 +406,11 @@ test("resume rejects an older scanner version without modifying the result", asy
   const config = configWithRecordLimit();
   const previousProvenance: Provenance = {
     ...provenanceFor(config),
-    scannerVersion: "0.1.1",
+    scannerVersion: "0.1.2",
   };
   const currentProvenance: Provenance = {
     ...previousProvenance,
-    scannerVersion: "0.1.2",
+    scannerVersion: "0.1.3",
   };
   const runId = "37937a78-f39d-49ed-a51d-6d398ae45a20";
   const bytes = Buffer.from(
