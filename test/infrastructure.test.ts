@@ -2,10 +2,7 @@ import assert from "node:assert/strict";
 import { once } from "node:events";
 import { createServer as createHttpServer } from "node:http";
 import { type Server, type Socket } from "node:net";
-import {
-  setImmediate as waitForImmediate,
-  setTimeout as delay,
-} from "node:timers/promises";
+import { setImmediate as waitForImmediate } from "node:timers/promises";
 import { test, type TestContext } from "node:test";
 
 import {
@@ -581,31 +578,50 @@ test("uses one absolute DNS deadline, cancels the resolver, and ignores late ans
     [["limits", "timeMs", "dnsLookup"], 80],
   ]);
   const session = createSession(t, config);
+  const firstAnswer = Promise.withResolvers<unknown>();
   const lateAnswer = Promise.withResolvers<unknown>();
 
   await runWithInfrastructureRuntime(
     {
-      async resolve(_hostname, recordType) {
+      resolve(_hostname, recordType) {
         if (recordType === "A") {
-          await delay(60);
-          return ["8.8.8.8"];
+          return firstAnswer.promise;
         }
 
         return lateAnswer.promise;
       },
     },
     async (harness) => {
-      const startedAt = performance.now();
-      const result = await collectInfrastructure("shop.vendor.tld", {
+      t.mock.timers.enable({ apis: ["setTimeout"] });
+      let settled = false;
+      const collecting = collectInfrastructure("shop.vendor.tld", {
         config,
         session,
         inspectionPlan: inspectionPlan(["A", "CNAME"]),
         httpResult: failedHttpResult(),
+      }).then((result) => {
+        settled = true;
+        return result;
       });
-      const elapsedMs = performance.now() - startedAt;
+
+      await waitForImmediate();
+      assert.deepEqual(
+        harness.resolveCalls.map(({ recordType }) => recordType),
+        ["A", "CNAME"],
+      );
+
+      t.mock.timers.tick(60);
+      firstAnswer.resolve(["8.8.8.8"]);
+      await waitForImmediate();
+      t.mock.timers.tick(19);
+      await waitForImmediate();
+      assert.equal(settled, false);
+      assert.deepEqual(harness.cancelCalls, [0]);
+
+      t.mock.timers.tick(1);
+      const result = await collecting;
       const beforeLateAnswer = structuredClone(result);
 
-      assert.ok(elapsedMs < 130, `DNS collection took ${elapsedMs}ms`);
       assert.deepEqual(harness.cancelCalls, [2]);
       assert.deepEqual(result.observations.dnsRecords, [
         { type: "A", value: "8.8.8.8" },
