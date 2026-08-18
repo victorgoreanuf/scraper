@@ -993,7 +993,55 @@ test("finalizes the batch but exits nonzero after a required pool is lost", asyn
   }), 1);
   assert.deepEqual(harness.writer.finalizeCalls, [0]);
   assert.match(harness.stderr.text(), /\[COMPLETE\]/u);
-  assert.match(harness.stderr.text(), /CLI_DEGRADED/u);
+  assert.match(harness.stderr.text(), /\[CLI_DEGRADED\] unavailable=browser/u);
+
+  const detector = createHarness({ domains: [] });
+  const detectorDependencies: CliDependencies = {
+    ...detector.dependencies,
+    createDetectorPool: async () => ({
+      catalog: {} as CompiledFingerprintCatalog,
+      isAvailable: () => false,
+      close: async () => undefined,
+    } as unknown as DetectorPool),
+  };
+  assert.equal(await runCli(cliArguments(), {
+    dependencies: detectorDependencies,
+    stdout: detector.stdout,
+    stderr: detector.stderr,
+  }), 1);
+  assert.deepEqual(detector.writer.finalizeCalls, [0]);
+  assert.match(
+    detector.stderr.text(),
+    /\[CLI_DEGRADED\] unavailable=detector\n/u,
+  );
+
+  const both = createHarness({ domains: [] });
+  const bothDependencies: CliDependencies = {
+    ...both.dependencies,
+    createDetectorPool: async () => ({
+      catalog: {} as CompiledFingerprintCatalog,
+      isAvailable: () => false,
+      close: async () => undefined,
+    } as unknown as DetectorPool),
+    createBrowserPool: async () => ({
+      runtime: {
+        playwright: "1.62.1",
+        chromiumRevision: "1234",
+        chromiumVersion: "151.0.7922.34",
+      },
+      isAvailable: () => false,
+      close: async () => undefined,
+    } as unknown as BrowserPool),
+  };
+  assert.equal(await runCli(cliArguments(), {
+    dependencies: bothDependencies,
+    stdout: both.stdout,
+    stderr: both.stderr,
+  }), 1);
+  assert.match(
+    both.stderr.text(),
+    /\[CLI_DEGRADED\] unavailable=detector,browser/u,
+  );
 });
 
 test("keeps domain failures successful at the batch level and progress on stderr", async () => {

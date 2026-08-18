@@ -1538,6 +1538,7 @@ a fatal preflight/orchestration/output error exits `1`, invalid usage exits `2`,
 and graceful SIGINT/SIGTERM cleanup exits `130`/`143`. The first signal aborts
 work and closes input, writer, browser, and detector resources without a false
 summary; a second signal uses the operating system default termination.
+`CLI_DEGRADED` identifies the unavailable `detector`, `browser`, or both pools.
 
 ## Incremental output and resume
 

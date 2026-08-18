@@ -611,7 +611,7 @@ async function executeRun(
   let runFailure: unknown;
   let exitCode = 0;
   let completionLine: string | undefined;
-  let degraded = false;
+  const degradedPools: Array<"detector" | "browser"> = [];
 
   try {
     prepared = await dependencies.openInput(options.inputPath, {
@@ -673,8 +673,9 @@ async function executeRun(
     if (!options.quiet) {
       completionLine = `[COMPLETE] processed=${summary.processedDomains} success=${summary.statusCounts.success} partial=${summary.statusCounts.partial} failed=${summary.statusCounts.failed}\n`;
     }
-    if (!detectorPool.isAvailable() || !browserPool.isAvailable()) {
-      degraded = true;
+    if (!detectorPool.isAvailable()) degradedPools.push("detector");
+    if (!browserPool.isAvailable()) degradedPools.push("browser");
+    if (degradedPools.length > 0) {
       exitCode = 1;
     }
   } catch (error) {
@@ -705,8 +706,8 @@ async function executeRun(
   if (runFailure !== undefined) throw runFailure;
   signal.throwIfAborted();
   if (completionLine !== undefined) stderr(completionLine);
-  if (degraded) {
-    stderr("[CLI_DEGRADED] A required worker pool became unavailable.\n");
+  if (degradedPools.length > 0) {
+    stderr(`[CLI_DEGRADED] unavailable=${degradedPools.join(",")}\n`);
   }
   return exitCode;
 }
