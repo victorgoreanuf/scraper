@@ -2,9 +2,10 @@
 
 > Project status: the application foundation, protected HTTP/browser transports,
 > fail-closed robots policy, static HTTP collector, fingerprint compiler,
-> isolated detector, and protected Playwright/Chromium collector and pool are
-> implemented and tested. DNS/TLS collection, pipeline/output integration, and
-> the runnable CLI remain separate roadmap slices.
+> isolated detector, protected Playwright/Chromium collector and pool, and
+> bounded DNS/TLS infrastructure collection are implemented and tested.
+> Pipeline/output integration and the runnable CLI remain separate roadmap
+> slices.
 
 ## Goal
 
@@ -693,6 +694,56 @@ At production scale, host/container egress rules also restrict Chromium to the
 local proxy. A proxy failure during a domain scan closes the context and yields
 a partial result.
 
+### DNS and TLS infrastructure signals v1
+
+`crawl/infrastructure.ts` owns infrastructure collection policy v1. DNS queries
+always use the exact canonical input domain as owner; they do not follow the
+selected target alias, `www` hostname, redirect hostname, or an address learned
+from page content. The compiled catalog plan supplies the set of required record
+types. The collector issues only those typed `A`, `AAAA`, `CAA`, `CNAME`, `MX`,
+`NS`, `PTR`, `SOA`, `SRV`, or `TXT` queries, in fixed record-type order, and
+never sends `ANY` or speculative queries.
+
+Resolver answers become one string per record using these fixed
+normalizations:
+
+- `A` and `AAAA`: canonical public address text;
+- `CNAME`, `NS`, and `PTR`: lowercase hostname without a trailing dot;
+- `MX`: its normalized lowercase `exchange` without a trailing dot, excluding
+  priority;
+- `SOA`: its normalized lowercase `nsname` without a trailing dot, excluding
+  mailbox and timing fields;
+- `SRV`: its normalized lowercase `name` without a trailing dot, excluding
+  priority, weight, and port;
+- `CAA`: the record value only, excluding its critical flag and property name;
+- `TXT`: the chunks of each TXT item joined with no separator.
+
+Every raw `A`/`AAAA` answer must pass the same canonical public-address policy
+used by protected transport. The collector never keeps a public subset from a
+mixed or otherwise invalid address answer. `recordsPerType` and
+`recordsPerDomain` count raw resolver records before normalization,
+deduplication, or sorting, and all typed queries share one session-wide DNS
+record budget. Normalized observations are then deduplicated and sorted with
+direct `<`/`>` comparison. TXT item and aggregate DNS text limits remain shared
+across that session.
+
+`ENODATA` and `ENOTFOUND` are ordinary absence for the requested type: they add
+neither an error nor a retry. The complete DNS stage has one absolute
+`dnsLookup` deadline, ten seconds by default, shared by every requested type;
+timeout or upstream cancellation cancels outstanding resolver work rather than
+starting a fresh per-type window. The collector performs no DNS retry.
+
+TLS issuer evidence may come only from the already certificate-verified and
+IP-pinned handshake of the selected final HTTPS transport response. The
+infrastructure collector never opens a second TLS connection. If there is no
+final response, the final URL is HTTP, or that verified handshake exposes no
+issuer, TLS collection is skipped without an error. Issuer text is admitted
+only when it fits the 4 KiB UTF-8 `issuerBytes` limit; it is never truncated,
+and overflow emits non-retryable `TLS_LIMIT_EXCEEDED`. Version 1 deliberately
+does not expose DNSSEC state, TLS protocol, cipher, certificate subject, SANs,
+serial numbers, validity dates, or cryptographic material as detector evidence.
+These rules are fixed by `policyVersions.infrastructure: 1`.
+
 ## Observation and detection boundaries
 
 Collectors produce normalized observations such as:
@@ -926,7 +977,7 @@ registry is:
 | Robots | `ROBOTS_DISALLOWED`, `ROBOTS_UNAVAILABLE`, `ROBOTS_LIMIT_EXCEEDED` |
 | HTTP | `HTTP_REQUEST_FAILED`, `HTTP_TIMEOUT`, `HTTP_LIMIT_EXCEEDED`, `HTTP_RESPONSE_LIMIT_EXCEEDED`, `HTTP_DECOMPRESSION_FAILED`, `UNSUPPORTED_CONTENT_TYPE` |
 | DNS | `DNS_LOOKUP_FAILED`, `DNS_NO_ADDRESS`, `DNS_LIMIT_EXCEEDED` |
-| TLS | `TLS_CONNECTION_FAILED`, `TLS_CERTIFICATE_INVALID`, `TLS_TIMEOUT` |
+| TLS | `TLS_CONNECTION_FAILED`, `TLS_CERTIFICATE_INVALID`, `TLS_TIMEOUT`, `TLS_LIMIT_EXCEEDED` |
 | Browser | `BROWSER_UNAVAILABLE`, `BROWSER_NAVIGATION_FAILED`, `BROWSER_TIMEOUT`, `BROWSER_LIMIT_EXCEEDED`, `BROWSER_PROXY_FAILED` |
 | Destination policy | `SSRF_NON_PUBLIC_ADDRESS`, `SSRF_MIXED_ADDRESSES`, `SSRF_REMOTE_ADDRESS_MISMATCH` |
 | Domain | `DOMAIN_DEADLINE_EXCEEDED` |
@@ -1156,6 +1207,7 @@ These are starting values, not final performance claims:
 | Concurrent full scans / browser contexts | 3 |
 | Active domain deadline | 60 seconds |
 | Individual HTTP request | 10 seconds |
+| DNS lookup stage | 10 seconds absolute across all requested record types |
 | Browser page including settle | 15 seconds |
 | Canonical target candidates | 4 |
 | Redirects per chain | 5 |
@@ -1175,6 +1227,7 @@ These are starting values, not final performance claims:
 | Browser transfer | 15 MiB per page / 30 MiB per domain |
 | Cookies | 100 per domain; 256-code-unit name / 4 KiB value / 64 KiB total |
 | DNS | 32 records per type / 128 total; 4 KiB TXT item / 64 KiB DNS text total |
+| TLS issuer | 4 KiB UTF-8, never truncated |
 | robots.txt | 512 KiB; 5,000 lines; 500 rules; 512 code units per rule |
 | Robots matching work | 1,000,000 pattern-path character states per checked URL |
 | Extracted link/resource URLs | 5,000 per page |
@@ -1788,7 +1841,7 @@ are recorded in `THIRD_PARTY_NOTICES.md`.
 - [x] Implement the static HTTP observation collector.
 - [x] Implement the fingerprint catalog compiler and HTTP/browser detector.
 - [x] Implement the protected browser collector and bounded Chromium pool.
-- [ ] Add DNS/TLS signals.
+- [x] Add bounded DNS/TLS infrastructure signals.
 - [ ] Add incremental output, resume, and summary generation.
 - [ ] Run deterministic tests and a small real-site smoke test.
 - [ ] Scan all 200 domains and analyze misses and false positives.
@@ -1817,5 +1870,6 @@ Coding starts only after these decisions are explicit:
 
 The readiness gate, application foundation, protected HTTP/browser transports,
 robots policy, static and rendered observation collectors, fingerprint
-compiler, isolated detector, and bounded Chromium pool are complete. DNS/TLS,
-pipeline/output integration, and the runnable CLI remain separate slices.
+compiler, isolated detector, bounded Chromium pool, and DNS/TLS infrastructure
+collector are complete. Pipeline/output integration and the runnable CLI remain
+separate slices.

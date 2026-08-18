@@ -96,6 +96,8 @@ function testCatalog(inputs: readonly RuleInput[]): CompiledFingerprintCatalog {
       dom: [],
       javascript: [],
       probePaths: [],
+      dnsRecordTypes: [],
+      tlsIssuer: false,
     },
     declarationCount: rules.length,
     relationshipCount: 0,

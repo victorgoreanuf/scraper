@@ -10,6 +10,7 @@ import {
   type Evidence,
   type EvidenceSource,
   type HttpEntryResult,
+  type InfrastructureObservations,
   type Inference,
   type PageId,
   type ScanError,
@@ -30,6 +31,7 @@ export interface DetectHttpContext {
   readonly pool: DetectorPool;
   readonly config: ScanConfig;
   readonly browserPages?: readonly BrowserPageObservations[];
+  readonly infrastructure?: InfrastructureObservations;
   readonly signal?: AbortSignal;
 }
 
@@ -41,7 +43,7 @@ export interface DetectHttpResult {
 }
 
 interface CandidateDraft {
-  readonly collector: "http" | "browser";
+  readonly collector: Collector;
   readonly kind: "presence" | "value";
   readonly source: EvidenceSource;
   readonly pageId: PageId | null;
@@ -50,7 +52,7 @@ interface CandidateDraft {
 }
 
 interface CollectedDetectorCandidate extends DetectorCandidate {
-  readonly collector: "http" | "browser";
+  readonly collector: Collector;
   readonly pageId: PageId | null;
 }
 
@@ -212,11 +214,12 @@ function candidateIdentity(candidate: CandidateDraft): string {
 function collectCandidates(
   input: HttpEntryResult,
   browserPages: readonly BrowserPageObservations[],
+  infrastructure: InfrastructureObservations | undefined,
   config: ScanConfig,
 ): readonly CollectedDetectorCandidate[] {
   const candidates: CandidateDraft[] = [];
   const add = (
-    collector: "http" | "browser",
+    collector: Collector,
     kind: "presence" | "value",
     source: EvidenceSource,
     pageId: PageId | null,
@@ -299,6 +302,13 @@ function collectCandidates(
     for (const script of page.scriptBodies) {
       add("browser", "value", "script_content", script.pageId, null, script.content);
     }
+  }
+
+  for (const record of infrastructure?.dnsRecords ?? []) {
+    add("dns", "value", "dns_record", null, record.type, record.value);
+  }
+  if (infrastructure?.tlsIssuer !== null && infrastructure?.tlsIssuer !== undefined) {
+    add("tls", "value", "tls_issuer", null, null, infrastructure.tlsIssuer);
   }
 
   const unique = new Map<string, CandidateDraft>();
@@ -1140,6 +1150,7 @@ export async function detectHttp(
   const candidates = collectCandidates(
     input,
     context.browserPages ?? [],
+    context.infrastructure,
     context.config,
   );
   if (candidates.length === 0) {

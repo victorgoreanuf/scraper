@@ -611,6 +611,8 @@ test("preserves Host and SNI for trusted TLS and rejects a trusted wrong name", 
     process.stdout.write(JSON.stringify({
       statusCode: acceptedResponse.statusCode,
       body: new TextDecoder().decode(acceptedResponse.body),
+      tlsIssuer: acceptedResponse.tlsIssuer,
+      tlsHandshakeMs: acceptedResponse.tlsHandshakeMs,
       wrongNameCode,
     }));
   `;
@@ -630,14 +632,18 @@ test("preserves Host and SNI for trusted TLS and rejects a trusted wrong name", 
   const childResult = JSON.parse(String(stdout)) as {
     readonly statusCode: number;
     readonly body: string;
+    readonly tlsIssuer: string | null;
+    readonly tlsHandshakeMs: number | null;
     readonly wrongNameCode: string;
   };
 
-  assert.deepEqual(childResult, {
-    statusCode: 200,
-    body: "secure",
-    wrongNameCode: "TLS_CERTIFICATE_INVALID",
-  });
+  assert.equal(childResult.statusCode, 200);
+  assert.equal(childResult.body, "secure");
+  assert.equal(childResult.wrongNameCode, "TLS_CERTIFICATE_INVALID");
+  assert.equal(typeof childResult.tlsIssuer, "string");
+  assert.ok((childResult.tlsIssuer?.length ?? 0) > 0);
+  assert.equal(Number.isSafeInteger(childResult.tlsHandshakeMs), true);
+  assert.ok((childResult.tlsHandshakeMs ?? -1) >= 0);
   assert.deepEqual(requests, [{
     host: "shop.vendor.tld",
     servername: "shop.vendor.tld",

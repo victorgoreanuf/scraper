@@ -46,6 +46,7 @@ const canonicalConfig: JsonRecord = {
     relationships: 1,
     detector: 1,
     browserEgress: 1,
+    infrastructure: 1,
     output: 1,
   },
   registryPins: {
@@ -80,6 +81,7 @@ const canonicalConfig: JsonRecord = {
       browserSettle: 2_000,
       retryAfterCap: 2_000,
       robotsCache: 86_400_000,
+      dnsLookup: 10_000,
     },
     parquet: {
       rows: 1_000_000,
@@ -142,6 +144,9 @@ const canonicalConfig: JsonRecord = {
       recordsPerDomain: 128,
       txtItemBytes: 4_096,
       textBytesPerDomain: 65_536,
+    },
+    tls: {
+      issuerBytes: 4_096,
     },
     robots: {
       bodyBytes: 524_288,
@@ -366,6 +371,7 @@ test("accepts safe lower resource limits", () => {
   setAtPath(candidate, ["limits", "concurrency", "globalHttp"], 1);
   setAtPath(candidate, ["limits", "timeMs", "browserSettle"], 0);
   setAtPath(candidate, ["limits", "timeMs", "retryAfterCap"], 0);
+  setAtPath(candidate, ["limits", "timeMs", "dnsLookup"], 1);
   setAtPath(candidate, ["limits", "target", "redirectsPerChain"], 0);
   setAtPath(candidate, ["limits", "http", "transientRetriesPerRequest"], 0);
   setAtPath(candidate, ["limits", "pages", "catalogProbesPerDomain"], 0);
@@ -379,6 +385,7 @@ test("accepts safe lower resource limits", () => {
   setAtPath(candidate, ["limits", "detector", "workerOldHeapBytes"], 16_777_216);
   setAtPath(candidate, ["limits", "detector", "workerYoungHeapBytes"], 4_194_304);
   setAtPath(candidate, ["limits", "detector", "workerStackBytes"], 1_048_576);
+  setAtPath(candidate, ["limits", "tls", "issuerBytes"], 1);
   setAtPath(candidate, ["limits", "output", "jsonlRecordBytes"], 65_536);
   setAtPath(candidate, ["limits", "output", "evidencePerTechnology"], 1);
 
@@ -393,11 +400,13 @@ test("rejects Parquet and representative scan limits above their v1 caps", () =>
     [["limits", "parquet", "selectedChunkCompressedBytes"], 33_554_433],
     [["limits", "parquet", "selectedChunkUncompressedBytes"], 33_554_433],
     [["limits", "target", "candidates"], 5],
+    [["limits", "timeMs", "dnsLookup"], 10_001],
     [["limits", "hostname", "inputCodeUnits"], 2_049],
     [["limits", "http", "transactionsPerDomain"], 41],
     [["limits", "pages", "topLevelPerDomain"], 4],
     [["limits", "pages", "metadataPerPage"], 5_001],
     [["limits", "browser", "transferBytesPerDomain"], 31_457_281],
+    [["limits", "tls", "issuerBytes"], 4_097],
     [["limits", "detector", "workers"], 3],
     [["limits", "detector", "catalogFiles"], 65],
     [["limits", "detector", "catalogFileBytes"], 1_048_577],
@@ -423,6 +432,8 @@ test("rejects negative, fractional, missing, and unknown values", () => {
   const invalidMutations: ReadonlyArray<readonly [readonly string[], unknown]> = [
     [["limits", "parquet", "rows"], 0],
     [["limits", "timeMs", "activeDomain"], -1],
+    [["limits", "timeMs", "dnsLookup"], 0],
+    [["limits", "tls", "issuerBytes"], 0],
     [["limits", "http", "headerFields"], 1.5],
     [["limits", "detector", "catalogFiles"], 28],
     [["limits", "detector", "catalogFileBytes"], 524_287],
@@ -462,6 +473,7 @@ test("rejects changes to fixed input, registry, target, and security policies", 
     [["inputPolicy", "selectedColumn"], "domain"],
     [["inputPolicy", "allowedCodecs"], ["SNAPPY", "UNCOMPRESSED"]],
     [["policyVersions", "hostname"], 2],
+    [["policyVersions", "infrastructure"], 2],
     [["policyVersions", "output"], 2],
     [["registryPins", "ianaIpv4UpdatedOn"], "2026-01-01"],
     [

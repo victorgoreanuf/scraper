@@ -420,7 +420,10 @@ function extractCookies(
 }
 
 function responseObservations(
-  response: Pick<ProtectedTransportResponse, "url" | "statusCode" | "headers">,
+  response: Pick<
+    ProtectedTransportResponse,
+    "url" | "statusCode" | "headers" | "tlsIssuer" | "tlsHandshakeMs"
+  >,
   redirects: readonly HttpRedirectObservation[],
   config: ScanConfig,
 ): HttpResponseObservations {
@@ -436,6 +439,8 @@ function responseObservations(
     headers: Object.freeze(headers),
     cookies: cookies.cookies,
     cookiesTruncated: cookies.truncated,
+    tlsIssuer: response.tlsIssuer,
+    tlsHandshakeMs: response.tlsHandshakeMs,
   });
 }
 
@@ -879,7 +884,13 @@ function htmlHeadResponse(
   config: ScanConfig,
 ): HttpResponseObservations {
   return responseObservations(
-    { url: head.url, statusCode: head.statusCode, headers: head.headers },
+    {
+      url: head.url,
+      statusCode: head.statusCode,
+      headers: head.headers,
+      tlsIssuer: head.tlsIssuer,
+      tlsHandshakeMs: head.tlsHandshakeMs,
+    },
     redirects,
     config,
   );

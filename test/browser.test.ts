@@ -86,6 +86,8 @@ const inspectionPlan: CatalogInspectionPlan = Object.freeze({
     demand: Object.freeze({ presence: false, value: true }),
   })]),
   probePaths: Object.freeze([]),
+  dnsRecordTypes: Object.freeze([]),
+  tlsIssuer: false,
 });
 
 function setConfigValue(

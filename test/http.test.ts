@@ -24,6 +24,7 @@ import type {
   RobotsCheck,
   RobotsPolicyService,
 } from "../src/crawl/robots.ts";
+import type { DnsRecordObservation } from "../src/model.ts";
 import {
   installTransportRuntimeHook,
   setupTransportRuntime,
@@ -103,6 +104,8 @@ function response(
     ),
     body,
     redirectUrl: options.redirectUrl ?? null,
+    tlsIssuer: null,
+    tlsHandshakeMs: null,
   });
 }
 
@@ -121,6 +124,8 @@ function deliver(
       url: source.url,
       statusCode: source.statusCode,
       headers: source.headers,
+      tlsIssuer: source.tlsIssuer,
+      tlsHandshakeMs: source.tlsHandshakeMs,
     };
     keepBody = request.acceptBody(head);
     admitted?.push(keepBody);
@@ -166,6 +171,10 @@ class ScriptedSession implements ProtectedTransportSession {
 
   getSignal(): AbortSignal {
     return this.signal;
+  }
+
+  admitDnsRecords(records: readonly DnsRecordObservation[]) {
+    return Object.freeze({ records: Object.freeze(records), limitExceeded: false });
   }
 
   getUsage(): ProtectedTransportUsage {
@@ -574,6 +583,8 @@ test("preserves the accepted response head when body collection fails", async ()
           { name: "x-platform", value: "bounded-head" },
           { name: "set-cookie", value: "platform=shop" },
         ],
+        tlsIssuer: "CN=Trusted Test CA",
+        tlsHandshakeMs: 1,
       };
       assert.equal(request.acceptBody?.(head), true);
       throw new ProtectedTransportError(
@@ -595,6 +606,8 @@ test("preserves the accepted response head when body collection fails", async ()
 
   assert.equal(result.page.collectionState, "failed");
   assert.equal(result.page.response.finalNetworkUrl, entryUrl);
+  assert.equal(result.page.response.tlsIssuer, "CN=Trusted Test CA");
+  assert.equal(result.page.response.tlsHandshakeMs, 1);
   assert.deepEqual(result.page.response.cookies, [{ name: "platform", value: "shop" }]);
   assert.deepEqual(errorCodes(result), ["HTTP_RESPONSE_LIMIT_EXCEEDED"]);
 });

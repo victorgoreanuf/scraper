@@ -17,10 +17,12 @@ import { Ajv2020, type AnySchemaObject } from "ajv/dist/2020.js";
 import { load as loadHtml } from "cheerio";
 
 import type { ScanConfig } from "../config.ts";
+import { DNS_RECORD_TYPES } from "../model.ts";
 import type {
   CatalogDomFactKind,
   CatalogInspectionPlan,
   Category,
+  DnsRecordType,
   EvidenceSource,
 } from "../model.ts";
 
@@ -97,18 +99,7 @@ const ruleSignals: readonly EvidenceSource[] = [
   "probe",
 ];
 const signalRank = new Map(ruleSignals.map((signal, index) => [signal, index]));
-const supportedDnsTypes = new Set([
-  "A",
-  "AAAA",
-  "CAA",
-  "CNAME",
-  "MX",
-  "NS",
-  "PTR",
-  "SOA",
-  "SRV",
-  "TXT",
-]);
+const supportedDnsTypes = new Set<string>(DNS_RECORD_TYPES);
 
 export type CatalogErrorCode =
   | "CATALOG_IO_FAILED"
@@ -254,6 +245,8 @@ function createInspectionPlan(
 ): CatalogInspectionPlan {
   const domBySelector = new Map<string, Map<string, MutableDomFact>>();
   const javascriptByPath = new Map<string, MutableFactDemand>();
+  const dnsRecordTypes = new Set<DnsRecordType>();
+  let tlsIssuer = false;
 
   for (const rule of rules) {
     if (rule.source === "dom") {
@@ -301,6 +294,22 @@ function createInspectionPlan(
       };
       addRuleDemand(demand, rule.matchMode);
       javascriptByPath.set(path, demand);
+      continue;
+    }
+
+    if (rule.source === "dns_record") {
+      if (rule.locator === null || !supportedDnsTypes.has(rule.locator)) {
+        throw new FingerprintCatalogError(
+          "CATALOG_INVALID",
+          "Compiled DNS rule is missing a supported record type",
+        );
+      }
+      dnsRecordTypes.add(rule.locator as DnsRecordType);
+      continue;
+    }
+
+    if (rule.source === "tls_issuer") {
+      tlsIssuer = true;
     }
   }
 
@@ -336,6 +345,8 @@ function createInspectionPlan(
         },
       })),
     probePaths: [...probePaths].sort(compareString),
+    dnsRecordTypes: DNS_RECORD_TYPES.filter((type) => dnsRecordTypes.has(type)),
+    tlsIssuer,
   };
 }
 

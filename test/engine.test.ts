@@ -30,6 +30,7 @@ import {
   type HttpEntryResult,
   type HttpPageObservations,
   type HttpResponseObservations,
+  type InfrastructureObservations,
   type ScanError,
 } from "../src/model.ts";
 
@@ -148,6 +149,8 @@ function catalog(
       dom: [],
       javascript: [],
       probePaths: [],
+      dnsRecordTypes: [],
+      tlsIssuer: false,
     },
     declarationCount: rules.length,
     relationshipCount: technologies.reduce(
@@ -177,6 +180,8 @@ function response(
     headers: [],
     cookies: [],
     cookiesTruncated: false,
+    tlsIssuer: null,
+    tlsHandshakeMs: null,
     ...overrides,
   };
 }
@@ -397,6 +402,246 @@ test("maps, normalizes, deduplicates, and ranks only supported HTTP candidates",
     observed.map((item) => item.id),
     [...observed.map((item) => item.id)].sort(),
   );
+});
+
+test("orders infrastructure candidates and publishes bounded DNS and TLS evidence", async () => {
+  const rules = [
+    rule(1, "Infrastructure service", {
+      source: "dns_record",
+      locator: "A",
+      pattern: "184\\.216",
+    }),
+    rule(2, "Infrastructure service", {
+      source: "dns_record",
+      locator: "CNAME",
+      pattern: "edge\\.vendor",
+    }),
+    rule(3, "Infrastructure service", {
+      source: "dns_record",
+      locator: "TXT",
+      pattern: "verification=fixture",
+    }),
+    rule(4, "Infrastructure service", {
+      source: "tls_issuer",
+      locator: null,
+      pattern: "Alpha Root CA",
+      matchMode: "literal",
+    }),
+  ];
+  const fingerprintCatalog = catalog(
+    [technology("Infrastructure service")],
+    rules,
+  );
+  const infrastructure = {
+    dnsRecords: [
+      { type: "TXT", value: "verification=fixture-secret" },
+      { type: "CNAME", value: "edge.vendor.tld" },
+      { type: "A", value: "93.184.216.34" },
+      { type: "A", value: "93.184.216.34" },
+    ],
+    tlsIssuer: "C=US, O=Fixture, CN=Alpha Root CA 2026",
+  } as const satisfies InfrastructureObservations;
+  const failedInput: HttpEntryResult = {
+    kind: "failed",
+    response: null,
+    robots: [],
+    errors: [{
+      stage: "http",
+      code: "HTTP_REQUEST_FAILED",
+      pageId: null,
+      retryable: true,
+      message: "The static request failed.",
+      ruleId: null,
+      signal: null,
+      limit: null,
+      catalogRevision: null,
+    }],
+  };
+  let observed: readonly DetectorCandidate[] = [];
+  const result = await detectHttp(failedInput, {
+    catalog: fingerprintCatalog,
+    pool: fakePool(fingerprintCatalog, (candidates) => {
+      observed = candidates;
+      return emptyMatchResult({
+        matches: [
+          workerMatch(candidates, 0, (candidate) => candidate.key === "A", {
+            index: "93.184.216.34".indexOf("184.216"),
+            length: "184.216".length,
+          }),
+          workerMatch(
+            candidates,
+            1,
+            (candidate) => candidate.key === "CNAME",
+            { length: "edge.vendor".length },
+          ),
+          workerMatch(candidates, 2, (candidate) => candidate.key === "TXT", {
+            length: "verification=fixture".length,
+          }),
+          workerMatch(
+            candidates,
+            3,
+            (candidate) => candidate.source === "tls_issuer",
+            {
+              index: infrastructure.tlsIssuer.indexOf("Alpha Root CA"),
+              length: "Alpha Root CA".length,
+            },
+          ),
+        ],
+      });
+    }),
+    config: defaultConfig,
+    infrastructure,
+  });
+  type InfrastructureCandidate = DetectorCandidate & {
+    readonly collector: "dns" | "tls";
+    readonly pageId: null;
+  };
+  const infrastructureCandidates = observed.filter(
+    (candidate) => candidate.source === "dns_record"
+      || candidate.source === "tls_issuer",
+  ) as unknown as readonly InfrastructureCandidate[];
+
+  assert.deepEqual(
+    infrastructureCandidates.map(
+      ({ collector, source, pageId, key, value }) => ({
+        collector,
+        source,
+        pageId,
+        key,
+        value,
+      }),
+    ),
+    [
+      {
+        collector: "dns",
+        source: "dns_record",
+        pageId: null,
+        key: "A",
+        value: "93.184.216.34",
+      },
+      {
+        collector: "dns",
+        source: "dns_record",
+        pageId: null,
+        key: "CNAME",
+        value: "edge.vendor.tld",
+      },
+      {
+        collector: "dns",
+        source: "dns_record",
+        pageId: null,
+        key: "TXT",
+        value: "verification=fixture-secret",
+      },
+      {
+        collector: "tls",
+        source: "tls_issuer",
+        pageId: null,
+        key: null,
+        value: infrastructure.tlsIssuer,
+      },
+    ],
+  );
+  assert.deepEqual(
+    infrastructureCandidates.map((candidate) => candidate.id),
+    ["c00000000", "c00000001", "c00000002", "c00000003"],
+  );
+  assert.equal(result.signalAdmitted, true);
+  assert.equal(result.completed, true);
+  assert.deepEqual(result.errors, []);
+
+  const detected = result.technologies[0];
+  assert.equal(detected?.name, "Infrastructure service");
+  const evidenceByKey = new Map(
+    detected?.evidence.map((evidence) => [evidence.key, evidence]),
+  );
+  assert.deepEqual(evidenceByKey.get("A")?.match, {
+    kind: "value",
+    value: "93.184.216.34",
+    truncated: false,
+  });
+  assert.deepEqual(evidenceByKey.get("CNAME")?.match, {
+    kind: "value",
+    value: "edge.vendor.tld",
+    truncated: false,
+  });
+  assert.deepEqual(evidenceByKey.get("TXT")?.match, {
+    kind: "redacted",
+    value: null,
+    truncated: false,
+  });
+  assert.deepEqual(evidenceByKey.get(null)?.match, {
+    kind: "value",
+    value: "Alpha Root CA",
+    truncated: false,
+  });
+  assert.deepEqual(
+    detected?.evidence.map((evidence) => [
+      evidence.collector,
+      evidence.pageId,
+      evidence.key,
+    ]),
+    [
+      ["dns", null, "A"],
+      ["dns", null, "CNAME"],
+      ["dns", null, "TXT"],
+      ["tls", null, null],
+    ],
+  );
+
+  const configDigest = computeConfigDigest(defaultConfig);
+  const domainResult: DomainResult = {
+    schemaVersion: 1,
+    runId: "37937a78-f39d-49ed-a51d-6d398ae45a20",
+    domain: "shop.vendor.tld",
+    scannedAt: "2026-08-17T00:00:00.000Z",
+    status: "partial",
+    finalUrl: null,
+    scanMode: "full",
+    pages: [],
+    technologies: result.technologies,
+    errors: failedInput.errors,
+    timings: {
+      totalMs: 1,
+      targetMs: 0,
+      robotsMs: null,
+      httpMs: 0,
+      dnsMs: 0,
+      tlsMs: 0,
+      browserMs: null,
+      detectMs: 0,
+    },
+    usage: {
+      httpRequests: 1,
+      browserRequests: 0,
+      retries: 0,
+      pagesVisited: 0,
+      probesIssued: 0,
+      scriptBodiesInspected: 0,
+      staticTransferredBytes: 0,
+      browserTransferredBytes: 0,
+    },
+    provenance: {
+      scannerVersion: "0.1.0",
+      runtime: {
+        node: "24.19.0",
+        playwright: "1.62.1",
+        chromiumRevision: "chromium-fixture",
+      },
+      catalog: {
+        source: fingerprintCatalog.source,
+        revision: fingerprintCatalog.revision,
+        digest: fingerprintCatalog.digest,
+      },
+      configDigest,
+    },
+  };
+
+  assert.equal(validateDomainResult(domainResult, {
+    scanConfig: defaultConfig,
+    expectedConfigDigest: configDigest,
+    signalAdmitted: result.signalAdmitted,
+  }), domainResult);
 });
 
 test("merges browser observations once and preserves every evidence page", async () => {

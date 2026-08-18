@@ -8,6 +8,7 @@ import {
 } from "../src/config.ts";
 import {
   DomainResultValidationError,
+  createEvidenceValueMatch,
   sanitizeEvidenceKey,
   sanitizeUrl,
   validateDomainResult,
@@ -190,6 +191,89 @@ test("sanitizes URLs deterministically", () => {
     () => sanitizeUrl(expandingQuery),
     /Sanitized URL exceeds the configured code-unit limit/,
   );
+});
+
+test("publishes whole safe DNS values and only the matched TLS issuer fragment", () => {
+  const dnsMatch = (
+    key: string,
+    observedValue: string,
+    matchedValue: string,
+  ) => createEvidenceValueMatch({
+    source: "dns_record",
+    key,
+    observedValue,
+    matchedValue,
+    scanConfig,
+  });
+  const safeDnsRecords = [
+    ["A", "93.184.216.34", "184.216"],
+    ["AAAA", "2606:2800:220:1:248:1893:25c8:1946", "248:1893"],
+    ["CNAME", "edge.vendor.tld", "edge.vendor"],
+    ["MX", "mail.vendor.tld", "mail.vendor"],
+    ["NS", "ns1.vendor.tld", "ns1"],
+    ["PTR", "ptr.vendor.tld", "ptr.vendor"],
+    ["SRV", "service.vendor.tld", "service.vendor"],
+  ] as const;
+
+  for (const [key, observedValue, matchedValue] of safeDnsRecords) {
+    assert.deepEqual(dnsMatch(key, observedValue, matchedValue), {
+      kind: "value",
+      value: observedValue,
+      truncated: false,
+    });
+  }
+
+  for (const [key, value] of [
+    ["TXT", "google-site-verification=fixture-secret"],
+    ["CAA", "letsencrypt.org"],
+    ["SOA", "ns1.vendor.tld hostmaster.vendor.tld 1 2 3 4 5"],
+  ] as const) {
+    assert.deepEqual(dnsMatch(key, value, "vendor"), {
+      kind: "redacted",
+      value: null,
+      truncated: false,
+    });
+  }
+
+  assert.deepEqual(dnsMatch("A", "10.0.0.1", "10.0"), {
+    kind: "redacted",
+    value: null,
+    truncated: false,
+  });
+  assert.deepEqual(dnsMatch("CNAME", "alice@example.invalid", "example"), {
+    kind: "redacted",
+    value: null,
+    truncated: false,
+  });
+
+  const lowerConfigValue = structuredClone(scanConfig) as unknown as {
+    limits: { evidence: { matchCodePoints: number } };
+  };
+  lowerConfigValue.limits.evidence.matchCodePoints = 4;
+  const lowerConfig = parseScanConfig(lowerConfigValue);
+  assert.deepEqual(createEvidenceValueMatch({
+    source: "dns_record",
+    key: "A",
+    observedValue: "93.184.216.34",
+    matchedValue: "93.184",
+    scanConfig: lowerConfig,
+  }), {
+    kind: "redacted",
+    value: null,
+    truncated: false,
+  });
+
+  assert.deepEqual(createEvidenceValueMatch({
+    source: "tls_issuer",
+    key: null,
+    observedValue: "C=US, O=Fixture, CN=Alpha Root CA 2026",
+    matchedValue: "Alpha Root CA",
+    scanConfig,
+  }), {
+    kind: "value",
+    value: "Alpha Root CA",
+    truncated: false,
+  });
 });
 
 test("accepts sanitized query names through semantic URL validation", () => {
@@ -658,6 +742,31 @@ test("requires registered ordered errors and checks signal-aware status", () => 
       expectedConfigDigest: configDigest,
       signalAdmitted: true,
     })
+  );
+
+  const tlsLimitError: ScanError = {
+    ...error,
+    stage: "tls",
+    code: "TLS_LIMIT_EXCEEDED",
+    retryable: false,
+    message: "TLS certificate observations exceeded a safety limit.",
+  };
+  assert.doesNotThrow(() =>
+    validateDomainResult(makeResult({
+      status: "partial",
+      errors: [tlsLimitError],
+    }), {
+      scanConfig,
+      expectedConfigDigest: configDigest,
+      signalAdmitted: true,
+    })
+  );
+  expectSemanticFailure(
+    makeResult({
+      status: "partial",
+      errors: [{ ...tlsLimitError, stage: "dns" }],
+    }),
+    /incompatible with its stage/,
   );
 
   const unregistered = structuredClone(partial) as unknown as {

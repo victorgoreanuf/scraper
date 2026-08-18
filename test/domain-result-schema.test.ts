@@ -197,6 +197,28 @@ function makeDnsResult(): JsonObject {
   return result;
 }
 
+function makeTlsResult(): JsonObject {
+  const result = makeResult();
+  const technology = firstTechnology(result);
+  technology.version = null;
+  technology.pageIds = [];
+
+  const evidence = firstEvidence(result);
+  evidence.collector = "tls";
+  evidence.source = "tls_issuer";
+  evidence.pageId = null;
+  evidence.key = null;
+  evidence.match = {
+    kind: "value",
+    value: "Alpha Root CA",
+    truncated: false,
+  };
+  evidence.pattern = "Alpha Root CA";
+  evidence.version = null;
+
+  return result;
+}
+
 function expectValid(value: unknown): void {
   assert.equal(
     validateDomainResult(value),
@@ -299,6 +321,9 @@ test("accepts the direct, inferred, redacted, partial, and failed shapes", () =>
   const dnsEvidence = makeDnsResult();
   expectValid(dnsEvidence);
 
+  const tlsEvidence = makeTlsResult();
+  expectValid(tlsEvidence);
+
   const networkUrlEvidence = makeResult();
   const networkTechnology = firstTechnology(networkUrlEvidence);
   networkTechnology.version = null;
@@ -325,6 +350,13 @@ test("accepts the direct, inferred, redacted, partial, and failed shapes", () =>
   };
   txtEvidence.pattern = "google-site-verification=.+";
   expectValid(redactedTxtEvidence);
+
+  const tlsLimit = makePartialResult();
+  const tlsLimitError = firstError(tlsLimit);
+  tlsLimitError.stage = "tls";
+  tlsLimitError.code = "TLS_LIMIT_EXCEEDED";
+  tlsLimitError.message = "TLS certificate observations exceeded a safety limit.";
+  expectValid(tlsLimit);
 
   expectValid(makePartialResult());
 
@@ -626,6 +658,14 @@ test("enforces evidence redaction and collector-source boundaries", () => {
   const dnsWithoutType = makeDnsResult();
   firstEvidence(dnsWithoutType).key = null;
   expectInvalid(dnsWithoutType);
+
+  const wrongTlsCollector = makeTlsResult();
+  firstEvidence(wrongTlsCollector).collector = "dns";
+  expectInvalid(wrongTlsCollector);
+
+  const tlsWithPage = makeTlsResult();
+  firstEvidence(tlsWithPage).pageId = "p1";
+  expectInvalid(tlsWithPage);
 
   const browserWithoutPage = makeResult();
   const browserEvidence = firstEvidence(browserWithoutPage);

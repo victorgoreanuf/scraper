@@ -56,6 +56,9 @@
 - Colectorul browser folosește un pool FIFO bounded de procese Chromium
   reutilizabile, fiecare cu proxy validant propriu, preflight canary obligatoriu
   și cel mult o înlocuire după pierderea procesului.
+- Colectorul de infrastructură interoghează numai tipurile DNS cerute de
+  catalog pentru domeniul input canonic și reutilizează exclusiv issuerul TLS
+  din handshake-ul HTTPS final deja verificat și pin-uit.
 
 ## Structura proiectului
 
@@ -418,6 +421,42 @@ Bugetele exacte și failure semantics sunt contractul unic din secțiunile
 HTTP rulează pentru toate domeniile, iar probele, paginile interne și browserul
 cu scripturile deja descărcate de el sunt tier-uri selective măsurate împotriva
 baseline-ului `full`.
+
+## Decizia colectării semnalelor DNS/TLS
+
+Politica este fixată prin `policyVersions.infrastructure: 1` și implementată în
+`crawl/infrastructure.ts`. Ownerul DNS este întotdeauna domeniul input canonic,
+nu aliasul `www`, hostname-ul final ori un hostname extras din pagină. Planul
+compilat al catalogului cere explicit tipurile necesare, iar colectorul emite
+numai query-uri typed pentru `A`, `AAAA`, `CAA`, `CNAME`, `MX`, `NS`, `PTR`,
+`SOA`, `SRV` și `TXT`, în ordine fixă. Nu folosim `ANY`, query-uri speculative
+sau DNSSEC în v1.
+
+Normalizarea DNS produce un string per record. `A`/`AAAA` folosesc adresa
+publică în forma canonică. `CNAME`/`NS`/`PTR` folosesc hostname lowercase fără
+punct terminal; `MX` păstrează numai `exchange` normalizat, `SOA` numai
+`nsname`, iar `SRV` numai `name`. `CAA` păstrează numai value-ul, iar fiecare
+item `TXT` își unește chunkurile fără separator. Toate răspunsurile brute
+`A`/`AAAA` trebuie să treacă politica adreselor publice; nu păstrăm subsetul
+public al unui răspuns mixt sau invalid.
+
+Limitele de 32 records per tip și 128 per domeniu se consumă pe răspunsurile
+brute, înainte de deduplicare, iar toate query-urile sesiunii folosesc același
+buget. După normalizare, valorile se deduplică și se sortează cu comparație
+directă `<`/`>`. Bugetele TXT de 4 KiB per item și 64 KiB text DNS total sunt
+tot comune sesiunii. `ENODATA` și `ENOTFOUND` înseamnă absență normală pentru
+tipul cerut, fără eroare sau retry. Întregul stage are un singur deadline absolut
+`dnsLookup` de maximum 10 secunde; timeoutul sau anularea din exterior anulează
+resolverul și nu pornește ferestre noi per tip. Colectorul DNS nu face retry.
+
+Issuerul TLS se preia numai din handshake-ul răspunsului HTTPS final deja
+validat de transport: certificat verificat, hostname/SNI păstrat și conexiune
+pin-uită la IP-ul admis. Nu deschidem o a doua conexiune TLS. Lipsa unui răspuns
+final, un final HTTP ori lipsa issuerului în handshake înseamnă skip fără
+eroare. Issuerul are limita `issuerBytes` de maximum 4 KiB UTF-8, nu se
+trunchiază, iar depășirea emite `TLS_LIMIT_EXCEEDED` non-retryable. Nu expunem
+DNSSEC, versiunea protocolului TLS, cipherul, subjectul, SAN-urile, serialul,
+validitatea sau material criptografic ca semnale de detecție în v1.
 
 ## Decizia rezultatului și a dovezilor
 

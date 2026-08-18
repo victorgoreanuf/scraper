@@ -25,6 +25,7 @@ export type ScanConfig = {
     readonly relationships: 1;
     readonly detector: 1;
     readonly browserEgress: 1;
+    readonly infrastructure: 1;
     readonly output: 1;
   };
   readonly registryPins: {
@@ -59,6 +60,7 @@ export type ScanConfig = {
       readonly browserSettle: number;
       readonly retryAfterCap: number;
       readonly robotsCache: number;
+      readonly dnsLookup: number;
     };
     readonly parquet: {
       readonly rows: number;
@@ -121,6 +123,9 @@ export type ScanConfig = {
       readonly recordsPerDomain: number;
       readonly txtItemBytes: number;
       readonly textBytesPerDomain: number;
+    };
+    readonly tls: {
+      readonly issuerBytes: number;
     };
     readonly robots: {
       readonly bodyBytes: number;
@@ -343,6 +348,7 @@ export function createDefaultScanConfig(userAgent: string): ScanConfig {
       relationships: 1,
       detector: 1,
       browserEgress: 1,
+      infrastructure: 1,
       output: 1,
     },
     registryPins: {
@@ -377,6 +383,7 @@ export function createDefaultScanConfig(userAgent: string): ScanConfig {
         browserSettle: 2_000,
         retryAfterCap: 2_000,
         robotsCache: 86_400_000,
+        dnsLookup: 10_000,
       },
       parquet: {
         rows: 1_000_000,
@@ -439,6 +446,9 @@ export function createDefaultScanConfig(userAgent: string): ScanConfig {
         recordsPerDomain: 128,
         txtItemBytes: 4_096,
         textBytesPerDomain: 65_536,
+      },
+      tls: {
+        issuerBytes: 4_096,
       },
       robots: {
         bodyBytes: 524_288,

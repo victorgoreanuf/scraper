@@ -30,7 +30,14 @@ import {
 } from "node:zlib";
 
 import type { ScanConfig } from "../config.ts";
-import type { ErrorCode, ErrorStage, PageId } from "../model.ts";
+import { DNS_RECORD_TYPES } from "../model.ts";
+import type {
+  DnsRecordObservation,
+  DnsRecordType,
+  ErrorCode,
+  ErrorStage,
+  PageId,
+} from "../model.ts";
 import {
   TARGET_POLICY_ERROR_CODES,
   TargetPolicyError,
@@ -44,6 +51,9 @@ const LOOKUP_OPTIONS = Object.freeze({
   order: "verbatim",
 } as const);
 const MAX_RAW_DNS_ANSWERS_PER_LOOKUP = 128;
+const DNS_RECORD_RANK = new Map<DnsRecordType, number>(
+  DNS_RECORD_TYPES.map((type, index) => [type, index]),
+);
 
 const REDIRECT_STATUS_CODES = new Set([301, 302, 303, 307, 308]);
 const CERTIFICATE_ERROR_CODES = new Set([
@@ -187,6 +197,8 @@ export interface ProtectedTransportResponse {
   readonly headers: readonly ProtectedTransportHeader[];
   readonly body: Uint8Array;
   readonly redirectUrl: string | null;
+  readonly tlsIssuer: string | null;
+  readonly tlsHandshakeMs: number | null;
 }
 
 export interface ProtectedTransportRequest {
@@ -200,6 +212,13 @@ export interface ProtectedTransportResponseHead {
   readonly url: string;
   readonly statusCode: number;
   readonly headers: readonly ProtectedTransportHeader[];
+  readonly tlsIssuer: string | null;
+  readonly tlsHandshakeMs: number | null;
+}
+
+export interface ProtectedDnsRecordAdmission {
+  readonly records: readonly DnsRecordObservation[];
+  readonly limitExceeded: boolean;
 }
 
 export interface ProtectedTransportSessionOptions {
@@ -208,6 +227,9 @@ export interface ProtectedTransportSessionOptions {
 
 export interface ProtectedTransportSession {
   requestHop(request: ProtectedTransportRequest): Promise<ProtectedTransportResponse>;
+  admitDnsRecords(
+    records: readonly DnsRecordObservation[],
+  ): ProtectedDnsRecordAdmission;
   getSignal(): AbortSignal;
   getUsage(): ProtectedTransportUsage;
   close(): void;
@@ -347,6 +369,7 @@ class DestinationResolver {
   private readonly dnsScheduler: ConcurrencyScheduler;
   private readonly ipv4Records = new Set<string>();
   private readonly ipv6Records = new Set<string>();
+  private readonly otherRecords = new Map<DnsRecordType, Set<string>>();
 
   constructor(config: ScanConfig, dnsScheduler: ConcurrencyScheduler) {
     this.config = config;
@@ -356,6 +379,91 @@ class DestinationResolver {
   reset(): void {
     this.ipv4Records.clear();
     this.ipv6Records.clear();
+    this.otherRecords.clear();
+  }
+
+  admitRecords(
+    records: readonly DnsRecordObservation[],
+  ): ProtectedDnsRecordAdmission {
+    const nextIpv4 = new Set(this.ipv4Records);
+    const nextIpv6 = new Set(this.ipv6Records);
+    const nextOther = new Map<DnsRecordType, Set<string>>(
+      [...this.otherRecords].map(([type, values]) => [type, new Set(values)]),
+    );
+    const admitted: DnsRecordObservation[] = [];
+    const seen = new Set<string>();
+    let limitExceeded = false;
+
+    const ordered = [...records].sort((left, right) =>
+      (DNS_RECORD_RANK.get(left.type) ?? Number.MAX_SAFE_INTEGER)
+        - (DNS_RECORD_RANK.get(right.type) ?? Number.MAX_SAFE_INTEGER)
+      || (left.value < right.value ? -1 : left.value > right.value ? 1 : 0));
+
+    for (const record of ordered) {
+      if (
+        !DNS_RECORD_RANK.has(record.type)
+        || !record.value.isWellFormed()
+      ) {
+        throw new TypeError("DNS record admission received an invalid record");
+      }
+      const identity = `${record.type}\0${record.value}`;
+      if (seen.has(identity)) {
+        continue;
+      }
+      seen.add(identity);
+
+      const target = record.type === "A"
+        ? nextIpv4
+        : record.type === "AAAA"
+          ? nextIpv6
+          : (nextOther.get(record.type) ?? new Set<string>());
+      const alreadyPresent = target.has(record.value);
+      target.add(record.value);
+      if (record.type !== "A" && record.type !== "AAAA") {
+        nextOther.set(record.type, target);
+      }
+
+      const recordCount = nextIpv4.size + nextIpv6.size
+        + [...nextOther.values()].reduce((sum, values) => sum + values.size, 0);
+      const textBytes = [...nextIpv4, ...nextIpv6].reduce(
+        (sum, value) => sum + Buffer.byteLength(value, "utf8"),
+        0,
+      ) + [...nextOther.values()].reduce(
+        (sum, values) => sum + [...values].reduce(
+          (subtotal, value) => subtotal + Buffer.byteLength(value, "utf8"),
+          0,
+        ),
+        0,
+      );
+
+      if (
+        target.size > this.config.limits.dns.recordsPerType
+        || recordCount > this.config.limits.dns.recordsPerDomain
+        || textBytes > this.config.limits.dns.textBytesPerDomain
+      ) {
+        if (!alreadyPresent) {
+          target.delete(record.value);
+        }
+        limitExceeded = true;
+        break;
+      }
+
+      admitted.push(Object.freeze({ type: record.type, value: record.value }));
+    }
+
+    this.ipv4Records.clear();
+    this.ipv6Records.clear();
+    this.otherRecords.clear();
+    for (const value of nextIpv4) this.ipv4Records.add(value);
+    for (const value of nextIpv6) this.ipv6Records.add(value);
+    for (const [type, values] of nextOther) {
+      this.otherRecords.set(type, values);
+    }
+
+    return Object.freeze({
+      records: Object.freeze(admitted),
+      limitExceeded,
+    });
   }
 
   async resolve(
@@ -422,10 +530,27 @@ class DestinationResolver {
       }
     }
 
+    const otherRecordCount = [...this.otherRecords.values()].reduce(
+      (sum, records) => sum + records.size,
+      0,
+    );
+    const textBytes = [...nextIpv4, ...nextIpv6].reduce(
+      (sum, value) => sum + Buffer.byteLength(value, "utf8"),
+      0,
+    ) + [...this.otherRecords.values()].reduce(
+      (sum, records) => sum + [...records].reduce(
+        (subtotal, value) => subtotal + Buffer.byteLength(value, "utf8"),
+        0,
+      ),
+      0,
+    );
+
     if (
       nextIpv4.size > this.config.limits.dns.recordsPerType
       || nextIpv6.size > this.config.limits.dns.recordsPerType
-      || nextIpv4.size + nextIpv6.size > this.config.limits.dns.recordsPerDomain
+      || nextIpv4.size + nextIpv6.size + otherRecordCount
+        > this.config.limits.dns.recordsPerDomain
+      || textBytes > this.config.limits.dns.textBytesPerDomain
     ) {
       throw transportError("DNS_LIMIT_EXCEEDED", "dns", false);
     }
@@ -2162,6 +2287,7 @@ class ProtectedTransportSessionImpl implements ProtectedTransportSession {
   private retries = 0;
   private staticTransferredBytes = 0;
   private staticDecompressedBytes = 0;
+  private dnsAdmissionUsed = false;
   private closed = false;
 
   constructor(
@@ -2200,6 +2326,8 @@ class ProtectedTransportSessionImpl implements ProtectedTransportSession {
     let phase: RequestPhase = "queue";
     let release: (() => void) | undefined;
     let socket: Socket | TLSSocket | undefined;
+    let tlsIssuer: string | null = null;
+    let tlsHandshakeMs: number | null = null;
 
     try {
       this.throwIfDomainAborted(phase);
@@ -2241,12 +2369,16 @@ class ProtectedTransportSessionImpl implements ProtectedTransportSession {
 
         if (parsed.url.protocol === "https:") {
           phase = "tls";
-          socket = await this.secureSocket(
+          const tlsStartedAt = performance.now();
+          const securedSocket = await this.secureSocket(
             socket,
             parsed.logicalHostname,
             parsed.addressFamily,
             attemptSignal,
           );
+          socket = securedSocket;
+          tlsHandshakeMs = Math.max(0, Math.ceil(performance.now() - tlsStartedAt));
+          tlsIssuer = securedSocket.getPeerX509Certificate()?.issuer ?? null;
         }
 
         phase = "headers";
@@ -2276,6 +2408,8 @@ class ProtectedTransportSessionImpl implements ProtectedTransportSession {
           url: parsed.url.href,
           statusCode,
           headers,
+          tlsIssuer,
+          tlsHandshakeMs,
         });
         const bodyAccepted =
           statusCode >= 200 &&
@@ -2301,6 +2435,8 @@ class ProtectedTransportSessionImpl implements ProtectedTransportSession {
           headers,
           body,
           redirectUrl,
+          tlsIssuer,
+          tlsHandshakeMs,
         });
       } catch (error) {
         if (this.domainTimedOut()) {
@@ -2341,6 +2477,20 @@ class ProtectedTransportSessionImpl implements ProtectedTransportSession {
       socket?.destroy();
       release?.();
     }
+  }
+
+  admitDnsRecords(
+    records: readonly DnsRecordObservation[],
+  ): ProtectedDnsRecordAdmission {
+    if (this.closed) {
+      throw new DOMException("The transport session is closed.", "AbortError");
+    }
+    this.signal.throwIfAborted();
+    if (this.dnsAdmissionUsed) {
+      throw new TypeError("Infrastructure DNS records were already admitted");
+    }
+    this.dnsAdmissionUsed = true;
+    return this.destinationResolver.admitRecords(records);
   }
 
   getUsage(): ProtectedTransportUsage {

@@ -206,10 +206,12 @@ test("produces a deterministic digest for every admitted behavior change", () =>
     ],
     [["limits", "concurrency", "globalHttp"], 19],
     [["limits", "timeMs", "activeDomain"], 59_999],
+    [["limits", "timeMs", "dnsLookup"], 9_999],
     [["limits", "parquet", "rows"], 999_999],
     [["limits", "target", "redirectsPerChain"], 4],
     [["limits", "detector", "workers"], 1],
     [["limits", "evidence", "matchCodePoints"], 255],
+    [["limits", "tls", "issuerBytes"], 4_095],
     [["limits", "output", "jsonlRecordBytes"], 16_777_215],
   ];
   const digests = new Set([baselineDigest]);
@@ -237,6 +239,7 @@ test("rejects fixed policy and registry pin changes before digesting", () => {
     readonly [readonly string[], unknown]
   > = [
     [["policyVersions", "hostname"], 2],
+    [["policyVersions", "infrastructure"], 2],
     [["policyVersions", "output"], 2],
     [["registryPins", "specialUseDomainsReviewedOn"], "2026-08-18"],
     [["registryPins", "ianaIpv4UpdatedOn"], "2026-01-01"],

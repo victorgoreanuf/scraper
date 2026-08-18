@@ -266,6 +266,8 @@ test("loads the exact pinned baseline as immutable plain data", () => {
     ),
     javascriptPaths: catalog.inspectionPlan.javascript.length,
     probePaths: catalog.inspectionPlan.probePaths.length,
+    dnsRecordTypes: catalog.inspectionPlan.dnsRecordTypes,
+    tlsIssuer: catalog.inspectionPlan.tlsIssuer,
     networkUrlRules: catalog.rules.filter(
       (rule) => rule.source === "network_url",
     ).length,
@@ -282,6 +284,8 @@ test("loads the exact pinned baseline as immutable plain data", () => {
     domFacts: 1_780,
     javascriptPaths: 5_570,
     probePaths: 3,
+    dnsRecordTypes: ["CNAME", "MX", "NS", "SOA", "TXT"],
+    tlsIssuer: true,
     networkUrlRules: 113,
     indexes: 16,
   });
@@ -793,6 +797,40 @@ test("separates presence, literal, regex, confidence, and version metadata", () 
   assert.equal(bySource.get("tls_issuer")?.matchMode, "literal");
   assert.equal(bySource.get("probe")?.matchMode, "presence");
   assert.deepEqual(catalog.inspectionPlan.probePaths, ["/alpha"]);
+});
+
+test("derives a deterministic DNS and TLS inspection plan from catalog demand", () => {
+  const catalog = compile([
+    {
+      Alpha: technology({
+        certIssuer: "Alpha CA",
+        dns: {
+          txt: ["alpha-verification"],
+          MX: ["mail\\.alpha\\.example"],
+        },
+      }),
+    },
+    {
+      Beta: technology({
+        dns: {
+          cname: ["edge\\.beta\\.example"],
+          MX: ["mail\\.beta\\.example"],
+        },
+      }),
+    },
+  ]);
+  const noInfrastructure = compile([{
+    Plain: technology({ headers: { server: "Plain" } }),
+  }]);
+
+  assert.deepEqual(catalog.inspectionPlan.dnsRecordTypes, [
+    "CNAME",
+    "MX",
+    "TXT",
+  ]);
+  assert.equal(catalog.inspectionPlan.tlsIssuer, true);
+  assert.deepEqual(noInfrastructure.inspectionPlan.dnsRecordTypes, []);
+  assert.equal(noInfrastructure.inspectionPlan.tlsIssuer, false);
 });
 
 test("preserves pinned version metadata on a presence rule", () => {

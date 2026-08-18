@@ -30,6 +30,20 @@ export const EVIDENCE_SOURCES = [
 ] as const;
 export type EvidenceSource = (typeof EVIDENCE_SOURCES)[number];
 
+export const DNS_RECORD_TYPES = [
+  "A",
+  "AAAA",
+  "CAA",
+  "CNAME",
+  "MX",
+  "NS",
+  "PTR",
+  "SOA",
+  "SRV",
+  "TXT",
+] as const;
+export type DnsRecordType = (typeof DNS_RECORD_TYPES)[number];
+
 export const ERROR_STAGES = [
   "target",
   "robots",
@@ -61,6 +75,7 @@ export const ERROR_CODES = [
   "TLS_CONNECTION_FAILED",
   "TLS_CERTIFICATE_INVALID",
   "TLS_TIMEOUT",
+  "TLS_LIMIT_EXCEEDED",
   "BROWSER_UNAVAILABLE",
   "BROWSER_NAVIGATION_FAILED",
   "BROWSER_TIMEOUT",
@@ -199,6 +214,26 @@ export interface HttpResponseObservations {
   readonly headers: readonly HttpHeaderObservation[];
   readonly cookies: readonly HttpCookieObservation[];
   readonly cookiesTruncated: boolean;
+  readonly tlsIssuer: string | null;
+  readonly tlsHandshakeMs: number | null;
+}
+
+export interface DnsRecordObservation {
+  readonly type: DnsRecordType;
+  readonly value: string;
+}
+
+export interface InfrastructureObservations {
+  readonly dnsRecords: readonly DnsRecordObservation[];
+  readonly tlsIssuer: string | null;
+}
+
+export interface InfrastructureResult {
+  readonly observations: InfrastructureObservations;
+  readonly errors: readonly ScanError[];
+  readonly dnsMs: number | null;
+  readonly tlsMs: number | null;
+  readonly completed: boolean;
 }
 
 export interface HttpPageObservations {
@@ -277,6 +312,8 @@ export interface CatalogInspectionPlan {
   readonly dom: readonly CatalogDomInspection[];
   readonly javascript: readonly CatalogJavascriptInspection[];
   readonly probePaths: readonly string[];
+  readonly dnsRecordTypes: readonly DnsRecordType[];
+  readonly tlsIssuer: boolean;
 }
 
 export interface BrowserDomObservation {
@@ -507,6 +544,7 @@ const errorCodeStages = {
   TLS_CONNECTION_FAILED: ["tls"],
   TLS_CERTIFICATE_INVALID: ["tls"],
   TLS_TIMEOUT: ["tls"],
+  TLS_LIMIT_EXCEEDED: ["tls"],
   BROWSER_UNAVAILABLE: ["browser"],
   BROWSER_NAVIGATION_FAILED: ["browser"],
   BROWSER_TIMEOUT: ["browser"],
@@ -834,6 +872,25 @@ export function createEvidenceValueMatch(input: EvidenceMatchInput): EvidenceMat
     candidate = input.matchedValue;
   } else if (input.source === "network_hostname") {
     candidate = input.observedValue;
+  } else if (input.source === "dns_record") {
+    if (
+      (input.key === "A" && isCanonicalPublicIpAddress(input.observedValue, 4))
+      || (input.key === "AAAA"
+        && isCanonicalPublicIpAddress(input.observedValue, 6))
+      || ((input.key === "CNAME"
+        || input.key === "MX"
+        || input.key === "NS"
+        || input.key === "PTR"
+        || input.key === "SRV")
+        && isCanonicalPublicHostname(input.observedValue))
+    ) {
+      candidate = input.observedValue;
+      if ([...candidate].length > input.scanConfig.limits.evidence.matchCodePoints) {
+        return redact();
+      }
+    } else {
+      return redact();
+    }
   } else if (input.source === "tls_issuer") {
     if (isSensitiveToken(input.observedValue, limits)) {
       return redact();
