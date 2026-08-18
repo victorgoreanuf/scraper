@@ -1179,6 +1179,13 @@ class BrowserProxyClientClosed extends Error {
   }
 }
 
+class BrowserProxyGrantRejected extends Error {
+  constructor() {
+    super("The protected browser proxy rejected an ungranted request.");
+    this.name = "BrowserProxyGrantRejected";
+  }
+}
+
 function proxyError(retryable = false): ProtectedTransportError {
   return transportError("BROWSER_PROXY_FAILED", "browser", retryable);
 }
@@ -1475,7 +1482,9 @@ class ProtectedBrowserProxyImpl implements ProtectedBrowserProxy {
     httpServer.on("connection", (socket) => {
       keepSocketErrorsHandled(socket);
       this.serverSockets.add(socket);
-      if (this.activePage !== null) {
+      if (this.activePage === null) {
+        socket.destroy();
+      } else {
         this.pageClientSockets.add(socket);
       }
       socket.once("close", () => {
@@ -1877,6 +1886,7 @@ class ProtectedBrowserProxyImpl implements ProtectedBrowserProxy {
   private handleProxyFailure(error: unknown): void {
     if (
       error instanceof BrowserProxyPageFinished
+      || error instanceof BrowserProxyGrantRejected
       || this.finishing
       || this.domainSignal?.aborted === true
     ) {
@@ -1959,7 +1969,7 @@ class ProtectedBrowserProxyImpl implements ProtectedBrowserProxy {
       this.activePage === null
       || !this.authorizedHttpsOrigins.has(parsed.url.origin)
     ) {
-      throw proxyError();
+      throw new BrowserProxyGrantRejected();
     }
   }
 

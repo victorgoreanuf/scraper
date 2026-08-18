@@ -874,6 +874,96 @@ test("finishing a page closes both sides of an active CONNECT tunnel", async (t)
   await proxy.finishDomain();
 });
 
+test("proxy sockets without a page or grant cannot poison the next CONNECT", async (t) => {
+  const reply = Buffer.from("p2-reply");
+  const upstream = createNetServer((socket) => {
+    socket.once("data", (chunk) => {
+      assert.equal(chunk.toString(), "p2-request");
+      socket.end(reply);
+    });
+  });
+  const upstreamPort = await listenOnLoopback(t, upstream);
+  const runtime = runtimeHarness({
+    lookup: () => [{ address: primaryPublicAddress, family: 4 }],
+    routes: new Map([
+      [primaryPublicAddress, { physicalPort: upstreamPort }],
+    ]),
+  });
+  const proxy = await createProxy(t);
+  proxy.activateDomain();
+  proxy.startPage("p1");
+  proxy.recordRequestAttempt({
+    pageId: "p1",
+    url: "https://between-pages.vendor.tld/p1",
+    forward: true,
+  });
+  await proxy.finishPage("p1");
+
+  const idleClient = createNetConnection(proxyEndpoint(proxy));
+  idleClient.on("error", () => undefined);
+  const idleResponse: Buffer[] = [];
+  idleClient.on("data", (chunk: Buffer) => idleResponse.push(chunk));
+  t.after(() => idleClient.destroy());
+  const idleClosed = once(idleClient, "close", {
+    signal: AbortSignal.timeout(1_000),
+  });
+  await once(idleClient, "connect");
+  await idleClosed;
+  assert.deepEqual(idleResponse, []);
+
+  proxy.startPage("p2");
+  const speculativeClient = createNetConnection(proxyEndpoint(proxy));
+  speculativeClient.on("error", () => undefined);
+  const speculativeResponse: Buffer[] = [];
+  speculativeClient.on("data", (chunk: Buffer) => {
+    speculativeResponse.push(chunk);
+  });
+  t.after(() => speculativeClient.destroy());
+  const speculativeClosed = once(speculativeClient, "close", {
+    signal: AbortSignal.timeout(1_000),
+  });
+  await once(speculativeClient, "connect");
+  speculativeClient.write(
+    "CONNECT between-pages.vendor.tld:443 HTTP/1.1\r\n"
+      + "Host: between-pages.vendor.tld:443\r\n\r\n",
+  );
+  await speculativeClosed;
+  await waitForImmediate();
+
+  assert.match(Buffer.concat(speculativeResponse).toString(), /^HTTP\/1\.1 502 /);
+  assert.equal(proxy.getFailure(), null);
+  assert.deepEqual(runtime.lookupCalls, []);
+  assert.deepEqual(runtime.connectCalls, []);
+
+  proxy.recordRequestAttempt({
+    pageId: "p2",
+    url: "https://between-pages.vendor.tld/p2",
+    forward: true,
+  });
+  const p2Client = await connectToProxy(proxy);
+  t.after(() => p2Client.destroy());
+  p2Client.write(
+    "CONNECT between-pages.vendor.tld:443 HTTP/1.1\r\n"
+      + "Host: between-pages.vendor.tld:443\r\n\r\n",
+  );
+  const connectResponse = await readUntil(p2Client, "\r\n\r\n");
+  assert.match(connectResponse.toString(), /^HTTP\/1\.1 200 /);
+  p2Client.write("p2-request");
+  const downstream = await readUntil(p2Client, reply.toString());
+
+  assert.equal(downstream.toString(), reply.toString());
+  assert.deepEqual(runtime.lookupCalls.map(({ hostname }) => hostname), [
+    "between-pages.vendor.tld",
+  ]);
+  assert.deepEqual(runtime.connectCalls, [
+    { address: primaryPublicAddress, family: 4, port: 443 },
+  ]);
+  assert.equal(proxy.getFailure(), null);
+  p2Client.destroy();
+  await proxy.finishPage("p2");
+  await proxy.finishDomain();
+});
+
 test("logical request and downstream byte caps latch stable browser limit failures", async (t) => {
   runtimeHarness({
     lookup: () => [{ address: primaryPublicAddress, family: 4 }],

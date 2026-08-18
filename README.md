@@ -806,6 +806,15 @@ without a destination bypass, with service workers, QUIC, and non-proxied WebRTC
 traffic disabled. Playwright/CDP interception is an additional
 navigation/method/redirect guard, not the SSRF boundary.
 
+Every accepted proxy TCP socket is owned by the page generation active at
+accept time. A socket accepted while no page is active, including the cleanup
+gap between two ordered pages, is destroyed immediately; it cannot survive into
+the next page and consume that page's reset HTTP or HTTPS grants. A
+syntactically valid CONNECT without a current HTTPS grant receives a local 502
+without DNS or an upstream connection and does not poison the domain; malformed
+method, authority, Host, port, headers, or protocol input remains a terminal
+proxy failure.
+
 For every pool slot, startup launches a loopback canary and maps one random
 synthetic hostname to it through Chromium's fixed resolver rule and the proxy's
 canary resolver. The proxy must reject the non-public answer and the listener
@@ -1703,7 +1712,8 @@ included in canonical form.
   statuses, bounded bodies, redacted literal evidence, and request accounting.
 - `browser-proxy.test.ts` covers one-use HTTP grants, CONNECT authority/port
   policy, mixed and non-public DNS, peer pinning, late-DNS/page cleanup,
-  request/byte limits, and a zero-hit loopback canary.
+  request/byte limits, page-generation socket isolation, and a zero-hit
+  loopback canary.
 - `browser.test.ts` covers safe launch/context options, slot preflight,
   FIFO admission and cleanup, ordered per-domain pages, synchronous robots
   gating, dual-stage CDP redirect admission, deterministic top-20 script

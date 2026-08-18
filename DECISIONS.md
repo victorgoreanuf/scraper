@@ -447,6 +447,14 @@ request, iar proxy-ul autorizează authority-ul CONNECT, aplică egress și num�
 bytes criptate downstream. Interceptionarea Playwright/CDP rămâne strat de
 politică, nu boundary-ul SSRF.
 
+Fiecare socket TCP acceptat de proxy aparține generației de pagină active în
+acel moment. Dacă nu există o pagină activă — inclusiv în intervalul de cleanup
+dintre două pagini ordonate — socketul este distrus imediat și nu poate ajunge
+în generația următoare cu granturile ei HTTP/HTTPS resetate. Un CONNECT valid
+sintactic, dar fără grant HTTPS curent, primește local 502 fără DNS sau conexiune
+upstream și nu otrăvește domeniul; metoda, authority, Host, portul, headerele ori
+protocolul malformate rămân failure terminal al proxy-ului.
+
 Fiecare slot trece un canary de startup cu hostname sintetic mapat la un listener
 loopback atât prin regula resolverului Chromium, cât și prin resolverul canary al
 proxy-ului. Proxy-ul trebuie să înregistreze respingerea adresei nepublice, iar
