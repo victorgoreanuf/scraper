@@ -404,10 +404,13 @@ test("resume rejects an older scanner version without modifying the result", asy
   const directory = await temporaryDirectory(t);
   const resultPath = join(directory, "older-scanner.jsonl");
   const config = configWithRecordLimit();
-  const previousProvenance = provenanceFor(config);
+  const previousProvenance: Provenance = {
+    ...provenanceFor(config),
+    scannerVersion: "0.1.1",
+  };
   const currentProvenance: Provenance = {
     ...previousProvenance,
-    scannerVersion: "0.1.1",
+    scannerVersion: "0.1.2",
   };
   const runId = "37937a78-f39d-49ed-a51d-6d398ae45a20";
   const bytes = Buffer.from(
