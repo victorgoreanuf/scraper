@@ -4,6 +4,9 @@
   "description": "Batch CLI that detects website technologies with verifiable evidence.",
   "private": true,
   "type": "module",
+  "bin": {
+    "website-technologies-scraper": "dist/cli.js"
+  },
   "license": "GPL-3.0-only",
   "packageManager": "npm@11.17.0",
   "engines": {
@@ -24,6 +27,8 @@
   "scripts": {
     "clean": "node --input-type=module --eval \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true });\"",
     "build": "npm run clean && tsc --project tsconfig.build.json",
+    "postbuild": "node --input-type=module --eval \"import { chmodSync } from 'node:fs'; chmodSync('dist/cli.js', 0o755);\"",
+    "start": "node dist/cli.js",
     "typecheck": "tsc --project tsconfig.json --noEmit",
     "test": "node --test \"test/**/*.test.ts\"",
     "check": "npm run typecheck && npm test"

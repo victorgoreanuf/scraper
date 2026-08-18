@@ -1631,11 +1631,18 @@ class BrowserPoolImpl implements BrowserPool {
     transport: ProtectedHttpTransport,
     config: ScanConfig,
     launcher: BrowserLauncher,
+    signal?: AbortSignal,
   ): Promise<BrowserPoolImpl> {
     const pool = new BrowserPoolImpl(transport, config, launcher);
     try {
       for (let id = 0; id < config.limits.concurrency.fullScans; id += 1) {
-        pool.#slots.push(await pool.#createSlot(id, false));
+        signal?.throwIfAborted();
+        const slot = await pool.#createSlot(id, false);
+        if (signal?.aborted === true) {
+          await pool.#destroySlot(slot);
+          signal.throwIfAborted();
+        }
+        pool.#slots.push(slot);
       }
       const versions = new Set(pool.#slots.map((slot) => slot.browser.version()));
       const chromiumVersion = versions.size === 1 ? [...versions][0] : undefined;
@@ -3065,6 +3072,7 @@ export function createBrowserPool(
   transport: ProtectedHttpTransport,
   config: ScanConfig,
   launcher: BrowserLauncher = (options) => chromium.launch(options),
+  signal?: AbortSignal,
 ): Promise<BrowserPool> {
-  return BrowserPoolImpl.create(transport, config, launcher);
+  return BrowserPoolImpl.create(transport, config, launcher, signal);
 }

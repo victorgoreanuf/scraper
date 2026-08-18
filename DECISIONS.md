@@ -777,6 +777,44 @@ Closure-ul folosește un priority heap și traversări iterative pentru fixed po
 SCC și provenance. Astfel limita acceptată de 20.000 tehnologii nu depinde de
 call stack și nu rescanează/sortează quadratic întreaga coadă.
 
+## Decizia CLI-ului executabil v1
+
+CLI-ul construit este `dist/cli.js`, declarat ca bin local
+`website-technologies-scraper`; Node `util.parseArgs` rămâne parserul unic și nu
+adăugăm Commander, logger, YAML sau un pool generic. `--input` și `--output` au
+defaulturile `input/domains.parquet` și `results.jsonl`. Exact una dintre
+`--contact` și `--config` este obligatorie: contactul HTTPS/mailto validat
+construiește User-Agent-ul cu versiunea reală din manifest, iar config citește
+maximum 1 MiB de JSON UTF-8 strict și cere un `ScanConfig` v1 complet cu aceeași
+versiune. Opțiunile operaționale rămase sunt `--resume`, `--force`, `--quiet`,
+`--help` și `--version`; duplicatele, poziționalele și opțiunile necunoscute sunt
+invalide, iar resume/force sunt mutual exclusive.
+
+Startup-ul validează runtime-ul, configurația și întregul Parquet înainte de
+catalog, pool-uri sau output mutabil. Inputul pregătit păstrează count-ul și
+membership-ul primei treceri, apoi expune o singură a doua trecere streaming.
+Configul și Parquetul sunt deschise nonblocking pe ținta canonizată, refuză un
+symlink schimbat în timpul deschiderii și acceptă numai descriptor regular.
+Resultul și summary-ul pereche nu pot aliasa inputul sau configul, iar resume
+validează fiecare domeniu persistat în membership-ul inputului înainte să
+repare fragmentul final ori să elimine summary-ul stale. Catalogul și workerii
+detectorului sunt pregătiți înaintea transportului și canary-ului Chromium; abia
+după toate preflighturile writerul creează/reia `runId` pe calea output deja
+canonizată și verificată. Configul trebuie să includă exact același contact
+canonic HTTPS/mailto pe care l-ar accepta `--contact`, nu doar un prefix de
+User-Agent cu versiunea corectă.
+
+Schedulerul direct ține maximum `limits.concurrency.fullScans` taskuri, fiecare
+incluzând scanarea și appendul, astfel încât writerul aplică backpressure și
+JSONL rămâne completion-order. Progresul canonic merge numai în stderr, iar
+stdout este rezervat help/version. Exit `0` înseamnă că toate rândurile au un
+record și summary, chiar dacă unele domenii sunt partial/failed; un pool global
+devenit indisponibil sau un failure fatal dă `1`, usage invalid `2`, iar
+SIGINT/SIGTERM după cleanup bounded dau `130`/`143`. Primul signal face abort
+graceful fără summary fals complet; al doilea revine la terminarea implicită a
+sistemului de operare. V1 nu creează automat directoare output și nu adaugă un
+lock cross-process peste writerul deja decis.
+
 ## Decizia izolării regex
 
 Păstrăm `RegExp` nativ cu flagul `i`, compatibil cu specificația catalogului,

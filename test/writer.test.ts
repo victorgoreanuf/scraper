@@ -317,6 +317,37 @@ test("resume gives an empty or fragment-only file a new run id", async (t) => {
   }
 });
 
+test("resume rejects a domain outside the validated input before repair", async (t) => {
+  const directory = await temporaryDirectory(t);
+  const resultPath = join(directory, "results.jsonl");
+  const config = configWithRecordLimit();
+  const provenance = provenanceFor(config);
+  const writer = await openResultWriter({
+    resultPath,
+    mode: "create",
+    config,
+    provenance,
+  });
+  await writer.append(
+    failedResult(writer.runId, "outside.vendor.com", provenance),
+  );
+  await writer.close();
+  await appendFile(resultPath, "{\"incomplete\":true}");
+  const before = await readFile(resultPath);
+
+  await expectWriterError(
+    openResultWriter({
+      resultPath,
+      mode: "resume",
+      config,
+      provenance,
+      resumeDomainAllowed: () => false,
+    }),
+    "OUTPUT_CONTEXT_MISMATCH",
+  );
+  assert.deepEqual(await readFile(resultPath), before);
+});
+
 test("resume rejects corruption without modifying the result prefix", async (t) => {
   const directory = await temporaryDirectory(t);
   const config = configWithRecordLimit(65_536);

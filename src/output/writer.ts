@@ -46,6 +46,7 @@ export interface OpenResultWriterOptions {
   readonly mode: ResultWriterMode;
   readonly config: ScanConfig;
   readonly provenance: Provenance;
+  readonly resumeDomainAllowed?: (domain: string) => boolean;
 }
 
 export interface ResultWriter {
@@ -87,7 +88,12 @@ export class OutputWriterError extends Error {
   }
 }
 
-interface CanonicalOutputPaths {
+export interface ResultOutputPaths {
+  readonly resultPath: string;
+  readonly summaryPath: string;
+}
+
+interface CanonicalOutputPaths extends ResultOutputPaths {
   readonly parentPath: string;
   readonly parentIdentity: string;
   readonly resultPath: string;
@@ -180,6 +186,16 @@ async function canonicalOutputPaths(
     resultPath: join(parentPath, resultBasename),
     summaryPath: join(parentPath, summaryBasename(resultBasename)),
   };
+}
+
+export async function resolveResultOutputPaths(
+  resultPath: string,
+): Promise<ResultOutputPaths> {
+  const paths = await canonicalOutputPaths(resultPath);
+  return Object.freeze({
+    resultPath: paths.resultPath,
+    summaryPath: paths.summaryPath,
+  });
 }
 
 async function inspectTarget(
@@ -467,6 +483,7 @@ async function scanResumeFile(
   handle: FileHandle,
   config: ScanConfig,
   provenance: Provenance,
+  domainAllowed: ((domain: string) => boolean) | undefined,
 ): Promise<ResumeState> {
   const descriptorStats = await handle.stat();
   if (!Number.isSafeInteger(descriptorStats.size) || descriptorStats.size < 0) {
@@ -502,6 +519,12 @@ async function scanResumeFile(
     }
 
     ensureResultContext(result, runId, config, provenance);
+    if (domainAllowed !== undefined && !domainAllowed(result.domain)) {
+      throw writerError(
+        "OUTPUT_CONTEXT_MISMATCH",
+        "The result file contains a domain outside the validated input.",
+      );
+    }
     if (completedDomains.has(result.domain)) {
       throw writerError(
         "OUTPUT_DUPLICATE_DOMAIN",
@@ -1021,6 +1044,7 @@ export async function openResultWriter(
         handle,
         config,
         provenance,
+        options.resumeDomainAllowed,
       );
       if (summaryInspection.exists) {
         await removeValidatedTarget(

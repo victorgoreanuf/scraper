@@ -1,4 +1,5 @@
-import { open, type FileHandle } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { open, realpath, type FileHandle } from "node:fs/promises";
 
 import {
   parquetMetadata,
@@ -51,6 +52,14 @@ export interface ParquetInputLimits {
 export interface ParquetInputOptions {
   readonly limits: ParquetInputLimits;
   readonly hostnameCodeUnits: number;
+}
+
+export interface PreparedParquetDomains {
+  readonly domainCount: number;
+  readonly sourcePath: string;
+  hasDomain(domain: string): boolean;
+  domains(): AsyncGenerator<string>;
+  close(): Promise<void>;
 }
 
 export class ParquetInputError extends Error {
@@ -918,11 +927,29 @@ export async function* readParquetDomainsFromFile(
   filePath: string,
   options: ParquetInputOptions,
 ): AsyncGenerator<string> {
-  let handle: FileHandle | undefined;
-  let byteLength: number;
+  const input = await openParquetDomainsFromFile(filePath, options);
 
   try {
-    handle = await open(filePath, "r");
+    yield* input.domains();
+  } finally {
+    await input.close();
+  }
+}
+
+export async function openParquetDomainsFromFile(
+  filePath: string,
+  options: ParquetInputOptions,
+): Promise<PreparedParquetDomains> {
+  let handle: FileHandle | undefined;
+  let byteLength: number;
+  let sourcePath: string;
+
+  try {
+    sourcePath = await realpath(filePath);
+    handle = await open(
+      sourcePath,
+      fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
+    );
     const stats = await handle.stat();
 
     if (!stats.isFile() || !Number.isSafeInteger(stats.size) || stats.size < 0) {
@@ -939,9 +966,64 @@ export async function* readParquetDomainsFromFile(
     );
   }
 
+  let parquet: ValidatedParquet;
+  let firstRows: ReadonlyMap<string, number>;
+
   try {
-    yield* readParquetDomains(fileHandleBuffer(handle, byteLength), options);
-  } finally {
+    parquet = await prepareParquet(fileHandleBuffer(handle, byteLength), options);
+    firstRows = await preflightDomains(parquet, options.hostnameCodeUnits);
+  } catch (error) {
     await handle.close().catch(() => undefined);
+    throw error;
   }
+
+  let closePromise: Promise<void> | undefined;
+  let iterationStarted = false;
+  const close = (): Promise<void> => {
+    closePromise ??= handle.close();
+    return closePromise;
+  };
+  const domains = async function*(): AsyncGenerator<string> {
+    if (closePromise !== undefined || iterationStarted) {
+      throw new TypeError("The prepared Parquet input can be consumed only once.");
+    }
+    iterationStarted = true;
+
+    try {
+      for (const group of parquet.groups) {
+        const rows = await readGroup(parquet, group);
+
+        for (let index = 0; index < rows.length; index += 1) {
+          const row = rows[index];
+          const rowNumber = group.firstRowNumber + index;
+
+          if (row === undefined) {
+            throw invalidParquet();
+          }
+
+          const domain = normalizeRow(
+            row,
+            rowNumber,
+            options.hostnameCodeUnits,
+          );
+          if (firstRows.get(domain) !== rowNumber) {
+            throw invalidParquet();
+          }
+          yield domain;
+        }
+      }
+    } finally {
+      await close();
+    }
+  };
+
+  return Object.freeze({
+    domainCount: firstRows.size,
+    sourcePath,
+    hasDomain(domain: string): boolean {
+      return firstRows.has(domain);
+    },
+    domains,
+    close,
+  });
 }

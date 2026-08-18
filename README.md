@@ -4,9 +4,8 @@
 > fail-closed robots policy, static HTTP collector, fingerprint compiler,
 > isolated detector, protected Playwright/Chromium collector and pool, and
 > bounded catalog-probe and DNS/TLS infrastructure collection plus pipeline
-> orchestration are implemented and tested. Incremental output, resume, and
-> summary generation are also implemented and tested; the runnable CLI is the
-> next roadmap slice.
+> orchestration are implemented and tested. Incremental output, resume, summary
+> generation, and the runnable local CLI are also implemented and tested.
 
 ## Goal
 
@@ -1455,8 +1454,10 @@ are rejected during resume before `JSON.parse`; the minimum configurable cap is
 Queue wait is measured separately; the domain deadline begins only after the
 job receives a full-scan slot. Reaching a limit cancels the affected work,
 releases resources, records a stable error, and preserves earlier observations.
-All limits live in one validated runtime configuration with explicit CLI
-overrides rather than a separate YAML system.
+All limits live in one validated runtime configuration. CLI v1 uses the reviewed
+defaults with a required real contact, or accepts one complete local JSON
+`ScanConfig`; it does not add a second YAML system or dozens of partial flag
+overrides.
 
 The pinned catalog currently yields 1,769 unique DOM selectors, 1,780 exact DOM
 facts, 5,570 unique JavaScript paths, and 113 browser request-URL rules after
@@ -1476,6 +1477,57 @@ dropping fingerprint rules.
 - Use a descriptive user agent and conservative timeouts.
 - Do not bypass authentication, CAPTCHAs, or explicit access controls.
 - Record partial results when a later stage fails.
+
+## Runnable CLI v1
+
+The built entry point is `dist/cli.js`, exposed locally as
+`website-technologies-scraper`. Build and inspect it with the pinned runtime:
+
+```sh
+npm run build
+./dist/cli.js --help
+./dist/cli.js \
+  --contact "$CRAWLER_CONTACT" \
+  --input input/domains.parquet \
+  --output results.jsonl
+```
+
+Set `CRAWLER_CONTACT` to the operator's real HTTPS or `mailto:` contact before
+the scan; the repository deliberately provides no copyable placeholder
+identity. Direct invocation keeps scan stdout empty, whereas npm may print its
+own lifecycle banner around `npm start`.
+
+`--input` defaults to `input/domains.parquet`, and `--output` defaults to
+`results.jsonl`; the output parent must already exist. Exactly one configuration
+source is required:
+
+- `--contact <https://...|mailto:...>` creates the immutable reviewed default
+  configuration and constructs
+  `WebsiteTechScraper/<package-version> (<canonical-contact>)`; the CLI never
+  ships a fictitious contact;
+- `--config <path>` reads at most 1 MiB of strict UTF-8 JSON and requires one
+  complete `ScanConfig` v1 whose User-Agent carries the actual package version.
+
+Operational flags are `--resume`, `--force`, `--quiet`, `--help`, and
+`--version`. Resume and force are mutually exclusive. Unknown, positional, or
+duplicate options fail before input, output, browser, or network work. The CLI
+validates the exact Node version, preflights the complete Parquet input, rejects
+result or paired-summary aliases of input/config files, compiles the catalog,
+preflights detector workers and protected Chromium, and only then opens the
+writer. Resume records must all belong to the validated current input before
+any domain crawl starts.
+
+The second Parquet pass is streamed with at most
+`limits.concurrency.fullScans` tasks in flight. Each task includes both
+`scanDomain()` and its serialized append, so a slow output applies backpressure;
+records remain completion-order. Stdout is empty during a scan. Bounded progress
+uses only the canonical domain, count, and status on stderr; `--quiet` suppresses
+progress but never fatal diagnostics. A completed batch exits `0` even when
+individual domains are `partial` or `failed`; loss of an entire required pool or
+a fatal preflight/orchestration/output error exits `1`, invalid usage exits `2`,
+and graceful SIGINT/SIGTERM cleanup exits `130`/`143`. The first signal aborts
+work and closes input, writer, browser, and detector resources without a false
+summary; a second signal uses the operating system default termination.
 
 ## Incremental output and resume
 
@@ -1638,6 +1690,10 @@ included in canonical form.
   target/link safety, single-process ownership, no-clobber summary publication,
   canonical aggregate ordering, percentiles, safe sums, and atomic overflow
   rejection.
+- CLI tests cover bounded argument/config parsing, startup-before-mutation
+  ordering, input/output alias rejection, resume membership, completion-order
+  backpressure, pool loss, signal races, sanitized diagnostics, cleanup, and
+  the executable build boundary.
 - A small optional real-site smoke run that is not required in CI.
 - Deterministic sorting and output-schema checks.
 
@@ -2108,7 +2164,7 @@ are recorded in `THIRD_PARTY_NOTICES.md`.
 Remaining implementation slices:
 
 - [x] Add incremental output, resume, and summary generation.
-- [ ] Add the runnable CLI that connects Parquet input, the bounded local
+- [x] Add the runnable CLI that connects Parquet input, the bounded local
   worker pool, `scanDomain()`, and incremental output.
 
 Completion and evaluation gates:
@@ -2142,5 +2198,5 @@ The readiness gate, application foundation, protected HTTP/browser transports,
 robots policy, static and rendered observation collectors, fingerprint
 compiler, isolated detector, bounded Chromium pool, catalog probes, DNS/TLS
 infrastructure collector, pipeline orchestration, incremental output, resume,
-and summary generation are complete. The runnable CLI is the remaining
-implementation slice.
+summary generation, and the runnable local CLI are complete. The remaining
+roadmap items are evaluation gates rather than implementation slices.

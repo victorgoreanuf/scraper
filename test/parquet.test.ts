@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
+import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 
 import type { AsyncBuffer } from "hyparquet";
 
 import {
   ParquetInputError,
+  openParquetDomainsFromFile,
   readParquetDomains,
   readParquetDomainsFromFile,
   type InputErrorCode,
@@ -794,6 +798,30 @@ test("uses the stable open-failure code without exposing the path", async () => 
   );
 
   assert.equal(error.message.includes(missingPath), false);
+});
+
+test("preflights a file once and exposes bounded membership before streaming", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "veridion-parquet-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const filePath = join(directory, "domains.parquet");
+  const fixture = makeFixture([
+    ["first.vendor.com"],
+    ["second.vendor.com"],
+  ]);
+  await writeFile(filePath, fixture.bytes);
+
+  const prepared = await openParquetDomainsFromFile(filePath, readerOptions());
+  t.after(() => prepared.close());
+  assert.equal(prepared.domainCount, 2);
+  assert.equal(prepared.hasDomain("first.vendor.com"), true);
+  assert.equal(prepared.hasDomain("missing.vendor.com"), false);
+  assert.equal(prepared.sourcePath, await realpath(filePath));
+
+  const domains: string[] = [];
+  for await (const domain of prepared.domains()) domains.push(domain);
+  assert.deepEqual(domains, ["first.vendor.com", "second.vendor.com"]);
+  await prepared.close();
+  await assert.rejects(async () => prepared.domains().next(), TypeError);
 });
 
 test("rejects caller limits that would weaken the v1 ceilings", async () => {

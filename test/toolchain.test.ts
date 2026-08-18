@@ -14,6 +14,7 @@ type PackageManifest = {
   version: string;
   private: boolean;
   type: string;
+  bin: Record<string, string>;
   license: string;
   packageManager: string;
   engines: {
@@ -31,6 +32,7 @@ type PackageManifest = {
 type LockedPackage = {
   name?: string;
   version?: string;
+  bin?: Record<string, string>;
   engines?: Record<string, string>;
   dependencies?: Record<string, string>;
   devDependencies?: Record<string, string>;
@@ -121,6 +123,7 @@ test("keeps the npm v3 lockfile aligned with the manifest", () => {
   assert.equal(lock.version, manifest.version);
   assert.equal(lockRoot.name, manifest.name);
   assert.equal(lockRoot.version, manifest.version);
+  assert.deepEqual(lockRoot.bin, manifest.bin);
   assert.deepEqual(lockRoot.engines, manifest.engines);
   assert.deepEqual(lockRoot.dependencies, manifest.dependencies);
   assert.deepEqual(lockRoot.devDependencies, manifest.devDependencies);
@@ -165,6 +168,14 @@ test("builds only application source into dist", () => {
     manifest.scripts.build,
     "npm run clean && tsc --project tsconfig.build.json",
   );
+  assert.equal(
+    manifest.scripts.postbuild,
+    "node --input-type=module --eval \"import { chmodSync } from 'node:fs'; chmodSync('dist/cli.js', 0o755);\"",
+  );
+  assert.equal(manifest.scripts.start, "node dist/cli.js");
+  assert.deepEqual(manifest.bin, {
+    "website-technologies-scraper": "dist/cli.js",
+  });
   assert.equal(buildConfig.extends, "./tsconfig.json");
   assert.deepEqual(buildConfig.compilerOptions, {
     rootDir: "src",
