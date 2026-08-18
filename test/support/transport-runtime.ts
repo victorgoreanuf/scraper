@@ -15,6 +15,7 @@ const shimModuleUrl = import.meta.url;
 export interface TransportRoute {
   readonly physicalPort: number;
   readonly remoteAddress?: string;
+  readonly lateConnectResetErrors?: 1 | 2;
 }
 
 export interface TransportLookupCall {
@@ -57,6 +58,14 @@ interface ConnectionOptions {
   readonly host?: string;
   readonly port?: number | string;
   readonly family?: number;
+}
+
+function connectionResetError(): NodeJS.ErrnoException {
+  const error = new Error(
+    "The controlled transport peer reset the connection.",
+  ) as NodeJS.ErrnoException;
+  error.code = "ECONNRESET";
+  return error;
 }
 
 let hookInstalled = false;
@@ -150,6 +159,19 @@ export function createConnection(options: ConnectionOptions): Socket {
     enumerable: true,
     value: route.remoteAddress ?? address,
   });
+
+  if (route.lateConnectResetErrors !== undefined) {
+    socket.once("connect", () => {
+      process.nextTick(() => {
+        socket.destroy(connectionResetError());
+        if (route.lateConnectResetErrors === 2) {
+          process.nextTick(() => {
+            socket.emit("error", connectionResetError());
+          });
+        }
+      });
+    });
+  }
 
   return socket;
 }

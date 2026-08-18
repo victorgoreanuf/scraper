@@ -82,6 +82,7 @@ function configWith(
 async function listenOnLoopback(t: TestContext, server: Server): Promise<number> {
   const sockets = new Set<Socket>();
   server.on("connection", (socket) => {
+    socket.on("error", () => undefined);
     sockets.add(socket);
     socket.once("close", () => sockets.delete(socket));
   });
@@ -175,6 +176,7 @@ function requestThroughProxy(
 function connectToProxy(proxy: ProtectedBrowserProxy): Promise<Socket> {
   const endpoint = proxyEndpoint(proxy);
   const socket = createNetConnection(endpoint);
+  socket.on("error", () => undefined);
   return once(socket, "connect").then(() => socket);
 }
 
@@ -305,6 +307,45 @@ test("the proxy forwards absolute-form HTTP through a validated pinned address",
     browserTransferredBytes: 0,
   });
   await proxy.finishPage("p2");
+  await proxy.finishDomain();
+});
+
+test("late repeated upstream resets remain contained for HTTP proxy requests", async (t) => {
+  const upstream = createHttpServer((_request, response) => {
+    response.writeHead(200, { "Content-Length": "2" });
+    response.end("ok");
+  });
+  const upstreamPort = await listenOnLoopback(t, upstream);
+  const runtime = runtimeHarness({
+    lookup: () => [{ address: primaryPublicAddress, family: 4 }],
+    routes: new Map([
+      [
+        primaryPublicAddress,
+        { physicalPort: upstreamPort, lateConnectResetErrors: 2 },
+      ],
+    ]),
+  });
+  const proxy = await createProxy(t);
+  proxy.activateDomain();
+  proxy.startPage("p1");
+  const targetUrl = "http://reset.vendor.tld/";
+  proxy.recordRequestAttempt({ pageId: "p1", url: targetUrl, forward: true });
+
+  const response = await requestThroughProxy(proxy, targetUrl);
+
+  if (response.error === null) {
+    assert.equal(response.statusCode, 502);
+  } else {
+    assert.equal(
+      (response.error as NodeJS.ErrnoException).code,
+      "ECONNRESET",
+    );
+  }
+  assert.deepEqual(runtime.connectCalls, [
+    { address: primaryPublicAddress, family: 4, port: 80 },
+  ]);
+  assertFailure(proxy, "BROWSER_PROXY_FAILED", "browser");
+  await proxy.finishPage("p1");
   await proxy.finishDomain();
 });
 
@@ -528,6 +569,97 @@ test("finishing a page aborts late DNS work before it can dial", async (t) => {
   await proxy.finishDomain();
 });
 
+test("an HTTP client reset during pending DNS never reaches the upstream", async (t) => {
+  let upstreamGets = 0;
+  const upstream = createHttpServer((_request, response) => {
+    upstreamGets += 1;
+    response.writeHead(200, { "Content-Length": "2" });
+    response.end("ok");
+  });
+  const upstreamPort = await listenOnLoopback(t, upstream);
+  const lookupStarted = Promise.withResolvers<void>();
+  const lookupResult = Promise.withResolvers<unknown>();
+  const runtime = runtimeHarness({
+    lookup: () => {
+      lookupStarted.resolve();
+      return lookupResult.promise;
+    },
+    routes: new Map([
+      [primaryPublicAddress, { physicalPort: upstreamPort }],
+    ]),
+  });
+  const proxy = await createProxy(t);
+  proxy.activateDomain();
+  proxy.startPage("p1");
+  const targetUrl = "http://pending-http.vendor.tld/";
+  proxy.recordRequestAttempt({ pageId: "p1", url: targetUrl, forward: true });
+  const client = await connectToProxy(proxy);
+  const clientClosed = new Promise<void>((resolve) => {
+    client.once("close", () => resolve());
+  });
+  client.write(
+    `GET ${targetUrl} HTTP/1.1\r\nHost: pending-http.vendor.tld\r\nConnection: close\r\n\r\n`,
+  );
+  await lookupStarted.promise;
+
+  client.resetAndDestroy();
+  await clientClosed;
+  await waitForImmediate();
+  await waitForImmediate();
+  lookupResult.resolve([{ address: primaryPublicAddress, family: 4 }]);
+  await waitForImmediate();
+  await waitForImmediate();
+
+  assert.deepEqual(runtime.connectCalls, []);
+  assert.equal(upstreamGets, 0);
+  assert.equal(proxy.getFailure(), null);
+  await proxy.finishPage("p1");
+  await proxy.finishDomain();
+});
+
+test("a CONNECT client reset during pending DNS stays bounded by page cleanup", async (t) => {
+  const lookupStarted = Promise.withResolvers<void>();
+  const lookupResult = Promise.withResolvers<unknown>();
+  const runtime = runtimeHarness({
+    lookup: () => {
+      lookupStarted.resolve();
+      return lookupResult.promise;
+    },
+  });
+  const proxy = await createProxy(t);
+  proxy.activateDomain();
+  proxy.startPage("p1");
+  proxy.recordRequestAttempt({
+    pageId: "p1",
+    url: "https://pending.vendor.tld/",
+    forward: true,
+  });
+  const client = await connectToProxy(proxy);
+  const clientClosed = new Promise<void>((resolve) => {
+    client.once("close", () => resolve());
+  });
+  client.write(
+    "CONNECT pending.vendor.tld:443 HTTP/1.1\r\nHost: pending.vendor.tld:443\r\n\r\n",
+  );
+  await lookupStarted.promise;
+
+  client.resetAndDestroy();
+  await clientClosed;
+  await waitForImmediate();
+  await waitForImmediate();
+  lookupResult.resolve([{ address: primaryPublicAddress, family: 4 }]);
+  await waitForImmediate();
+  await waitForImmediate();
+
+  assert.equal(client.destroyed, true);
+  assert.deepEqual(runtime.connectCalls, []);
+  assert.equal(proxy.getFailure(), null);
+  await proxy.finishPage("p1");
+  proxy.startPage("p2");
+  await proxy.finishPage("p2");
+  await proxy.finishDomain();
+});
+
 test("page cleanup remains available after the external domain signal aborts", async (t) => {
   runtimeHarness({
     lookup: () => [{ address: primaryPublicAddress, family: 4 }],
@@ -588,6 +720,88 @@ test("CONNECT is restricted to an approved HTTPS authority and counts downstream
   });
   assert.equal(proxy.getFailure(), null);
   client.destroy();
+  await proxy.finishPage("p1");
+  await proxy.finishDomain();
+});
+
+test("a CONNECT client reset after establishment leaves the proxy reusable", async (t) => {
+  const upstreamConnected = Promise.withResolvers<void>();
+  const upstreamClosed = Promise.withResolvers<void>();
+  const upstream = createNetServer((socket) => {
+    upstreamConnected.resolve();
+    socket.once("close", () => upstreamClosed.resolve());
+  });
+  const upstreamPort = await listenOnLoopback(t, upstream);
+  runtimeHarness({
+    lookup: () => [{ address: primaryPublicAddress, family: 4 }],
+    routes: new Map([
+      [primaryPublicAddress, { physicalPort: upstreamPort }],
+    ]),
+  });
+  const proxy = await createProxy(t);
+  proxy.activateDomain();
+  proxy.startPage("p1");
+  proxy.recordRequestAttempt({
+    pageId: "p1",
+    url: "https://reset-client.vendor.tld/",
+    forward: true,
+  });
+  const client = await connectToProxy(proxy);
+  const clientClosed = new Promise<void>((resolve) => {
+    client.once("close", () => resolve());
+  });
+  client.write(
+    "CONNECT reset-client.vendor.tld:443 HTTP/1.1\r\nHost: reset-client.vendor.tld:443\r\n\r\n",
+  );
+  await readUntil(client, "\r\n\r\n");
+  await upstreamConnected.promise;
+
+  client.resetAndDestroy();
+  await Promise.all([clientClosed, upstreamClosed.promise]);
+  await waitForImmediate();
+  await waitForImmediate();
+
+  assert.equal(proxy.getFailure(), null);
+  await proxy.finishPage("p1");
+  proxy.startPage("p2");
+  await proxy.finishPage("p2");
+  await proxy.finishDomain();
+});
+
+test("late repeated upstream resets remain contained for CONNECT", async (t) => {
+  const upstream = createNetServer();
+  const upstreamPort = await listenOnLoopback(t, upstream);
+  const runtime = runtimeHarness({
+    lookup: () => [{ address: primaryPublicAddress, family: 4 }],
+    routes: new Map([
+      [
+        primaryPublicAddress,
+        { physicalPort: upstreamPort, lateConnectResetErrors: 2 },
+      ],
+    ]),
+  });
+  const proxy = await createProxy(t);
+  proxy.activateDomain();
+  proxy.startPage("p1");
+  proxy.recordRequestAttempt({
+    pageId: "p1",
+    url: "https://reset.vendor.tld/",
+    forward: true,
+  });
+
+  const response = await writeRawUntilClose(
+    proxy,
+    "CONNECT reset.vendor.tld:443 HTTP/1.1\r\nHost: reset.vendor.tld:443\r\n\r\n",
+  );
+
+  assert.ok(
+    response.byteLength === 0
+      || /^HTTP\/1\.1 502 /.test(response.toString()),
+  );
+  assert.deepEqual(runtime.connectCalls, [
+    { address: primaryPublicAddress, family: 4, port: 443 },
+  ]);
+  assertFailure(proxy, "BROWSER_PROXY_FAILED", "browser");
   await proxy.finishPage("p1");
   await proxy.finishDomain();
 });

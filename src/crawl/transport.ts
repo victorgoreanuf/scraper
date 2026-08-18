@@ -593,6 +593,10 @@ class PinnedSocketAgent extends Agent {
   }
 }
 
+function keepSocketErrorsHandled(socket: Socket | TLSSocket): void {
+  socket.on("error", () => undefined);
+}
+
 async function connectSocket(
   address: string,
   family: 4 | 6,
@@ -607,9 +611,13 @@ async function connectSocket(
     family,
     autoSelectFamily: false,
   });
+  keepSocketErrorsHandled(socket);
 
   try {
     await once(socket, "connect", { signal });
+    if (socket.destroyed || socket.errored !== null) {
+      throw socket.errored ?? new Error("Socket closed immediately after connect.");
+    }
   } catch (error) {
     socket.destroy();
     throw error;
@@ -653,6 +661,11 @@ function isCertificateError(error: unknown): boolean {
 function isTransientNetworkError(error: unknown): boolean {
   const code = errorCode(error);
   return code !== undefined && TRANSIENT_NETWORK_ERROR_CODES.has(code);
+}
+
+function isProxyClientCancellation(error: unknown): boolean {
+  const code = errorCode(error);
+  return code === "ECONNRESET" || code === "EPIPE" || code === "ECONNABORTED";
 }
 
 function canonicalIpAddress(address: string): string | undefined {
@@ -1159,6 +1172,13 @@ class BrowserProxyPageFinished extends Error {
   }
 }
 
+class BrowserProxyClientClosed extends Error {
+  constructor() {
+    super("The protected browser proxy client closed.");
+    this.name = "BrowserProxyClientClosed";
+  }
+}
+
 function proxyError(retryable = false): ProtectedTransportError {
   return transportError("BROWSER_PROXY_FAILED", "browser", retryable);
 }
@@ -1453,6 +1473,7 @@ class ProtectedBrowserProxyImpl implements ProtectedBrowserProxy {
     this.server = server;
 
     httpServer.on("connection", (socket) => {
+      keepSocketErrorsHandled(socket);
       this.serverSockets.add(socket);
       if (this.activePage !== null) {
         this.pageClientSockets.add(socket);
@@ -1491,8 +1512,12 @@ class ProtectedBrowserProxyImpl implements ProtectedBrowserProxy {
       this.latchFailure(proxyError());
       socket.destroy();
     });
-    httpServer.on("clientError", (_error, socket) => {
-      if (this.domainSignal !== null && !this.finishing) {
+    httpServer.on("clientError", (error, socket) => {
+      if (
+        this.domainSignal !== null
+        && !this.finishing
+        && !isProxyClientCancellation(error)
+      ) {
         this.latchFailure(proxyError());
       }
       socket.destroy();
@@ -1972,11 +1997,15 @@ class ProtectedBrowserProxyImpl implements ProtectedBrowserProxy {
   private async openPinnedProxySocket(
     parsed: ParsedNetworkUrl,
     pageGeneration: number,
+    operationSignal?: AbortSignal,
   ): Promise<PinnedProxySocket> {
-    const signal = this.pageSignal;
-    if (signal === null || this.pageGeneration !== pageGeneration) {
+    const pageSignal = this.pageSignal;
+    if (pageSignal === null || this.pageGeneration !== pageGeneration) {
       throw proxyError();
     }
+    const signal = operationSignal === undefined
+      ? pageSignal
+      : AbortSignal.any([pageSignal, operationSignal]);
 
     let selected: ValidatedAddressAnswer;
     try {
@@ -1998,11 +2027,13 @@ class ProtectedBrowserProxyImpl implements ProtectedBrowserProxy {
       throw mapPhaseError(error, "dns");
     }
 
-    this.assertPageGeneration(pageGeneration, signal);
+    this.assertPageGeneration(pageGeneration, pageSignal);
+    signal.throwIfAborted();
 
     const release = await this.scheduler.acquire(parsed.url.origin, signal);
     try {
-      this.assertPageGeneration(pageGeneration, signal);
+      this.assertPageGeneration(pageGeneration, pageSignal);
+      signal.throwIfAborted();
       const port = parsed.url.protocol === "https:" ? 443 : 80;
       const socket = await raceWithSignal(
         () => connectSocket(selected.address, selected.family, port, signal),
@@ -2051,6 +2082,15 @@ class ProtectedBrowserProxyImpl implements ProtectedBrowserProxy {
     request: IncomingMessage,
     response: ServerResponse,
   ): Promise<void> {
+    const clientClosed = new BrowserProxyClientClosed();
+    const clientController = new AbortController();
+    const onClientClosed = (): void => {
+      if (!clientController.signal.aborted) {
+        clientController.abort(clientClosed);
+      }
+    };
+    request.socket.once("error", onClientClosed);
+    request.socket.once("close", onClientClosed);
     let parsed: ParsedNetworkUrl | undefined;
     let pinned: PinnedProxySocket | undefined;
     let agent: PinnedSocketAgent | undefined;
@@ -2072,7 +2112,11 @@ class ProtectedBrowserProxyImpl implements ProtectedBrowserProxy {
       const pageGeneration = this.pageGeneration;
       request.resume();
 
-      pinned = await this.openPinnedProxySocket(parsed, pageGeneration);
+      pinned = await this.openPinnedProxySocket(
+        parsed,
+        pageGeneration,
+        clientController.signal,
+      );
       agent = new PinnedSocketAgent(pinned.socket);
       const upstream = await this.requestProxyHttpResponse(
         request,
@@ -2098,6 +2142,9 @@ class ProtectedBrowserProxyImpl implements ProtectedBrowserProxy {
         throw proxyError();
       }
     } catch (error) {
+      if (error === clientClosed || clientController.signal.aborted) {
+        return;
+      }
       if (pinned?.signal.aborted === true) {
         throw abortError(pinned.signal.reason);
       }
@@ -2107,6 +2154,8 @@ class ProtectedBrowserProxyImpl implements ProtectedBrowserProxy {
       }
       throw error;
     } finally {
+      request.socket.removeListener("error", onClientClosed);
+      request.socket.removeListener("close", onClientClosed);
       agent?.destroy();
       pinned?.socket.destroy();
       pinned?.release();
@@ -2181,28 +2230,45 @@ class ProtectedBrowserProxyImpl implements ProtectedBrowserProxy {
     client: Socket,
     head: Buffer,
   ): Promise<void> {
-    this.validateProxyRequest(request);
-    this.pageClientSockets.add(client);
-    if (request.method !== "CONNECT") {
-      throw proxyError();
-    }
-    const parsed = parseProxyConnectTarget(request.url ?? "", this.config);
-    assertProxyHost(request, parsed, true);
-    this.assertHttpsAuthorized(parsed);
-    const pageGeneration = this.pageGeneration;
-    const pinned = await this.openPinnedProxySocket(parsed, pageGeneration);
-    const upstream = pinned.socket;
+    const clientClosed = new BrowserProxyClientClosed();
+    const clientController = new AbortController();
+    const onClientClosed = (): void => {
+      if (!clientController.signal.aborted) {
+        clientController.abort(clientClosed);
+      }
+    };
+    client.once("error", onClientClosed);
+    client.once("close", onClientClosed);
+    let pinned: PinnedProxySocket | undefined;
 
     try {
+      this.validateProxyRequest(request);
+      this.pageClientSockets.add(client);
+      if (request.method !== "CONNECT") {
+        throw proxyError();
+      }
+      const parsed = parseProxyConnectTarget(request.url ?? "", this.config);
+      assertProxyHost(request, parsed, true);
+      this.assertHttpsAuthorized(parsed);
+      const pageGeneration = this.pageGeneration;
+      pinned = await this.openPinnedProxySocket(
+        parsed,
+        pageGeneration,
+        clientController.signal,
+      );
+      const upstream = pinned.socket;
+      if (client.destroyed || client.errored !== null || !client.writable) {
+        return;
+      }
       await new Promise<void>((resolve, reject) => {
         let settled = false;
         const counter = this.downstreamCounter();
         const cleanup = (): void => {
-          client.removeListener("error", onError);
-          upstream.removeListener("error", onError);
+          client.removeListener("error", onClientError);
+          upstream.removeListener("error", onUpstreamError);
           client.removeListener("close", onClose);
           upstream.removeListener("close", onClose);
-          counter.removeListener("error", onError);
+          counter.removeListener("error", onUpstreamError);
         };
         const settle = (error?: unknown): void => {
           if (settled) {
@@ -2218,13 +2284,14 @@ class ProtectedBrowserProxyImpl implements ProtectedBrowserProxy {
             reject(error);
           }
         };
-        const onError = (error: Error): void => settle(error);
+        const onClientError = (): void => settle(clientClosed);
+        const onUpstreamError = (error: Error): void => settle(error);
         const onClose = (): void => settle();
-        client.once("error", onError);
-        upstream.once("error", onError);
+        client.once("error", onClientError);
+        upstream.once("error", onUpstreamError);
         client.once("close", onClose);
         upstream.once("close", onClose);
-        counter.once("error", onError);
+        counter.once("error", onUpstreamError);
 
         client.write("HTTP/1.1 200 Connection Established\r\n\r\n");
         if (head.byteLength > 0) {
@@ -2233,9 +2300,16 @@ class ProtectedBrowserProxyImpl implements ProtectedBrowserProxy {
         client.pipe(upstream);
         upstream.pipe(counter).pipe(client);
       });
+    } catch (error) {
+      if (error === clientClosed) {
+        return;
+      }
+      throw error;
     } finally {
-      upstream.destroy();
-      pinned.release();
+      client.removeListener("error", onClientClosed);
+      client.removeListener("close", onClientClosed);
+      pinned?.socket.destroy();
+      pinned?.release();
     }
   }
 }
@@ -2589,9 +2663,14 @@ class ProtectedTransportSessionImpl implements ProtectedTransportSession {
       checkServerIdentity: (_hostname, certificate) =>
         checkServerIdentity(logicalHostname, certificate),
     });
+    keepSocketErrorsHandled(tlsSocket);
 
     try {
       await once(tlsSocket, "secureConnect", { signal });
+      if (tlsSocket.destroyed || tlsSocket.errored !== null) {
+        throw tlsSocket.errored
+          ?? new Error("TLS socket closed immediately after secure connect.");
+      }
     } catch (error) {
       tlsSocket.destroy();
       throw error;
