@@ -832,10 +832,15 @@ function isSafeProbePath(value: string, maximumCodeUnits: number): boolean {
   }
 }
 
-export function sanitizeUrl(
+interface SanitizedUrlResult {
+  readonly value: string;
+  readonly collapsed: boolean;
+}
+
+function sanitizeUrlResult(
   value: string,
   limits: SanitizationLimits = defaultSanitizationLimits,
-): string {
+): SanitizedUrlResult {
   if (value.length > limits.urlCodeUnits) {
     throw new TypeError("URL exceeds the configured code-unit limit");
   }
@@ -865,11 +870,24 @@ export function sanitizeUrl(
 
   const sanitized = url.href;
 
-  if (sanitized.length > limits.urlCodeUnits) {
-    throw new TypeError("Sanitized URL exceeds the configured code-unit limit");
+  if (sanitized.length <= limits.urlCodeUnits) {
+    return { value: sanitized, collapsed: false };
   }
 
-  return sanitized;
+  url.pathname = "/%5Bredacted%5D";
+  url.search = "";
+  const collapsed = url.href;
+  if (collapsed.length > limits.urlCodeUnits) {
+    throw new TypeError("Sanitized URL exceeds the configured code-unit limit");
+  }
+  return { value: collapsed, collapsed: true };
+}
+
+export function sanitizeUrl(
+  value: string,
+  limits: SanitizationLimits = defaultSanitizationLimits,
+): string {
+  return sanitizeUrlResult(value, limits).value;
 }
 
 export function sanitizeEvidenceKey(
@@ -919,7 +937,9 @@ export function createEvidenceValueMatch(input: EvidenceMatchInput): EvidenceMat
     || input.source === "network_url"
   ) {
     try {
-      candidate = sanitizeUrl(input.observedValue, limits);
+      const sanitized = sanitizeUrlResult(input.observedValue, limits);
+      if (sanitized.collapsed) return redact();
+      candidate = sanitized.value;
     } catch {
       return redact();
     }
@@ -1020,7 +1040,9 @@ export function createEvidenceVersion(input: EvidenceVersionInput): SafeVersion 
     let sanitized: URL;
     try {
       parsed = new URL(input.observedValue);
-      sanitized = new URL(sanitizeUrl(input.observedValue, limits));
+      const sanitizedResult = sanitizeUrlResult(input.observedValue, limits);
+      if (sanitizedResult.collapsed) return null;
+      sanitized = new URL(sanitizedResult.value);
     } catch {
       return null;
     }

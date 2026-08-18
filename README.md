@@ -1328,7 +1328,10 @@ Evidence redaction is part of the schema contract:
   and is not a UUID, a hexadecimal token of at least 16 characters, an
   unseparated base64url-like token of at least 24 characters, or adjacent to
   `token`, `key`, `signature`, `session`, `auth`, `password`, `secret`, or
-  `code`;
+  `code`; if those markers would expand the public URL past its configured
+  bound, page/result URLs collapse deterministically to
+  `origin/%5Bredacted%5D` with no query, while URL evidence from the original
+  observation remains fully redacted;
 - cookie values are never emitted or hashed; only a bounded non-sensitive
   cookie name remains, while an opaque/session-like name becomes `key: null`,
   and a value-dependent match uses `match.kind: "redacted"`;

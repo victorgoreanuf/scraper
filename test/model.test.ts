@@ -324,17 +324,39 @@ test("sanitizes URLs deterministically", () => {
     sanitizeUrl("https://example.com/monkey"),
     "https://example.com/monkey",
   );
+});
 
+test("bounds sanitizer expansion and redacts the original URL evidence", () => {
   const expandingQuery = `https://vendor.tld/?${Array.from(
-    { length: 150 },
-    () => "a=x",
+    { length: 200 },
+    (_value, index) => `k${index}=`,
   ).join("&")}`;
+  const expandingSensitivePath = `https://vendor.tld/${Array.from(
+    { length: 200 },
+    () => "token",
+  ).join("/")}`;
+  const cases = [
+    { source: "url", original: expandingQuery },
+    { source: "network_url", original: expandingSensitivePath },
+  ] as const;
 
-  assert.ok(expandingQuery.length < 2_048);
-  assert.throws(
-    () => sanitizeUrl(expandingQuery),
-    /Sanitized URL exceeds the configured code-unit limit/,
-  );
+  for (const testCase of cases) {
+    assert.ok(testCase.original.length < scanConfig.limits.url.codeUnits);
+    const sanitized = sanitizeUrl(testCase.original);
+    assert.ok(sanitized.length <= scanConfig.limits.url.codeUnits);
+    assert.equal(sanitizeUrl(sanitized), sanitized);
+    assert.deepEqual(createEvidenceValueMatch({
+      source: testCase.source,
+      key: null,
+      observedValue: testCase.original,
+      matchedValue: "vendor",
+      scanConfig,
+    }), {
+      kind: "redacted",
+      value: null,
+      truncated: false,
+    });
+  }
 });
 
 test("publishes whole safe DNS values and only the matched TLS issuer fragment", () => {

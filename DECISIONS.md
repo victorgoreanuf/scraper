@@ -724,7 +724,10 @@ folosește cea mai puternică relație validă fără însumarea căilor. O egal
 
 Dovada conține locatorul, regula, patternul și numai matchul exact sanitizat,
 limitat la 256 code points. Query values, query names sensibile/opace/oversized,
-segmentele URL opace, cookies și headere/valori sensibile sunt redactate;
+segmentele URL opace, cookies și headere/valori sensibile sunt redactate. Dacă
+redacția detaliată ar depăși limita URL, URL-ul public de pagină/rezultat se
+reduce determinist la `origin/%5Bredacted%5D` fără query, iar evidence-ul URL
+original rămâne complet redactat;
 valorile cookie nu sunt nici hash-uite, iar un nume de cookie opac sau sensibil
 devine `key:null` în evidence.
 O versiune este publicată numai dintr-o sursă neredactată și dacă trece gramatica

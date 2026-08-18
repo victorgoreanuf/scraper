@@ -41,6 +41,7 @@ import type {
   DetectorPool,
 } from "../src/detect/pool.ts";
 import {
+  sanitizeUrl,
   validateDomainResult,
   type BrowserPageObservations,
   type DnsRecordObservation,
@@ -1498,6 +1499,59 @@ test("drops an internal candidate whose sanitized URL collides with the entry pa
     [{ pageId: "p1", url: opaqueEntryUrl }],
   );
   assert.equal(browserPool.openCount, 1);
+  assert.equal(browserPool.session.finishCount, 1);
+  assert.equal(browserPool.session.closeCount, 1);
+  assert.equal(transport.sessions[0]?.closeCount, 1);
+  assertValidResult(result, config, true);
+});
+
+test("materializes a bounded final URL after redirect sanitization expands", async () => {
+  const config = configWith();
+  const catalog = catalogWith();
+  const expandingFinalUrl = `${ENTRY_URL}?${Array.from(
+    { length: 200 },
+    (_value, index) => `k${index}=`,
+  ).join("&")}`;
+  const redirect = Object.freeze({
+    ...response(ENTRY_URL, 302),
+    redirectUrl: expandingFinalUrl,
+  });
+  const transport = new ScriptedTransport([
+    [ENTRY_URL, redirect],
+    [expandingFinalUrl, response(expandingFinalUrl, 200, {
+      contentType: "application/json",
+      body: "{}",
+    })],
+  ]);
+  const robots = new FakeRobotsService();
+  const browserPool = new FakeBrowserPool();
+  const detectorPool = new RecordingDetectorPool(catalog);
+
+  const result = await scanDomain(DOMAIN, {
+    runId: RUN_ID,
+    config,
+    provenance: provenanceFor(config, catalog),
+    transport,
+    robots,
+    browserPool,
+    detectorPool,
+    catalog,
+  }, deterministicOptions());
+
+  assert.equal(result.status, "partial");
+  const finalUrl = result.finalUrl;
+  assert.ok(finalUrl !== null);
+  assert.ok(finalUrl.length <= config.limits.url.codeUnits);
+  assert.equal(sanitizeUrl(finalUrl), finalUrl);
+  assert.deepEqual(result.pages, []);
+  assert.deepEqual(result.errors.map((error: ScanError) => error.code), [
+    "UNSUPPORTED_CONTENT_TYPE",
+  ]);
+  assert.deepEqual(
+    transport.sessions[0]?.calls.map((call) => call.url),
+    [ENTRY_URL, expandingFinalUrl],
+  );
+  assert.equal(browserPool.session.inputs.length, 0);
   assert.equal(browserPool.session.finishCount, 1);
   assert.equal(browserPool.session.closeCount, 1);
   assert.equal(transport.sessions[0]?.closeCount, 1);
