@@ -15,6 +15,7 @@ import {
 import { DEFAULT_PARSERS } from "hyparquet/src/convert.js";
 import { deserializeTCompactProtocol } from "hyparquet/src/thrift.js";
 
+import { computeDomainSetDigest, type DomainSetDigest } from "../domain-set.ts";
 import { normalizeHostname, TargetPolicyError } from "../network-policy.ts";
 
 const TARGET_COLUMN = "root_domain";
@@ -56,6 +57,7 @@ export interface ParquetInputOptions {
 
 export interface PreparedParquetDomains {
   readonly domainCount: number;
+  readonly domainSetDigest: DomainSetDigest;
   readonly sourcePath: string;
   hasDomain(domain: string): boolean;
   domains(): AsyncGenerator<string>;
@@ -1019,6 +1021,7 @@ export async function openParquetDomainsFromFile(
 
   return Object.freeze({
     domainCount: firstRows.size,
+    domainSetDigest: computeDomainSetDigest(firstRows.keys()),
     sourcePath,
     hasDomain(domain: string): boolean {
       return firstRows.has(domain);

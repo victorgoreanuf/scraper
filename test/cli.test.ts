@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { lstat, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -8,11 +9,20 @@ import { setImmediate as waitForImmediate } from "node:timers/promises";
 import { test } from "node:test";
 import { promisify } from "node:util";
 
-import { createDefaultScanConfig } from "../src/config.ts";
+import {
+  computeConfigDigest,
+  createDefaultScanConfig,
+} from "../src/config.ts";
 import type { BrowserPool } from "../src/crawl/browser.ts";
 import type { ProtectedHttpTransport } from "../src/crawl/transport.ts";
 import type { CompiledFingerprintCatalog } from "../src/detect/catalog.ts";
 import type { DetectorPool } from "../src/detect/pool.ts";
+import { computeDomainSetDigest } from "../src/domain-set.ts";
+import {
+  canonicalizeShadowFrozenCandidate,
+  digestShadowFrozenCandidate,
+  type ShadowFrozenCandidate,
+} from "../src/evaluation-calibration.ts";
 import {
   SHADOW_EVALUATION_PROTOCOL_REVISION,
   type ShadowEvaluationSnapshot,
@@ -33,6 +43,7 @@ import {
 } from "../src/cli.ts";
 import {
   preflightShadowEvaluationOutput,
+  readPinnedShadowFrozenCandidate,
   writeShadowEvaluationArtifact,
 } from "../src/output/evaluation-writer.ts";
 import type {
@@ -45,6 +56,17 @@ import type { RunSummary } from "../src/output/summary.ts";
 
 const CONTACT = "https://crawler.veridion.com/contact";
 const RUN_ID = "12345678-1234-4123-8123-123456789abc";
+const TRAINING_RUN_ID = "87654321-4321-4321-8321-cba987654321";
+const CATALOG_SOURCE = "fixture-catalog";
+const CATALOG_REVISION = "fixture-v1";
+const CATALOG_DIGEST = `sha256:${"a".repeat(64)}`;
+const TRAINING_DOMAIN_SET_DIGEST = computeDomainSetDigest(Array.from(
+  { length: 200 },
+  (_, index) => `training-${String(index).padStart(3, "0")}.vendor.com`,
+));
+const EVALUATION_CONFIG_DIGEST = computeConfigDigest(createDefaultScanConfig(
+  `WebsiteTechScraper/0.1.7 (${CONTACT})`,
+));
 const execFileAsync = promisify(execFile);
 
 class CapturedStream extends Writable {
@@ -206,8 +228,71 @@ function shadowSnapshot(domain: string): ShadowEvaluationSnapshot {
   });
 }
 
+function frozenCandidate(
+  scannerVersion = "0.1.7",
+  configDigest = EVALUATION_CONFIG_DIGEST,
+  domainSetDigest = TRAINING_DOMAIN_SET_DIGEST,
+): ShadowFrozenCandidate {
+  const trainingProvenance: Provenance = Object.freeze({
+    scannerVersion: "0.1.5",
+    runtime: Object.freeze({
+      node: "24.19.0",
+      playwright: "1.62.1",
+      chromiumRevision: "1234",
+    }),
+    catalog: Object.freeze({
+      source: CATALOG_SOURCE,
+      revision: CATALOG_REVISION,
+      digest: CATALOG_DIGEST,
+    }),
+    configDigest: `sha256:${"b".repeat(64)}`,
+  });
+  return Object.freeze({
+    kind: "bounded-multiobjective-trigger-v2" as const,
+    calibrationRevision: "2026-08-20.2" as const,
+    protocolRevision: SHADOW_EVALUATION_PROTOCOL_REVISION,
+    trainingDomains: 200 as const,
+    objectives: Object.freeze({
+      canonicalDirectNameRetentionMinimum: 0.95 as const,
+      domainTechnologyPairRetentionMinimum: 0.8 as const,
+    }),
+    recurringNameMinimumSupport: 2 as const,
+    trainingIncrementalPairLift: 0,
+    trainingRareSingletonLift: 0,
+    globalMeanIncrementalPairLift: 0,
+    globalMeanRareSingletonLift: 0,
+    smoothingPrior: 4 as const,
+    trainingIdentity: Object.freeze({
+      artifactDigest: `sha256:${"c".repeat(64)}`,
+      domainSetDigest,
+      schemaVersion: 1 as const,
+      protocolRevision: SHADOW_EVALUATION_PROTOCOL_REVISION,
+      runId: TRAINING_RUN_ID,
+      provenance: trainingProvenance,
+    }),
+    evaluationCompatibility: Object.freeze({
+      schemaVersion: 1 as const,
+      protocolRevision: SHADOW_EVALUATION_PROTOCOL_REVISION,
+      scannerVersion,
+      catalog: trainingProvenance.catalog,
+      configDigest,
+    }),
+    trainingObjectives: Object.freeze({
+      fullPairs: 0,
+      baselineRetainedPairs: 0,
+      pairDeficit: 1,
+      fullCanonicalNames: 0,
+      baselineRetainedNames: 0,
+      nameDeficit: 1,
+    }),
+    recurringNames: Object.freeze([]),
+    tokens: Object.freeze([]),
+  });
+}
+
 class FakePreparedInput implements PreparedParquetDomains {
   readonly domainCount: number;
+  readonly domainSetDigest: ReturnType<typeof computeDomainSetDigest>;
   readonly sourcePath: string;
   readonly #values: readonly string[];
   readonly #domainSet: ReadonlySet<string>;
@@ -221,6 +306,7 @@ class FakePreparedInput implements PreparedParquetDomains {
     sourcePath = resolve("package.json"),
   ) {
     this.domainCount = values.length;
+    this.domainSetDigest = computeDomainSetDigest(values);
     this.sourcePath = sourcePath;
     this.#values = values;
     this.#domainSet = new Set(values);
@@ -330,9 +416,9 @@ function createHarness(options: HarnessOptions = {}): Harness {
   let openedResultPath: string | null = null;
 
   const catalog = {
-    source: "fixture-catalog",
-    revision: "fixture-v1",
-    digest: `sha256:${"a".repeat(64)}`,
+    source: CATALOG_SOURCE,
+    revision: CATALOG_REVISION,
+    digest: CATALOG_DIGEST,
   } as unknown as CompiledFingerprintCatalog;
   const detectorPools: DetectorPool[] = [];
   const browserPool = {
@@ -417,12 +503,24 @@ function createHarness(options: HarnessOptions = {}): Harness {
       events.push("evaluation:preflight");
       return preflightShadowEvaluationOutput(evaluationOptions);
     },
+    readPinnedShadowFrozenCandidate: async (
+      candidatePath: string,
+      candidateDigest: string,
+    ) => {
+      events.push("candidate:read");
+      return readPinnedShadowFrozenCandidate(candidatePath, candidateDigest);
+    },
     writeShadowEvaluationArtifact: async (
       prepared: Parameters<typeof writeShadowEvaluationArtifact>[0],
       artifact: Parameters<typeof writeShadowEvaluationArtifact>[1],
+      publicationOptions: Parameters<typeof writeShadowEvaluationArtifact>[2],
     ) => {
       events.push("evaluation:write");
-      await writeShadowEvaluationArtifact(prepared, artifact);
+      await writeShadowEvaluationArtifact(
+        prepared,
+        artifact,
+        publicationOptions,
+      );
     },
     scanDomain: options.scan ?? (async (domain, context) => {
       events.push(`scan:${domain}`);
@@ -455,11 +553,57 @@ function cliArguments(...extra: readonly string[]): string[] {
   ];
 }
 
+function rawDigest(value: string | Buffer): string {
+  return `sha256:${createHash("sha256").update(value).digest("hex")}`;
+}
+
+async function writeCandidate(
+  directory: string,
+  candidate: ShadowFrozenCandidate,
+): Promise<{ readonly path: string; readonly digest: string }> {
+  const path = join(directory, "trigger.candidate.json");
+  const wire = canonicalizeShadowFrozenCandidate(candidate);
+  await writeFile(path, wire, { encoding: "utf8", mode: 0o600 });
+  return Object.freeze({
+    path,
+    digest: digestShadowFrozenCandidate(candidate),
+  });
+}
+
+test("domain-set identity is independent of input order", () => {
+  const domains = [
+    "one.vendor.com",
+    "two.vendor.com",
+    "three.vendor.com",
+  ];
+  assert.equal(
+    computeDomainSetDigest(domains),
+    computeDomainSetDigest([...domains].reverse()),
+  );
+});
+
 test("parses the bounded operational surface without accepting ambiguous modes", () => {
   assert.doesNotThrow(() => parseCliArgs(cliArguments()));
   const shadow = parseCliArgs(cliArguments("--shadow-evaluation"));
   assert.equal(shadow.kind, "run");
-  if (shadow.kind === "run") assert.equal(shadow.shadowEvaluation, true);
+  if (shadow.kind === "run") {
+    assert.equal(shadow.shadowEvaluation, true);
+    assert.equal(shadow.shadowCandidatePath, null);
+    assert.equal(shadow.shadowCandidateDigest, null);
+  }
+  const holdout = parseCliArgs(cliArguments(
+    "--shadow-evaluation",
+    "--shadow-candidate",
+    "candidate.json",
+    "--shadow-candidate-digest",
+    `sha256:${"a".repeat(64)}`,
+  ));
+  assert.equal(holdout.kind, "run");
+  if (holdout.kind === "run") {
+    assert.equal(holdout.shadowEvaluation, true);
+    assert.equal(holdout.shadowCandidatePath, "candidate.json");
+    assert.equal(holdout.shadowCandidateDigest, `sha256:${"a".repeat(64)}`);
+  }
   assert.doesNotThrow(() => parseCliArgs(["--config", "scan-config.json"]));
   assert.doesNotThrow(() => parseCliArgs(["--help"]));
   assert.doesNotThrow(() => parseCliArgs(["--version"]));
@@ -471,6 +615,24 @@ test("parses the bounded operational surface without accepting ambiguous modes",
     cliArguments("--resume", "--shadow-evaluation"),
     cliArguments("--force", "--shadow-evaluation"),
     cliArguments("--shadow-evaluation", "--shadow-evaluation"),
+    cliArguments("--shadow-candidate", "candidate.json"),
+    cliArguments(
+      "--shadow-evaluation",
+      "--shadow-candidate",
+      "candidate.json",
+    ),
+    cliArguments(
+      "--shadow-evaluation",
+      "--shadow-candidate-digest",
+      `sha256:${"a".repeat(64)}`,
+    ),
+    cliArguments(
+      "--shadow-evaluation",
+      "--shadow-candidate",
+      "candidate.json",
+      "--shadow-candidate-digest",
+      `sha256:${"A".repeat(64)}`,
+    ),
     ["--contact", "mailto:.@veridion.com"],
     ["--contact", "mailto:a..b@veridion.com"],
     ["--contact", "mailto:a.@veridion.com"],
@@ -498,7 +660,7 @@ test("prints help, version, and usage failures without initializing the run", as
     stdout: version.stdout,
     stderr: version.stderr,
   }), 0);
-  assert.equal(version.stdout.text(), "0.1.6\n");
+  assert.equal(version.stdout.text(), "0.1.7\n");
   assert.equal(version.stderr.text(), "");
   assert.deepEqual(version.events, []);
 
@@ -522,7 +684,7 @@ test("loads one complete bounded JSON configuration before input preflight", asy
     await writeFile(
       configPath,
       JSON.stringify(createDefaultScanConfig(
-        "WebsiteTechScraper/0.1.6 (https://crawler.veridion.com/contact)",
+        "WebsiteTechScraper/0.1.7 (https://crawler.veridion.com/contact)",
       )),
       { encoding: "utf8", mode: 0o600 },
     );
@@ -565,11 +727,11 @@ test("loads one complete bounded JSON configuration before input preflight", asy
 
     const invalidContactPath = join(directory, "invalid-contact.json");
     const invalidContact = createDefaultScanConfig(
-      "WebsiteTechScraper/0.1.6 (https://crawler.veridion.com/contact)",
+      "WebsiteTechScraper/0.1.7 (https://crawler.veridion.com/contact)",
     );
     await writeFile(
       invalidContactPath,
-      JSON.stringify({ ...invalidContact, userAgent: "WebsiteTechScraper/0.1.6 (https://x)" }),
+      JSON.stringify({ ...invalidContact, userAgent: "WebsiteTechScraper/0.1.7 (https://x)" }),
       { encoding: "utf8", mode: 0o600 },
     );
     const rejectedContact = createHarness();
@@ -796,6 +958,177 @@ test("requires the exact fixed cohort before shadow output or network startup", 
   assert.match(harness.stderr.text(), /CLI_EVALUATION_INPUT_INVALID/u);
 });
 
+test("rejects the exact training domain set before catalog, pools, or writer", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "veridion-cli-candidate-domain-set-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const trainingDomains = Array.from(
+    { length: 200 },
+    (_, index) => `domain-${String(index).padStart(3, "0")}.vendor.com`,
+  );
+  const candidate = frozenCandidate(
+    "0.1.7",
+    EVALUATION_CONFIG_DIGEST,
+    computeDomainSetDigest(trainingDomains),
+  );
+  const pinned = await writeCandidate(directory, candidate);
+  const harness = createHarness({
+    domains: [...trainingDomains].reverse(),
+    outputPaths: {
+      resultPath: join(directory, "holdout.jsonl"),
+      summaryPath: join(directory, "holdout.summary.json"),
+    },
+  });
+
+  assert.equal(await runCli(cliArguments(
+    "--shadow-evaluation",
+    "--shadow-candidate",
+    pinned.path,
+    "--shadow-candidate-digest",
+    pinned.digest,
+  ), {
+    dependencies: harness.dependencies,
+    stdout: harness.stdout,
+    stderr: harness.stderr,
+  }), 1);
+  assert.equal(harness.events.includes("candidate:read"), true);
+  assert.equal(harness.events.includes("evaluation:preflight"), false);
+  assert.equal(harness.events.includes("catalog:loaded"), false);
+  assert.equal(harness.events.includes("detector:ready"), false);
+  assert.equal(harness.events.includes("browser:ready"), false);
+  assert.equal(
+    harness.events.some((event) => event.startsWith("writer:open:")),
+    false,
+  );
+  assert.match(harness.stderr.text(), /CLI_EVALUATION_CANDIDATE_INVALID/u);
+});
+
+test("rejects an invalid pinned candidate before catalog or pool startup", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "veridion-cli-candidate-invalid-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const candidatePath = join(directory, "invalid.candidate.json");
+  const wire = "{}";
+  await writeFile(candidatePath, wire, { mode: 0o600 });
+  const harness = createHarness({
+    domains: Array.from(
+      { length: 200 },
+      (_, index) => `domain-${String(index).padStart(3, "0")}.vendor.com`,
+    ),
+    outputPaths: {
+      resultPath: join(directory, "cohort.jsonl"),
+      summaryPath: join(directory, "cohort.summary.json"),
+    },
+  });
+
+  assert.equal(await runCli(cliArguments(
+    "--shadow-evaluation",
+    "--shadow-candidate",
+    candidatePath,
+    "--shadow-candidate-digest",
+    rawDigest(wire),
+  ), {
+    dependencies: harness.dependencies,
+    stdout: harness.stdout,
+    stderr: harness.stderr,
+  }), 1);
+  assert.equal(harness.events.includes("candidate:read"), true);
+  assert.equal(harness.events.includes("catalog:loaded"), false);
+  assert.equal(harness.events.includes("detector:ready"), false);
+  assert.equal(harness.events.includes("browser:ready"), false);
+  assert.match(harness.stderr.text(), /EVALUATION_SOURCE_INVALID/u);
+});
+
+test("rejects an incompatible frozen candidate before detector or browser startup", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "veridion-cli-candidate-incompatible-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const pinned = await writeCandidate(directory, frozenCandidate("9.9.9"));
+  const harness = createHarness({
+    domains: Array.from(
+      { length: 200 },
+      (_, index) => `domain-${String(index).padStart(3, "0")}.vendor.com`,
+    ),
+    outputPaths: {
+      resultPath: join(directory, "cohort.jsonl"),
+      summaryPath: join(directory, "cohort.summary.json"),
+    },
+  });
+
+  assert.equal(await runCli(cliArguments(
+    "--shadow-evaluation",
+    "--shadow-candidate",
+    pinned.path,
+    "--shadow-candidate-digest",
+    pinned.digest,
+  ), {
+    dependencies: harness.dependencies,
+    stdout: harness.stdout,
+    stderr: harness.stderr,
+  }), 1);
+  assert.equal(harness.events.includes("candidate:read"), true);
+  assert.equal(harness.events.includes("catalog:loaded"), true);
+  assert.equal(harness.events.includes("detector:ready"), false);
+  assert.equal(harness.events.includes("browser:ready"), false);
+  assert.match(harness.stderr.text(), /CLI_EVALUATION_CANDIDATE_INVALID/u);
+});
+
+test("rejects a candidate and output collision before destructive startup", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "veridion-cli-candidate-collision-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const pinned = await writeCandidate(directory, frozenCandidate());
+  const harness = createHarness({
+    domains: Array.from(
+      { length: 200 },
+      (_, index) => `domain-${String(index).padStart(3, "0")}.vendor.com`,
+    ),
+    outputPaths: {
+      resultPath: pinned.path,
+      summaryPath: join(directory, "cohort.summary.json"),
+    },
+  });
+
+  assert.equal(await runCli(cliArguments(
+    "--shadow-evaluation",
+    "--shadow-candidate",
+    pinned.path,
+    "--shadow-candidate-digest",
+    pinned.digest,
+  ), {
+    dependencies: harness.dependencies,
+    stdout: harness.stdout,
+    stderr: harness.stderr,
+  }), 1);
+  assert.equal(harness.events.includes("candidate:read"), true);
+  assert.equal(harness.events.includes("catalog:loaded"), false);
+  assert.equal(harness.events.includes("detector:ready"), false);
+  assert.equal(await readFile(pinned.path, "utf8"),
+    canonicalizeShadowFrozenCandidate(frozenCandidate()));
+  assert.match(harness.stderr.text(), /CLI_PATH_COLLISION/u);
+
+  const inputCollision = createHarness({
+    domains: Array.from(
+      { length: 200 },
+      (_, index) => `domain-${String(index).padStart(3, "0")}.vendor.com`,
+    ),
+    sourcePath: pinned.path,
+    outputPaths: {
+      resultPath: join(directory, "other.jsonl"),
+      summaryPath: join(directory, "other.summary.json"),
+    },
+  });
+  assert.equal(await runCli(cliArguments(
+    "--shadow-evaluation",
+    "--shadow-candidate",
+    pinned.path,
+    "--shadow-candidate-digest",
+    pinned.digest,
+  ), {
+    dependencies: inputCollision.dependencies,
+    stdout: inputCollision.stdout,
+    stderr: inputCollision.stderr,
+  }), 1);
+  assert.equal(inputCollision.events.includes("catalog:loaded"), false);
+  assert.match(inputCollision.stderr.text(), /CLI_PATH_COLLISION/u);
+});
+
 test("rejects an existing shadow sidecar before pools or output are opened", async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "veridion-cli-shadow-collision-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
@@ -894,6 +1227,62 @@ test("collects one snapshot per domain and publishes after finalize and cleanup"
   assert.ok(inputClose >= 0 && inputClose < evaluationWrite);
   assert.ok(browserClose >= 0 && browserClose < evaluationWrite);
   assert.ok(detectorClose >= 0 && detectorClose < evaluationWrite);
+});
+
+test("publishes a frozen holdout report without development training", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "veridion-cli-holdout-success-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const candidate = frozenCandidate();
+  const pinned = await writeCandidate(directory, candidate);
+  const domains = Array.from(
+    { length: 200 },
+    (_, index) => `domain-${String(index).padStart(3, "0")}.vendor.com`,
+  );
+  const harness = createHarness({
+    domains,
+    outputPaths: {
+      resultPath: join(directory, "holdout.jsonl"),
+      summaryPath: join(directory, "holdout.summary.json"),
+    },
+    scan: async (domain, context, options) => {
+      await options?.onShadowSnapshot?.(shadowSnapshot(domain));
+      return failedResult(domain, context.provenance);
+    },
+  });
+
+  assert.equal(await runCli(cliArguments(
+    "--shadow-evaluation",
+    "--shadow-candidate",
+    pinned.path,
+    "--shadow-candidate-digest",
+    pinned.digest,
+    "--quiet",
+  ), {
+    dependencies: harness.dependencies,
+    stdout: harness.stdout,
+    stderr: harness.stderr,
+  }), 0, harness.stderr.text());
+
+  const value = JSON.parse(await readFile(
+    join(directory, "holdout.evaluation.json"),
+    "utf8",
+  )) as {
+    readonly calibration: {
+      readonly mode: string;
+      readonly candidateDigest: string;
+      readonly predictions: readonly unknown[];
+      readonly deployable: { readonly selected: readonly unknown[] };
+    };
+  };
+  assert.equal(value.calibration.mode, "frozen-holdout");
+  assert.equal(value.calibration.candidateDigest, pinned.digest);
+  assert.equal(value.calibration.predictions.length, 200);
+  assert.equal(value.calibration.deployable.selected.length, 40);
+  assert.equal(harness.detectorPools.length, 3);
+  assert.ok(
+    harness.events.indexOf("candidate:read")
+      < harness.events.indexOf("catalog:loaded"),
+  );
 });
 
 test("leaves the shadow target absent when snapshot finalization fails", async (t) => {
@@ -1099,7 +1488,7 @@ async function waitForContext(
   const event = harness.events.find((value) => value.startsWith("writer:open:"));
   assert.ok(event);
   return {
-    scannerVersion: "0.1.6",
+    scannerVersion: "0.1.7",
     runtime: {
       node: "24.19.0",
       playwright: "1.62.1",

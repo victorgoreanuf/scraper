@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { constants, type Stats } from "node:fs";
 import {
   link,
@@ -13,8 +13,15 @@ import { basename, dirname, join, resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 
 import {
-  calibrateShadowEvaluation,
+  calibrateShadowDevelopmentSource,
+  canonicalizeShadowFrozenCandidate,
+  digestShadowFrozenCandidate,
+  evaluateFrozenShadowCandidate,
+  validateShadowFrozenCandidate,
   type ShadowCalibrationReport,
+  type ShadowDevelopmentCalibrationReport,
+  type ShadowFrozenCandidate,
+  type ShadowFrozenHoldoutReport,
 } from "../evaluation-calibration.ts";
 import {
   createShadowEvaluationAccumulator,
@@ -29,8 +36,10 @@ import type { Provenance } from "../model.ts";
 const FILE_MODE = 0o600;
 const NO_FOLLOW = constants.O_NOFOLLOW ?? 0;
 const RUN_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+const SHA256_DIGEST = /^sha256:[0-9a-f]{64}$/u;
 const MAX_STRUCTURE_ITEMS = 500_000;
 const MAX_STRUCTURE_DEPTH = 32;
+const PATH_CODE_UNITS = 4_096;
 
 export const SHADOW_EVALUATION_ARTIFACT_BYTES = 64 * 1_024 * 1_024;
 
@@ -40,7 +49,10 @@ export type EvaluationWriterErrorCode =
   | "EVALUATION_INVALID_ARTIFACT"
   | "EVALUATION_INVALID_TARGET"
   | "EVALUATION_IO_FAILED"
-  | "EVALUATION_PATH_COLLISION";
+  | "EVALUATION_PATH_COLLISION"
+  | "EVALUATION_SOURCE_INVALID"
+  | "EVALUATION_DIGEST_MISMATCH"
+  | "EVALUATION_CANDIDATE_REJECTED";
 
 export class EvaluationWriterError extends Error {
   readonly code: EvaluationWriterErrorCode;
@@ -69,9 +81,39 @@ export interface PreparedShadowEvaluationOutput {
   readonly parentInode: number;
 }
 
+export interface PreflightShadowCandidateOutputOptions {
+  readonly candidatePath: string;
+  readonly reservedPaths?: readonly string[] | undefined;
+  readonly sourcePaths?: readonly string[] | undefined;
+}
+
+export interface PreparedShadowCandidateOutput {
+  readonly candidatePath: string;
+  readonly parentPath: string;
+  readonly parentDevice: number;
+  readonly parentInode: number;
+}
+
 export interface PublishedShadowEvaluationArtifact
   extends ShadowEvaluationArtifact {
-  readonly calibration: ShadowCalibrationReport;
+  readonly calibration: ShadowCalibrationReport | ShadowFrozenHoldoutReport;
+}
+
+export interface LoadedShadowDevelopmentArtifact {
+  readonly artifact: ShadowEvaluationArtifact;
+  readonly sourcePath: string;
+  readonly digest: string;
+}
+
+export interface LoadedShadowFrozenCandidate {
+  readonly candidate: ShadowFrozenCandidate;
+  readonly sourcePath: string;
+  readonly digest: string;
+}
+
+export interface ShadowEvaluationPublicationOptions {
+  readonly frozenCandidate?: ShadowFrozenCandidate | undefined;
+  readonly candidateDigest?: string | undefined;
 }
 
 function evaluationError(
@@ -311,11 +353,12 @@ function preflightJsonStructure(value: unknown): void {
   }
 }
 
-function canonicalPublishedArtifact(
+function canonicalShadowEvaluationArtifact(
   value: unknown,
-): PublishedShadowEvaluationArtifact {
+  allowPublishedCalibration: boolean,
+): ShadowEvaluationArtifact {
   assertPlainRecord(value, "artifact");
-  assertExactKeys(value, [
+  const baseKeys = [
     "schemaVersion",
     "protocolRevision",
     "runId",
@@ -323,7 +366,16 @@ function canonicalPublishedArtifact(
     "provenance",
     "snapshots",
     "browserLimitAggregates",
-  ], "artifact");
+  ] as const;
+  const hasCalibration = Object.hasOwn(value, "calibration");
+  if (hasCalibration && !allowPublishedCalibration) {
+    invalidArtifact("The unpublished shadow evaluation artifact includes calibration.");
+  }
+  assertExactKeys(
+    value,
+    hasCalibration ? [...baseKeys, "calibration"] : baseKeys,
+    "artifact",
+  );
   if (value.schemaVersion !== SHADOW_EVALUATION_SCHEMA_VERSION) {
     invalidArtifact("The shadow evaluation schema version does not match.");
   }
@@ -350,13 +402,222 @@ function canonicalPublishedArtifact(
     accumulator.add(snapshot as ShadowEvaluationSnapshot);
   }
   const canonical = accumulator.build(value.inputDomains);
-  if (!isDeepStrictEqual(value, canonical)) {
+  const comparable = hasCalibration
+    ? Object.freeze({
+        schemaVersion: value.schemaVersion,
+        protocolRevision: value.protocolRevision,
+        runId: value.runId,
+        inputDomains: value.inputDomains,
+        provenance: value.provenance,
+        snapshots: value.snapshots,
+        browserLimitAggregates: value.browserLimitAggregates,
+      })
+    : value;
+  if (!isDeepStrictEqual(comparable, canonical)) {
     invalidArtifact("The shadow evaluation artifact is not canonical.");
+  }
+  return canonical;
+}
+
+function canonicalPublishedArtifact(
+  value: unknown,
+  options: ShadowEvaluationPublicationOptions,
+): PublishedShadowEvaluationArtifact {
+  const canonical = canonicalShadowEvaluationArtifact(value, false);
+  const hasCandidate = options.frozenCandidate !== undefined;
+  const hasDigest = options.candidateDigest !== undefined;
+  if (hasCandidate !== hasDigest) {
+    invalidArtifact("A frozen shadow candidate and digest must be provided together.");
   }
   return Object.freeze({
     ...canonical,
-    calibration: calibrateShadowEvaluation(canonical.snapshots),
+    calibration: hasCandidate
+      ? evaluateFrozenShadowCandidate(
+          canonical,
+          options.frozenCandidate!,
+          { candidateDigest: options.candidateDigest! },
+        )
+      : calibrateShadowDevelopmentSource(canonical),
   });
+}
+
+async function readPinnedJsonSource(
+  requestedPath: string,
+  expectedDigest: string,
+): Promise<{
+  readonly sourcePath: string;
+  readonly digest: string;
+  readonly text: string;
+  readonly value: unknown;
+}> {
+  if (!SHA256_DIGEST.test(expectedDigest)) {
+    throw evaluationError(
+      "EVALUATION_SOURCE_INVALID",
+      "The pinned shadow artifact digest is invalid.",
+    );
+  }
+  if (
+    requestedPath.length === 0
+    || requestedPath.length > PATH_CODE_UNITS
+    || !requestedPath.isWellFormed()
+    || requestedPath.includes("\0")
+  ) {
+    throw evaluationError(
+      "EVALUATION_SOURCE_INVALID",
+      "The pinned shadow artifact path is invalid.",
+    );
+  }
+
+  let handle: FileHandle | undefined;
+  try {
+    const absolutePath = resolve(requestedPath);
+    const requestedStats = await lstat(absolutePath);
+    if (
+      requestedStats.isSymbolicLink()
+      || !requestedStats.isFile()
+      || requestedStats.nlink !== 1
+      || requestedStats.size > SHADOW_EVALUATION_ARTIFACT_BYTES
+    ) {
+      throw new Error("invalid source target");
+    }
+    const sourcePath = join(
+      await realpath(dirname(absolutePath)),
+      basename(absolutePath),
+    );
+    const sourceStats = await lstat(sourcePath);
+    if (
+      sourceStats.isSymbolicLink()
+      || !sourceStats.isFile()
+      || sourceStats.nlink !== 1
+      || sourceStats.size > SHADOW_EVALUATION_ARTIFACT_BYTES
+      || !sameIdentity(requestedStats, sourceStats)
+    ) {
+      throw new Error("invalid source identity");
+    }
+
+    handle = await open(
+      sourcePath,
+      constants.O_RDONLY | constants.O_NONBLOCK | NO_FOLLOW,
+    );
+    const descriptor = await handle.stat();
+    if (
+      !descriptor.isFile()
+      || descriptor.nlink !== 1
+      || descriptor.size > SHADOW_EVALUATION_ARTIFACT_BYTES
+      || !sameIdentity(sourceStats, descriptor)
+    ) {
+      throw new Error("invalid source descriptor");
+    }
+
+    const bytes = Buffer.alloc(descriptor.size + 1);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const { bytesRead } = await handle.read(
+        bytes,
+        offset,
+        bytes.length - offset,
+        null,
+      );
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    const finalDescriptor = await handle.stat();
+    const finalPathStats = await lstat(sourcePath);
+    if (
+      offset !== descriptor.size
+      || finalDescriptor.size !== descriptor.size
+      || !sameIdentity(descriptor, finalDescriptor)
+      || finalPathStats.isSymbolicLink()
+      || !finalPathStats.isFile()
+      || finalPathStats.nlink !== 1
+      || finalPathStats.size !== descriptor.size
+      || !sameIdentity(descriptor, finalPathStats)
+    ) {
+      throw new Error("source changed while reading");
+    }
+
+    const contents = bytes.subarray(0, offset);
+    const digest = `sha256:${createHash("sha256").update(contents).digest("hex")}`;
+    if (digest !== expectedDigest) {
+      throw evaluationError(
+        "EVALUATION_DIGEST_MISMATCH",
+        "The shadow artifact does not match its operator-pinned digest.",
+      );
+    }
+    const text = new TextDecoder("utf-8", {
+      fatal: true,
+      ignoreBOM: true,
+    }).decode(contents);
+    return Object.freeze({
+      sourcePath,
+      digest,
+      text,
+      value: JSON.parse(text) as unknown,
+    });
+  } catch (error) {
+    if (error instanceof EvaluationWriterError) throw error;
+    throw evaluationError(
+      "EVALUATION_SOURCE_INVALID",
+      "The pinned shadow artifact is unavailable or invalid.",
+      error,
+    );
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
+export async function readPinnedShadowDevelopmentArtifact(
+  path: string,
+  expectedDigest: string,
+): Promise<LoadedShadowDevelopmentArtifact> {
+  const loaded = await readPinnedJsonSource(path, expectedDigest);
+  try {
+    preflightJsonStructure(loaded.value);
+    const artifact = canonicalShadowEvaluationArtifact(loaded.value, true);
+    return Object.freeze({
+      artifact,
+      sourcePath: loaded.sourcePath,
+      digest: loaded.digest,
+    });
+  } catch (error) {
+    if (error instanceof EvaluationWriterError) throw error;
+    throw evaluationError(
+      "EVALUATION_SOURCE_INVALID",
+      "The pinned development artifact failed validation.",
+      error,
+    );
+  }
+}
+
+export async function readPinnedShadowFrozenCandidate(
+  path: string,
+  expectedDigest: string,
+): Promise<LoadedShadowFrozenCandidate> {
+  const loaded = await readPinnedJsonSource(path, expectedDigest);
+  try {
+    preflightJsonStructure(loaded.value);
+    const candidate = validateShadowFrozenCandidate(loaded.value);
+    const canonical = canonicalizeShadowFrozenCandidate(candidate);
+    const digest = digestShadowFrozenCandidate(candidate);
+    if (loaded.text !== canonical || loaded.digest !== digest) {
+      throw evaluationError(
+        "EVALUATION_SOURCE_INVALID",
+        "The frozen shadow candidate file is not canonical.",
+      );
+    }
+    return Object.freeze({
+      candidate,
+      sourcePath: loaded.sourcePath,
+      digest,
+    });
+  } catch (error) {
+    if (error instanceof EvaluationWriterError) throw error;
+    throw evaluationError(
+      "EVALUATION_SOURCE_INVALID",
+      "The frozen shadow candidate failed validation.",
+      error,
+    );
+  }
 }
 
 export async function preflightShadowEvaluationOutput(
@@ -422,6 +683,77 @@ export async function preflightShadowEvaluationOutput(
   });
 }
 
+export async function preflightShadowCandidateOutput(
+  options: PreflightShadowCandidateOutputOptions,
+): Promise<PreparedShadowCandidateOutput> {
+  if (
+    options.candidatePath.length === 0
+    || options.candidatePath.length > PATH_CODE_UNITS
+    || !options.candidatePath.isWellFormed()
+    || options.candidatePath.includes("\0")
+  ) {
+    throw evaluationError(
+      "EVALUATION_INVALID_TARGET",
+      "The shadow candidate target path is invalid.",
+    );
+  }
+  const absoluteCandidatePath = resolve(options.candidatePath);
+  const requestedParent = dirname(absoluteCandidatePath);
+  let parentPath: string;
+  let parentStats: Stats;
+  try {
+    parentPath = await realpath(requestedParent);
+    parentStats = await stat(parentPath);
+  } catch (error) {
+    throw evaluationError(
+      "EVALUATION_INVALID_TARGET",
+      "The shadow candidate parent directory is unavailable.",
+      error,
+    );
+  }
+  if (!parentStats.isDirectory()) {
+    throw evaluationError(
+      "EVALUATION_INVALID_TARGET",
+      "The shadow candidate parent is not a directory.",
+    );
+  }
+
+  const candidatePath = join(parentPath, basename(absoluteCandidatePath));
+  for (const path of [
+    ...(options.reservedPaths ?? []),
+    ...(options.sourcePaths ?? []),
+  ]) {
+    let comparablePath: string;
+    try {
+      const absolutePath = resolve(path);
+      comparablePath = join(
+        await realpath(dirname(absolutePath)),
+        basename(absolutePath),
+      );
+    } catch (error) {
+      throw evaluationError(
+        "EVALUATION_INVALID_TARGET",
+        "A reserved or source path could not be canonicalized safely.",
+        error,
+      );
+    }
+    if (comparablePath === candidatePath) {
+      throw evaluationError(
+        "EVALUATION_PATH_COLLISION",
+        "The shadow candidate target aliases a reserved or source path.",
+      );
+    }
+  }
+
+  await inspectAbsentTarget(candidatePath);
+  return Object.freeze({
+    candidatePath,
+    parentPath,
+    parentDevice: parentStats.dev,
+    parentInode: parentStats.ino,
+  });
+}
+
 async function writeAll(handle: FileHandle, bytes: Buffer): Promise<void> {
   let offset = 0;
   while (offset < bytes.length) {
@@ -475,14 +807,169 @@ async function verifyOwnedRegularFile(
   }
 }
 
+interface PreparedAtomicOutput {
+  readonly parentPath: string;
+  readonly parentDevice: number;
+  readonly parentInode: number;
+}
+
+async function publishAtomicBytes(
+  prepared: PreparedAtomicOutput,
+  targetPath: string,
+  bytes: Buffer,
+): Promise<void> {
+  let currentParentPath: string;
+  let currentParentStats: Stats;
+  try {
+    currentParentPath = await realpath(prepared.parentPath);
+    currentParentStats = await stat(currentParentPath);
+  } catch (error) {
+    throw evaluationError(
+      "EVALUATION_INVALID_TARGET",
+      "The shadow artifact parent directory is unavailable.",
+      error,
+    );
+  }
+  if (
+    !currentParentStats.isDirectory()
+    || currentParentPath !== prepared.parentPath
+    || currentParentStats.dev !== prepared.parentDevice
+    || currentParentStats.ino !== prepared.parentInode
+  ) {
+    throw evaluationError(
+      "EVALUATION_INVALID_TARGET",
+      "The shadow artifact parent directory changed after preflight.",
+    );
+  }
+  await inspectAbsentTarget(targetPath);
+
+  const tempPath = join(
+    prepared.parentPath,
+    `.${basename(targetPath)}.${randomUUID()}.tmp`,
+  );
+  let tempHandle: FileHandle | undefined;
+  let tempStats: Stats | undefined;
+  let linked = false;
+  let committed = false;
+  try {
+    tempHandle = await open(
+      tempPath,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | NO_FOLLOW,
+      FILE_MODE,
+    );
+    tempStats = await tempHandle.stat();
+    if (!tempStats.isFile() || tempStats.nlink !== 1) {
+      throw evaluationError(
+        "EVALUATION_INVALID_TARGET",
+        "The shadow artifact temporary descriptor is not a regular file.",
+      );
+    }
+    await writeAll(tempHandle, bytes);
+    await tempHandle.sync();
+    await tempHandle.close();
+    tempHandle = undefined;
+    await verifyOwnedRegularFile(tempPath, tempStats, 1);
+
+    try {
+      await link(tempPath, targetPath);
+      linked = true;
+    } catch (error) {
+      if (errorCode(error) === "EEXIST") {
+        await inspectAbsentTarget(targetPath);
+      }
+      throw error;
+    }
+    await verifyOwnedRegularFile(targetPath, tempStats, 2);
+    if (!await unlinkOwnedPath(tempPath, tempStats)) {
+      throw evaluationError(
+        "EVALUATION_INVALID_TARGET",
+        "The shadow artifact temporary target changed before cleanup.",
+      );
+    }
+    await verifyOwnedRegularFile(targetPath, tempStats, 1);
+    committed = true;
+  } catch (error) {
+    if (linked && !committed && tempStats !== undefined) {
+      await unlinkOwnedPath(targetPath, tempStats);
+    }
+    if (error instanceof EvaluationWriterError) throw error;
+    throw evaluationError(
+      "EVALUATION_IO_FAILED",
+      "The shadow artifact could not be published atomically.",
+      error,
+    );
+  } finally {
+    await tempHandle?.close().catch(() => undefined);
+    if (tempStats !== undefined) {
+      await unlinkOwnedPath(tempPath, tempStats);
+    }
+  }
+}
+
+export async function writeShadowFrozenCandidateArtifact(
+  prepared: PreparedShadowCandidateOutput,
+  report: ShadowDevelopmentCalibrationReport,
+): Promise<string> {
+  const candidate = report.candidate;
+  const guardrails = report.deployable.provisionalGuardrails;
+  const costGuardrails = guardrails.realBrowserCosts;
+  if (
+    candidate === null
+    || !guardrails.passed
+    || !guardrails.canonicalDirectNames.passed
+    || !guardrails.domainTechnologyPairs.passed
+    || !guardrails.routedDomains.passed
+    || !costGuardrails.passed
+    || !costGuardrails.browserPagesAttempted.passed
+    || !costGuardrails.browserPagesAdmitted.passed
+    || !costGuardrails.browserRequests.passed
+    || !costGuardrails.browserTransferredBytes.passed
+    || !costGuardrails.browserMs.passed
+  ) {
+    throw evaluationError(
+      "EVALUATION_CANDIDATE_REJECTED",
+      "The development GO/NO-GO verdict does not permit candidate publication.",
+    );
+  }
+
+  let canonical: string;
+  let digest: string;
+  try {
+    preflightJsonStructure(candidate);
+    const validated = validateShadowFrozenCandidate(candidate);
+    canonical = canonicalizeShadowFrozenCandidate(validated);
+    digest = digestShadowFrozenCandidate(validated);
+    if (
+      Buffer.byteLength(canonical, "utf8") > SHADOW_EVALUATION_ARTIFACT_BYTES
+    ) {
+      artifactLimit("The frozen shadow candidate exceeds 64 MiB.");
+    }
+  } catch (error) {
+    if (error instanceof EvaluationWriterError) throw error;
+    throw evaluationError(
+      "EVALUATION_INVALID_ARTIFACT",
+      "The frozen shadow candidate failed structural validation.",
+      error,
+    );
+  }
+
+  await publishAtomicBytes(
+    prepared,
+    prepared.candidatePath,
+    Buffer.from(canonical, "utf8"),
+  );
+  return digest;
+}
+
 export async function writeShadowEvaluationArtifact(
   prepared: PreparedShadowEvaluationOutput,
   artifact: ShadowEvaluationArtifact,
+  options: ShadowEvaluationPublicationOptions = {},
 ): Promise<void> {
   let published: PublishedShadowEvaluationArtifact;
   try {
     preflightJsonStructure(artifact);
-    published = canonicalPublishedArtifact(artifact);
+    published = canonicalPublishedArtifact(artifact, options);
     preflightJsonStructure(published);
   } catch (error) {
     if (error instanceof EvaluationWriterError) throw error;
@@ -509,90 +996,5 @@ export async function writeShadowEvaluationArtifact(
     );
   }
 
-  let currentParentPath: string;
-  let currentParentStats: Stats;
-  try {
-    currentParentPath = await realpath(prepared.parentPath);
-    currentParentStats = await stat(currentParentPath);
-  } catch (error) {
-    throw evaluationError(
-      "EVALUATION_INVALID_TARGET",
-      "The shadow evaluation parent directory is unavailable.",
-      error,
-    );
-  }
-  if (
-    !currentParentStats.isDirectory()
-    || currentParentPath !== prepared.parentPath
-    || currentParentStats.dev !== prepared.parentDevice
-    || currentParentStats.ino !== prepared.parentInode
-  ) {
-    throw evaluationError(
-      "EVALUATION_INVALID_TARGET",
-      "The shadow evaluation parent directory changed after preflight.",
-    );
-  }
-  await inspectAbsentTarget(prepared.evaluationPath);
-
-  const tempPath = join(
-    prepared.parentPath,
-    `.${basename(prepared.evaluationPath)}.${randomUUID()}.tmp`,
-  );
-  let tempHandle: FileHandle | undefined;
-  let tempStats: Stats | undefined;
-  let linked = false;
-  let committed = false;
-  try {
-    tempHandle = await open(
-      tempPath,
-      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | NO_FOLLOW,
-      FILE_MODE,
-    );
-    tempStats = await tempHandle.stat();
-    if (!tempStats.isFile() || tempStats.nlink !== 1) {
-      throw evaluationError(
-        "EVALUATION_INVALID_TARGET",
-        "The shadow evaluation temporary descriptor is not a regular file.",
-      );
-    }
-    await writeAll(tempHandle, bytes);
-    await tempHandle.sync();
-    await tempHandle.close();
-    tempHandle = undefined;
-    await verifyOwnedRegularFile(tempPath, tempStats, 1);
-
-    try {
-      await link(tempPath, prepared.evaluationPath);
-      linked = true;
-    } catch (error) {
-      if (errorCode(error) === "EEXIST") {
-        await inspectAbsentTarget(prepared.evaluationPath);
-      }
-      throw error;
-    }
-    await verifyOwnedRegularFile(prepared.evaluationPath, tempStats, 2);
-    if (!await unlinkOwnedPath(tempPath, tempStats)) {
-      throw evaluationError(
-        "EVALUATION_INVALID_TARGET",
-        "The shadow evaluation temporary target changed before cleanup.",
-      );
-    }
-    await verifyOwnedRegularFile(prepared.evaluationPath, tempStats, 1);
-    committed = true;
-  } catch (error) {
-    if (linked && !committed && tempStats !== undefined) {
-      await unlinkOwnedPath(prepared.evaluationPath, tempStats);
-    }
-    if (error instanceof EvaluationWriterError) throw error;
-    throw evaluationError(
-      "EVALUATION_IO_FAILED",
-      "The shadow evaluation artifact could not be published atomically.",
-      error,
-    );
-  } finally {
-    await tempHandle?.close().catch(() => undefined);
-    if (tempStats !== undefined) {
-      await unlinkOwnedPath(tempPath, tempStats);
-    }
-  }
+  await publishAtomicBytes(prepared, prepared.evaluationPath, bytes);
 }

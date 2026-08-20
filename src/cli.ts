@@ -35,9 +35,15 @@ import {
 import {
   createShadowEvaluationAccumulator,
   SHADOW_EVALUATION_DOMAIN_COUNT,
+  SHADOW_EVALUATION_PROTOCOL_REVISION,
+  SHADOW_EVALUATION_SCHEMA_VERSION,
   type ShadowEvaluationArtifact,
   type ShadowEvaluationSnapshot,
 } from "./evaluation.ts";
+import {
+  assertShadowFrozenCandidateCompatibility,
+  type ShadowFrozenCandidate,
+} from "./evaluation-calibration.ts";
 import {
   openParquetDomainsFromFile,
   ParquetInputError,
@@ -47,6 +53,7 @@ import type { Provenance, DomainResult } from "./model.ts";
 import {
   EvaluationWriterError,
   preflightShadowEvaluationOutput,
+  readPinnedShadowFrozenCandidate,
   writeShadowEvaluationArtifact,
   type PreparedShadowEvaluationOutput,
 } from "./output/evaluation-writer.ts";
@@ -69,6 +76,7 @@ const DEFAULT_OUTPUT_PATH = "results.jsonl";
 const CONFIG_FILE_BYTES = 1_048_576;
 const PATH_CODE_UNITS = 4_096;
 const VERSION_PATTERN = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/u;
+const SHA256_DIGEST = /^sha256:[0-9a-f]{64}$/u;
 const EMAIL_LOCAL = /^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+$/u;
 
 interface ScannerMetadata {
@@ -93,6 +101,8 @@ export type CliOptions =
       readonly mode: ResultWriterMode;
       readonly quiet: boolean;
       readonly shadowEvaluation: boolean;
+      readonly shadowCandidatePath: string | null;
+      readonly shadowCandidateDigest: string | null;
     };
 
 export interface CliDependencies {
@@ -105,6 +115,7 @@ export interface CliDependencies {
   readonly openResultWriter: typeof openResultWriter;
   readonly resolveResultOutputPaths: typeof resolveResultOutputPaths;
   readonly preflightShadowEvaluationOutput: typeof preflightShadowEvaluationOutput;
+  readonly readPinnedShadowFrozenCandidate: typeof readPinnedShadowFrozenCandidate;
   readonly writeShadowEvaluationArtifact: typeof writeShadowEvaluationArtifact;
   readonly scanDomain: typeof scanDomain;
 }
@@ -153,6 +164,7 @@ const productionDependencies: CliDependencies = Object.freeze({
   openResultWriter,
   resolveResultOutputPaths,
   preflightShadowEvaluationOutput,
+  readPinnedShadowFrozenCandidate,
   writeShadowEvaluationArtifact,
   scanDomain,
 });
@@ -204,6 +216,10 @@ function usage(): string {
     "  --resume             Continue a compatible result file",
     "  --force              Replace a validated result file",
     "  --shadow-evaluation  Persist the fixed 200-domain shadow artifact",
+    "  --shadow-candidate <path>",
+    "                      Evaluate a frozen standalone shadow candidate",
+    "  --shadow-candidate-digest <sha256:digest>",
+    "                      Pin the exact frozen candidate file",
     "  --quiet              Suppress per-domain progress on stderr",
     "  --help                Show this help",
     "  --version             Show the scanner version",
@@ -327,6 +343,8 @@ export function parseCliArgs(argv: readonly string[]): CliOptions {
         resume: { type: "boolean" },
         force: { type: "boolean" },
         "shadow-evaluation": { type: "boolean" },
+        "shadow-candidate": { type: "string" },
+        "shadow-candidate-digest": { type: "string" },
         quiet: { type: "boolean" },
         help: { type: "boolean", short: "h" },
         version: { type: "boolean", short: "V" },
@@ -366,6 +384,35 @@ export function parseCliArgs(argv: readonly string[]): CliOptions {
     );
   }
 
+  const shadowCandidateValue = typeof parsed.values["shadow-candidate"] === "string"
+    ? parsed.values["shadow-candidate"]
+    : undefined;
+  const shadowCandidateDigestValue =
+    typeof parsed.values["shadow-candidate-digest"] === "string"
+      ? parsed.values["shadow-candidate-digest"]
+      : undefined;
+  if (
+    (shadowCandidateValue === undefined)
+    !== (shadowCandidateDigestValue === undefined)
+  ) {
+    throw new CliUsageError(
+      "--shadow-candidate and --shadow-candidate-digest must be provided together.",
+    );
+  }
+  if (shadowCandidateValue !== undefined && !shadowEvaluation) {
+    throw new CliUsageError(
+      "--shadow-candidate requires --shadow-evaluation.",
+    );
+  }
+  if (
+    shadowCandidateDigestValue !== undefined
+    && !SHA256_DIGEST.test(shadowCandidateDigestValue)
+  ) {
+    throw new CliUsageError(
+      "--shadow-candidate-digest must be sha256 followed by 64 lowercase hex digits.",
+    );
+  }
+
   const inputValue = typeof parsed.values.input === "string"
     ? parsed.values.input
     : undefined;
@@ -399,6 +446,10 @@ export function parseCliArgs(argv: readonly string[]): CliOptions {
     mode: resume ? "resume" : force ? "force" : "create",
     quiet: parsed.values.quiet === true,
     shadowEvaluation,
+    shadowCandidatePath: shadowCandidateValue === undefined
+      ? null
+      : validatedPath(shadowCandidateValue, "--shadow-candidate"),
+    shadowCandidateDigest: shadowCandidateDigestValue ?? null,
   });
 }
 
@@ -496,8 +547,13 @@ async function assertDistinctSources(
   input: PreparedParquetDomains,
   configPath: string | null,
   output: ResultOutputPaths,
+  additionalSourcePaths: readonly string[] = [],
 ): Promise<void> {
-  const sourcePaths = [input.sourcePath, ...(configPath === null ? [] : [configPath])];
+  const sourcePaths = [
+    input.sourcePath,
+    ...(configPath === null ? [] : [configPath]),
+    ...additionalSourcePaths,
+  ];
   const targetPaths = [output.resultPath, output.summaryPath];
   for (const sourcePath of sourcePaths) {
     if (targetPaths.includes(sourcePath)) {
@@ -506,11 +562,29 @@ async function assertDistinctSources(
         "An output target aliases an input file.",
       );
     }
-    const sourceStats = await stat(sourcePath);
+  }
+  const sourceStats = await Promise.all(sourcePaths.map(async (sourcePath) => ({
+    sourcePath,
+    stats: await stat(sourcePath),
+  })));
+  for (let left = 0; left < sourceStats.length; left += 1) {
+    for (let right = left + 1; right < sourceStats.length; right += 1) {
+      if (
+        sourceStats[left]!.sourcePath === sourceStats[right]!.sourcePath
+        || sameIdentity(sourceStats[left]!.stats, sourceStats[right]!.stats)
+      ) {
+        throw new CliStartupError(
+          "CLI_PATH_COLLISION",
+          "The shadow candidate must be distinct from every other input.",
+        );
+      }
+    }
+  }
+  for (const source of sourceStats) {
     for (const targetPath of targetPaths) {
       try {
         const targetStats = await stat(targetPath);
-        if (sameIdentity(sourceStats, targetStats)) {
+        if (sameIdentity(source.stats, targetStats)) {
           throw new CliStartupError(
             "CLI_PATH_COLLISION",
             "An output target aliases an input file.",
@@ -652,6 +726,9 @@ async function executeRun(
   let robots: RobotsPolicyService | undefined;
   let writer: ResultWriter | undefined;
   let preparedEvaluation: PreparedShadowEvaluationOutput | undefined;
+  let frozenCandidate: ShadowFrozenCandidate | undefined;
+  let frozenCandidateDigest: string | undefined;
+  let frozenCandidateSourcePath: string | undefined;
   let pendingEvaluationArtifact: ShadowEvaluationArtifact | undefined;
   let finalized = false;
   let runFailure: unknown;
@@ -666,7 +743,33 @@ async function executeRun(
     });
     signal.throwIfAborted();
     const outputPaths = await dependencies.resolveResultOutputPaths(options.outputPath);
-    await assertDistinctSources(prepared, loaded.sourcePath, outputPaths);
+    if (
+      options.shadowCandidatePath !== null
+      && options.shadowCandidateDigest !== null
+    ) {
+      const loadedCandidate = await dependencies.readPinnedShadowFrozenCandidate(
+        options.shadowCandidatePath,
+        options.shadowCandidateDigest,
+      );
+      if (
+        loadedCandidate.candidate.trainingIdentity.domainSetDigest
+          === prepared.domainSetDigest
+      ) {
+        throw new CliStartupError(
+          "CLI_EVALUATION_CANDIDATE_INVALID",
+          "The frozen shadow candidate requires a distinct evaluation cohort.",
+        );
+      }
+      frozenCandidate = loadedCandidate.candidate;
+      frozenCandidateDigest = loadedCandidate.digest;
+      frozenCandidateSourcePath = loadedCandidate.sourcePath;
+    }
+    await assertDistinctSources(
+      prepared,
+      loaded.sourcePath,
+      outputPaths,
+      frozenCandidateSourcePath === undefined ? [] : [frozenCandidateSourcePath],
+    );
     if (options.shadowEvaluation) {
       if (prepared.domainCount !== SHADOW_EVALUATION_DOMAIN_COUNT) {
         throw new CliStartupError(
@@ -680,12 +783,39 @@ async function executeRun(
         sourcePaths: [
           prepared.sourcePath,
           ...(loaded.sourcePath === null ? [] : [loaded.sourcePath]),
+          ...(frozenCandidateSourcePath === undefined
+            ? []
+            : [frozenCandidateSourcePath]),
         ],
       });
     }
 
     const catalog = dependencies.loadFingerprintCatalog(loaded.config);
     signal.throwIfAborted();
+    if (frozenCandidate !== undefined) {
+      try {
+        frozenCandidate = assertShadowFrozenCandidateCompatibility(
+          frozenCandidate,
+          {
+            schemaVersion: SHADOW_EVALUATION_SCHEMA_VERSION,
+            protocolRevision: SHADOW_EVALUATION_PROTOCOL_REVISION,
+            scannerVersion: metadata.version,
+            catalog: Object.freeze({
+              source: catalog.source,
+              revision: catalog.revision,
+              digest: catalog.digest,
+            }),
+            configDigest: computeConfigDigest(loaded.config),
+          },
+        );
+      } catch (error) {
+        throw new CliStartupError(
+          "CLI_EVALUATION_CANDIDATE_INVALID",
+          "The frozen shadow candidate is incompatible with this evaluation run.",
+          { cause: error },
+        );
+      }
+    }
     detectorPool = await dependencies.createDetectorPool(catalog, loaded.config);
     signal.throwIfAborted();
     if (options.shadowEvaluation) {
@@ -823,6 +953,12 @@ async function executeRun(
     await dependencies.writeShadowEvaluationArtifact(
       preparedEvaluation,
       pendingEvaluationArtifact,
+      frozenCandidate === undefined || frozenCandidateDigest === undefined
+        ? undefined
+        : {
+            frozenCandidate,
+            candidateDigest: frozenCandidateDigest,
+          },
     );
     signal.throwIfAborted();
   }

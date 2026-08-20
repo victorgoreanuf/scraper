@@ -7,9 +7,10 @@
 > orchestration are implemented and tested. Incremental output, resume, summary
 > generation, the runnable local CLI, the exact correction ledger, bounded
 > browser-limit telemetry, and the raw-free shadow evaluator/calibration
-> sidecar are also implemented and tested. The fresh v0.1.5 public run and its
-> calibration are complete: the provisional KPI was rejected, so functional
-> tier routing remains on hold pending a new trigger experiment and cohort.
+> sidecar are also implemented and tested. The bounded v0.1.7 KISS+ trigger and
+> frozen-holdout boundary are implemented, but their pinned offline development
+> verdict is `NO-GO`; no candidate was published and functional tier routing
+> remains on hold pending better training signal or an approved raw-free feature.
 
 ## Goal
 
@@ -73,6 +74,7 @@ The provided benchmark contains 200 unique domains in a Snappy-compressed Parque
 ├── src/
 │   ├── cli.ts
 │   ├── config.ts
+│   ├── domain-set.ts
 │   ├── evaluation.ts
 │   ├── evaluation-calibration.ts
 │   ├── model.ts
@@ -280,6 +282,13 @@ million canonical keys; it does not retain arbitrary columns or raw row values.
 The distributed design replaces this local challenge tradeoff with partitioned
 validation or an external sort/key store rather than copying the Map into every
 worker.
+
+That preflight also computes an order-independent `domainSetDigest` for the
+exact canonical domain set. The versioned construction hashes the UTF-8 tag
+`website-technologies-scraper/domain-set/v1\0`, the unsigned 64-bit big-endian
+domain count, then every canonical domain in direct UTF-16 order framed by its
+unsigned 64-bit big-endian UTF-8 byte length. This digest identifies set
+membership, not Parquet row order or file bytes.
 
 There is no `trim`, type coercion, skipped invalid row, first-row-wins, or
 automatic deduplication. `Shop.Vendor.TLD`, `shop.vendor.tld.`, and an
@@ -1585,11 +1594,13 @@ source is required:
 - `--config <path>` reads at most 1 MiB of strict UTF-8 JSON and requires one
   complete `ScanConfig` v1 whose User-Agent carries the actual package version.
 
-Operational flags are `--resume`, `--force`, `--shadow-evaluation`, `--quiet`,
-`--help`, and `--version`. Resume and force are mutually exclusive, and shadow
-evaluation is valid only in the default fresh-create mode, never with either of
-them. Unknown, positional, or duplicate options fail before input, output,
-browser, or network work. The CLI
+Operational flags are `--resume`, `--force`, `--shadow-evaluation`,
+`--shadow-candidate`, `--shadow-candidate-digest`, `--quiet`, `--help`, and
+`--version`. Candidate path and digest are an inseparable pair and are valid
+only with shadow evaluation. Resume and force are mutually exclusive, and
+shadow evaluation is valid only in the default fresh-create mode, never with
+either of them. Unknown, positional, or duplicate options fail before input,
+output, browser, or network work. The CLI
 validates the exact Node version, preflights the complete Parquet input, rejects
 result or paired-summary aliases of input/config files, compiles the catalog,
 preflights detector workers and protected Chromium, and only then opens the
@@ -1644,9 +1655,24 @@ without replacement as a single-link `0600` file. There is no shadow resume or
 force mode.
 
 The primary JSONL and summary finalize first. The exact 200 snapshots are then
-validated, calibrated, and the browser-limit aggregates are built; run-owned
-input/browser/detector resources close before the sidecar is published. A
-snapshot, calibration, serialization, or sidecar I/O failure is fatal.
+validated and the browser-limit aggregates are built; run-owned
+input/browser/detector resources close before the sidecar is published. Without
+a candidate, the sidecar contains a `development-source` OOF report and cannot
+publish or imply a frozen model because its own byte digest does not exist until
+publication. With the paired candidate flags, the CLI verifies the exact file
+digest and scanner/config/catalog/protocol compatibility before starting pools,
+then publishes a `frozen-holdout` report which never trains. A snapshot,
+evaluation, serialization, or sidecar I/O failure is fatal.
+
+The candidate also pins the order-independent digest of its exact canonical
+training-domain set. Immediately after Parquet preflight and candidate loading,
+before catalog compilation, detector/browser pools, or network traffic, the CLI
+rejects an evaluation input with that same exact set. The frozen evaluator
+independently rejects either the training `runId` or the same exact set once the
+completed artifact identity exists. This equality check does not require the
+two cohorts to be disjoint: partial domain overlap is not prohibited by the
+v0.1.7 contract and remains an explicit representativeness judgment.
+
 Before serialization, the writer rejects non-plain, cyclic, accessor-bearing,
 sparse, non-finite, or unsupported structures, as well as structures deeper
 than 32 levels or larger than 500,000 JSON values. It revalidates the fixed
@@ -2641,7 +2667,10 @@ The provisional acceptance guardrails are:
   names present anywhere in `full`;
 - at least 80% retention of corrected canonical direct
   `(domain, technology)` pairs, treated as the primary optimization target;
-- at most 40 routed domains under the accounting rule above.
+- at most 40 routed domains under the accounting rule above;
+- including both controls, no more than 30% of the full-cohort total for each
+  real browser-cost dimension: pages attempted, pages admitted, requests,
+  transferred bytes, and browser milliseconds.
 
 Both retention values are intersections with the `full` label divided by the
 corresponding non-empty `full` set. Extra shadow detections cannot increase
@@ -2698,18 +2727,97 @@ Equal-budget comparators are a 40-domain deterministic label-blind hash sample
 and a 40-domain post-hoc label-aware greedy selection which maximizes
 incremental pair lift, then newly covered canonical names, with its own frozen
 tie-break. The latter is reported as greedy, never as an oracle or mathematical
-upper bound. After out-of-fold evaluation, the same model form is trained on
-all 200 snapshots and stored as the deployment model for a later cohort; it
-does not replace the held-out fold selections used for this verdict.
+upper bound. The historical v0.1.5 report trained a full-cohort deployment
+model after OOF evaluation. Revision v0.1.7 replaces that ambiguous lifecycle
+with the separate `development-source`, `development-oof`, and `frozen-holdout`
+boundary below.
 
-The sidecar includes absolute/intersection retention, macro recall, extra
-shadow disagreements, actual browser-cost ratios, all selections and
-predictions, the full-cohort deployment model, and a machine-readable
-`provisional-shadow-challenge` guardrail verdict. That boolean is not a
-ratification by itself. The v0.1.5 deployable out-of-fold selection did not pass
-all three guardrails, so the roadmap records a rejection. A future candidate
-must be frozen before evaluation on a fresh representative cohort; the current
-development cohort cannot be reused to ratify a post-hoc adjustment.
+### KISS+ multi-objective candidate and frozen holdout
+
+Calibration revision `2026-08-20.2` does not reweight the failed v0.1.5 scalar
+score. It keeps the same raw-free `T1`/`T2`/pre-browser feature surface and adds
+only the minimum set-aware targets required by the observed failure:
+
+- a pair head estimates the number of direct `(domain, technology)` pairs in
+  `full` but absent from `T2`;
+- a bounded binary head is learned for each incremental canonical name which
+  appears on at least two training domains;
+- one aggregate rare-name head estimates the count of incremental canonical
+  names whose training support is exactly one. A name seen only in a held-out
+  fold is never inserted into that fold's model.
+
+All heads reuse the fixed smoothing prior of four and the existing deterministic
+feature tokens. During selection, recurring-name probability receives
+diminishing marginal credit after another selected domain already predicts the
+same name. Names already present anywhere in the candidate cohort's `T2` union
+receive no breadth credit. The frozen utility is:
+
+```text
+predicted pair lift / training pair deficit
++ marginal canonical-name lift / training name deficit
+```
+
+The deficits are computed only from the corresponding training partition as
+the positive gains still required to reach 80% pair retention and 95% canonical
+name retention; each denominator has an explicit minimum of one. No fitted
+weight search, browser-cost feature, generic model framework, or new raw signal
+is introduced.
+
+Development evaluation remains five-fold and fold-local: models, name support,
+deficits, trigger ranking, and controls for a held-out fold use no `full`, cost,
+or browser-limit field from that fold. After development GO/NO-GO, one model is
+trained on all development snapshots and serialized as a standalone canonical
+candidate. The candidate records the immutable development-sidecar digest,
+training provenance/config digest, the order-independent digest of the exact
+canonical training-domain set, snapshot and calibration revisions, catalog
+identity, and the exact scanner/config identity expected for its future
+evaluation. Its file digest is pinned independently by the operator.
+
+A prospective holdout run receives that standalone candidate and never receives
+the development snapshots or invokes training. It ranks the new cohort globally
+for exactly 38 trigger domains, then chooses two deterministic controls from the
+remainder. Mutating any holdout `full` label, browser cost, or browser-limit hit
+must leave every prediction, greedy step, trigger, and control byte-identical.
+Only `T1`, `T2`, or allowlisted pre-browser features may affect membership.
+The candidate cannot be evaluated against its training `runId` or the same exact
+canonical domain set. Partial overlap alone is not rejected; this narrow KISS
+guard prevents exact cohort reuse without claiming to solve cohort
+representativeness automatically.
+
+Real cost is deliberately an evaluation veto, not a predicted score term. All
+five selected/full ratios use exact integer comparison against `3/10`; a zero
+full total is valid only with a zero selected total. Controls are included in
+the numerator. Passing breadth or pair retention cannot compensate for any cost
+dimension above 30%.
+
+The existing v0.1.5 sidecar is the pinned development input; its historical
+calibration report is not treated as the new candidate. A bounded offline step
+canonicalizes its base snapshots and writes the separate candidate before any
+holdout traffic. If the KISS+ candidate misses any development guardrail, the
+experiment stops: the next action is more training signal/data or a separately
+approved raw-free feature, not weight tuning on these same 200 labels.
+
+Every sidecar includes absolute/intersection retention, macro recall, extra
+shadow disagreements, actual browser-cost ratios, all bounded scalar
+predictions, and a machine-readable `provisional-shadow-challenge` guardrail
+verdict. A `development-source` sidecar intentionally contains no candidate.
+The offline `development-oof` report can contain a candidate only after a full
+PASS, while a `frozen-holdout` report records the pinned candidate and training
+identity but never a training result. No per-domain recurring-name probability
+vectors are persisted. The two development report modes also include the
+equal-budget deterministic-random and label-aware-greedy comparators;
+`frozen-holdout` evaluates only the frozen deployable selection and does not
+recompute a label-aware comparator on the prospective cohort. The guardrail
+boolean is not a ratification by itself.
+
+The pinned v0.1.5 development artifact was evaluated offline with calibration
+revision `2026-08-20.2`. The set-aware trigger routed the exact 38+2 domains but
+retained only 294/348 canonical direct names (84.48%) and 1,595/2,031
+domain-technology pairs (78.53%). Its selected/full browser-cost ratios were
+35.78% attempted pages, 37.36% admitted pages, 39.07% requests, 36.64%
+transferred bytes, and 39.67% browser milliseconds. It therefore failed both
+retention guardrails and every real-cost guardrail. The result is `NO-GO`, the
+candidate is `null`, and no new public cohort is authorized by this result.
 
 The 95% and 80% values are provisional challenge guardrails. This cohort has
 already informed catalog fixes and metric design, so even out-of-fold results
@@ -2772,6 +2880,14 @@ Completion and evaluation gates:
   out-of-fold split and equal-budget random/label-aware comparators.
 - [x] Reject the provisional KPI after the deployable trigger failed canonical
   name and pair retention guardrails.
+- [x] Implement and audit the set-aware KISS+ development model, standalone
+  digest-pinned candidate, and no-training frozen-holdout evaluator.
+- [x] Run the offline development GO/NO-GO against the exact pinned v0.1.5
+  sidecar and freeze a candidate only if all retention, quota, and real-cost
+  guardrails pass. The result was `NO-GO`, so no candidate was frozen.
+- [ ] Evaluate a passing frozen candidate on a new representative 200-domain
+  cohort without retraining or changing its objective, features, thresholds,
+  salts, or cost ceiling.
 - [ ] Implement functional tiered orchestration only after a frozen deployable
   trigger passes a new representative cohort; this slice is on hold and has no
   reserved version.
@@ -2803,8 +2919,12 @@ robots policy, static and rendered observation collectors, fingerprint
 compiler, isolated detector, bounded Chromium pool, catalog probes, DNS/TLS
 infrastructure collector, pipeline orchestration, incremental output, resume,
 summary generation, runnable local CLI, exact correction ledger, bounded limit
-telemetry, and raw-free shadow evaluator are complete. The remaining gates are
-bounded trigger-quality research, evaluation on a new representative cohort,
-and only after a passing result the separate functional tiering slice. The
-v0.1.5 KPI decision is `REJECT`, not an authorization to lower the guardrails
-or ratify a same-cohort adjustment.
+telemetry, raw-free shadow evaluator, bounded set-aware trigger, standalone
+candidate boundary, and no-training frozen-holdout evaluator are complete in
+version 0.1.7. The offline development verdict is `NO-GO`, so no candidate or
+new representative cohort follows from this build. The next bounded work is to
+improve training signal/data or separately approve one raw-free feature, then
+repeat development GO/NO-GO without changing the frozen thresholds after
+observing a holdout. Functional routing remains a later slice and has no
+reserved version. The v0.1.5 and v0.1.7 rejections are not authorization to
+lower the guardrails or ratify a same-cohort adjustment.

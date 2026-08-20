@@ -84,6 +84,14 @@
   292/348 nume directe canonice și 1.609/2.031 perechi pe 40/40 domenii rutate.
   Routingul tiered funcțional rămâne `HOLD`; nu coborâm pragurile și nu ratificăm
   o ajustare pe același cohort de dezvoltare.
+- Modelul set-aware v0.1.7 separă development de holdout: development source nu
+  conține candidat, un candidat standalone poate fi publicat numai după PASS
+  complet, iar holdoutul pin-uit prin digest nu antrenează. Candidatul leagă și
+  digestul setului canonic exact de domenii folosit la training; același `runId`
+  sau exact același set este respins, fără a interzice overlapul parțial.
+  GO/NO-GO offline pe sidecarul v0.1.5 a eșuat retenția numelor, retenția
+  perechilor și toate cele cinci costuri; `candidate=null`, fără cohort public
+  nou.
 
 ## Structura proiectului
 
@@ -91,6 +99,7 @@
 src/
 ├── cli.ts
 ├── config.ts
+├── domain-set.ts
 ├── evaluation.ts
 ├── evaluation-calibration.ts
 ├── model.ts
@@ -233,6 +242,13 @@ sunt `INPUT_OPEN_FAILED`, `INPUT_PARQUET_INVALID`, `INPUT_SCHEMA_INVALID`,
 `INPUT_LIMIT_EXCEEDED`, `INPUT_DOMAIN_INVALID` și `INPUT_DOMAIN_DUPLICATE`; ele
 nu intră în `DomainResult.errors`. Contractul implementabil complet este în
 [`Parquet input contract v1`](README.md#parquet-input-contract-v1).
+
+Preflightul calculează și un `domainSetDigest` independent de ordinea rândurilor
+pentru setul exact de domenii canonice: SHA-256 peste tagul UTF-8 versionat
+`website-technologies-scraper/domain-set/v1\0`, numărul de domenii uint64
+big-endian, apoi domeniile sortate direct UTF-16, fiecare prefixat cu lungimea
+sa UTF-8 uint64 big-endian. Digestul identifică membershipul setului, nu bytes
+Parquet sau ordinea lor.
 
 Implementarea proiectează câte un singur row group și coloana selectată la
 fiecare apel `hyparquet`, pentru lucru liniar în numărul de grupuri, și nu
@@ -1258,11 +1274,12 @@ active ale paginii și proxy-ului înainte ca pipeline-ul să clasifice un failu
 aruncat de colecție, astfel încât sidecarurile viitoare rețin diagnosticul fără
 să schimbe `DomainResult`.
 
-Decizia este să păstrăm routingul funcțional pe `HOLD`. Următorul experiment
-este bounded: diagnosticăm breadth-ul lipsă și costul real, înghețăm înainte de
-evaluare orice schimbare de features/obiectiv/prag și folosim apoi un cohort
-reprezentativ nou. Cele 200 de domenii actuale pot servi la diagnostic și
-training, nu la re-ratificarea aceluiași candidat ajustat post-hoc.
+Decizia este să păstrăm routingul funcțional pe `HOLD`. Experimentul set-aware
+v0.1.7 a diagnosticat breadth-ul și costul real, dar a produs `NO-GO`. Nu
+folosim deci încă un cohort public; următorul pas este mai mult semnal/date de
+training sau aprobarea separată a unei feature raw-free. Cele 200 de domenii
+actuale pot servi la diagnostic și training, nu la re-ratificarea aceluiași
+candidat ajustat post-hoc.
 
 ## Protocolul provizoriu de evaluare tiered
 
@@ -1377,7 +1394,10 @@ nerutat și `F(d)` pentru cel rutat. Inferred rămâne separat. Guardrails sunt:
 - minimum 95% din setul global de nume directe canonicalizate din `full`;
 - minimum provizoriu 80% din perechile canonicalizate
   `(domain, technology)`, acesta fiind obiectivul principal de optimizare;
-- maximum 40 de domenii rutate după contabilizarea de mai sus.
+- maximum 40 de domenii rutate după contabilizarea de mai sus;
+- maximum 30% din totalul `full` pentru fiecare dintre pagini browser
+  attempted, pagini admitted, requesturi, bytes transferați și `browserMs`, cu
+  cele două controale incluse integral în numerator.
 
 Ambele retenții sunt intersecții cu labelul `full` împărțite la setul `full`
 nenul corespunzător. Detecțiile shadow suplimentare nu pot mări scorul și sunt
@@ -1423,12 +1443,64 @@ folds.
 
 Comparatorii de buget egal sunt un sample hash label-blind de 40 și un greedy
 post-hoc label-aware de 40, care maximizează întâi liftul de perechi și apoi
-numele canonice noi; îl numim greedy, nu oracle sau upper bound. După evaluarea
-OOF antrenăm aceeași formă pe toate cele 200 snapshoturi și persistăm separat
-deployment model-ul pentru un cohort ulterior; acesta nu înlocuiește selecțiile
-held-out ale verdictului curent.
+numele canonice noi; îl numim greedy, nu oracle sau upper bound. Revizia
+istorică v0.1.5 a inclus un deployment model în același raport. Revizia v0.1.7
+elimină acea ambiguitate: sidecarul live este doar development source, iar
+candidatul standalone se construiește offline și se publică numai după PASS.
 
-Prima implementare este exclusiv shadow: nu schimbă routingul și rezultatul
+Candidatul KISS+ v0.1.7 nu este o căutare de ponderi peste scorul scalar care a
+eșuat în v0.1.5. Păstrăm aceeași suprafață raw-free de features și adăugăm exact
+trei targets bounded: liftul de perechi, câte un head binar pentru numele
+incrementale cu support de minimum două domenii în training și un head agregat
+pentru numele rare cu support exact unu. Supportul, priorurile, deficitul până la
+80% perechi și deficitul până la 95% nume se calculează exclusiv din partiția de
+training. Un nume prezent numai în foldul held-out nu poate intra în modelul
+acelui fold.
+
+Selecția este set-aware. Creditul marginal al unui nume recurent scade după ce
+alt candidat îl prezice, iar numele deja prezente în uniunea `T2` a cohortului
+nu primesc credit de breadth. Utilitatea înghețată este suma dintre pair-liftul
+prezis normalizat cu deficitul de perechi și breadth-ul marginal normalizat cu
+deficitul de nume; denominatoarele au minimum unu. Păstrăm priorul patru,
+tokens, folds și salts existente. Nu adăugăm costul browser drept feature sau
+head predictiv în această primă revizie.
+
+Costul real este un veto independent după evaluare. Fiecare dintre cele cinci
+rapoarte selected/full trebuie să fie `<= 3/10`, comparat exact pe integers;
+`full=0` este valid numai cu `selected=0`. Niciun rezultat bun pe breadth sau
+pairs nu compensează un cost peste plafon. Pragul 30% este înghețat înaintea
+cohortului nou ca toleranță de 1,5x față de cota de 20% a domeniilor, nu ales
+pentru a trece datele deja observate.
+
+Separăm explicit development de holdout. Artefactul public v0.1.5, pin-uit prin
+digestul consemnat mai sus, rămâne development input; folosim snapshoturile lui
+canonice, nu raportul său vechi ca nou model. Un pas offline produce un candidat
+standalone canonic care păstrează digestul sursei, provenance/configul de
+training, digestul independent de ordine al setului canonic exact de domenii,
+protocolul, catalogul și identitatea exactă scanner/config a viitorului run.
+Digestul fișierului candidat este pin-uit separat de operator.
+
+Evaluatorul holdout primește numai candidatul standalone și snapshoturile
+cohortului nou; nu primește development snapshots și nu apelează training.
+Rulează global exact 38 trigger plus două controale deterministe. Schimbarea
+oricărui label `full`, cost sau browser-limit hit din holdout nu poate schimba
+predicțiile ori membership-ul 38+2. Dacă GO/NO-GO offline nu trece simultan
+breadth, pairs, cota și toate cele cinci costuri, nu lansăm cohortul public și nu
+retunăm ponderile pe aceleași 200 labels.
+
+Evaluatorul respinge același `runId` de training sau exact același set canonic
+de domenii. Egalitatea setului este detectată de CLI imediat după preflightul
+Parquet și citirea candidatului, înainte de catalog, pool-uri ori trafic; `runId`
+este reverificat de evaluator când identitatea artefactului complet există.
+Contractul v0.1.7 nu cere disjuncție totală: overlapul parțial nu este respins de
+acest guard KISS și rămâne o decizie explicită despre reprezentativitatea
+cohortului.
+
+Versiunea 0.1.7 implementează acest model și boundary-ul development versus
+frozen holdout. Nu conține routing funcțional; acel slice rămâne `HOLD` până la
+un PASS prospectiv pe cohort nou.
+
+Implementarea v0.1.7 este exclusiv shadow: nu schimbă routingul și rezultatul
 `full` rămâne autoritativ. `--shadow-evaluation` este create-only, incompatibil
 cu `--resume` și `--force`, cere exact 200 de domenii și ține în memorie maximum
 un snapshot allowlisted per domeniu, cu cap fix 200. Modului shadow îi aparțin
@@ -1450,11 +1522,34 @@ promitem atomicitate între result, summary și sidecar și nu anulăm
 artefactele principale deja finalizate dacă evaluarea eșuează. Failure-ul rămâne
 exit non-zero, iar sidecarul nu are resume sau force.
 
-Sidecarul include selecțiile/predicțiile, retențiile prin intersecție, macro
-recall, disagreements extra, costurile reale, comparatoarele, deployment model
-și verdictul machine-readable `provisional-shadow-challenge`. Câmpul `passed`
-nu ratifică singur nimic. În v0.1.5 selecția deployabilă OOF nu a trecut
-simultan 95% nume, 80% perechi și maximum 40 domenii, deci KPI-ul este respins.
+Fără alte flaguri, `--shadow-evaluation` publică numai raportul
+`development-source`. Pentru holdout, `--shadow-candidate <path>` și
+`--shadow-candidate-digest <sha256:...>` sunt obligatorii împreună. Candidatul
+este citit UTF-8 strict și bounded, pin-uit exact, respins dacă este symlink,
+hard link sau alias de input/output și verificat contra scanner/config/catalog/
+protocol înainte să pornească pool-urile sau traficul. După preflightul
+inputului, CLI-ul compară și digestul setului exact de domenii cu identitatea de
+training și respinge egalitatea la aceeași frontieră timpurie. Raportul rezultat
+este `frozen-holdout` și nu apelează training.
+
+Toate rapoartele includ selecțiile/predicțiile scalare bounded, retențiile prin
+intersecție, macro recall, disagreements extra, costurile reale și verdictul
+machine-readable `provisional-shadow-challenge`. Modurile de development includ
+și comparatorii cu buget egal random determinist și greedy label-aware; raportul
+`frozen-holdout` evaluează numai selecția deployabilă înghețată și nu recalculează
+un comparator label-aware pe cohortul prospectiv. Fără candidat, modul
+`development-source` nu persistă modelul standalone; pasul offline
+`development-oof` îl produce numai după PASS. Cu candidat, modul
+`frozen-holdout` pin-uiește digestul și training identity, dar nu antrenează.
+Câmpul `passed` nu ratifică singur nimic.
+
+GO/NO-GO v0.1.7 a folosit exact sidecarul v0.1.5 cu digest
+`sha256:1b53023cf747e7194adc3d0261f96f93a556cba041d8ee515e9b4a8dc37ef43e`.
+Selecția set-aware 38+2 a păstrat 294/348 nume canonice (84,48%) și
+1.595/2.031 perechi (78,53%). Costurile selected/full au fost 35,78% pagini
+încercate, 37,36% pagini admise, 39,07% requesturi, 36,64% bytes și 39,67%
+browser milliseconds. Toate cele cinci costuri depășesc 30%; verdictul este
+`NO-GO`, candidatul este `null`, iar cohortul public nou nu pornește.
 
 Cele 200 de domenii sunt set descriptiv/de dezvoltare, deoarece v0.1.4 a
 influențat corecțiile și metrica. Out-of-fold reduce leakage-ul calibrării, dar

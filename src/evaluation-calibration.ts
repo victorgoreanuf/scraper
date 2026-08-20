@@ -7,18 +7,31 @@ import {
   SHADOW_EVALUATION_PROTOCOL_REVISION,
   SHADOW_TRIGGER_DOMAIN_CAP,
   type AvailableShadowDetectorView,
+  type ShadowEvaluationArtifact,
   type ShadowDetectorView,
   type ShadowEvaluationSnapshot,
   type ShadowPreBrowserFeatures,
 } from "./evaluation.ts";
+import { computeDomainSetDigest } from "./domain-set.ts";
+import type { CatalogProvenance, Provenance } from "./model.ts";
 
-export const SHADOW_CALIBRATION_REVISION = "2026-08-20.1";
+export const SHADOW_CALIBRATION_REVISION = "2026-08-20.2";
 export const SHADOW_CALIBRATION_SMOOTHING_PRIOR = 4;
+export const SHADOW_RECURRING_NAME_MINIMUM_SUPPORT = 2;
+export const SHADOW_REAL_BROWSER_COST_MAXIMUM = 0.3;
 export const SHADOW_PROVISIONAL_GUARDRAILS = Object.freeze({
   canonicalDirectNameRetentionMinimum: 0.95,
   domainTechnologyPairRetentionMinimum: 0.8,
   routedDomainMaximum: 40,
+  realBrowserCostMaximum: SHADOW_REAL_BROWSER_COST_MAXIMUM,
 });
+
+const SHADOW_MODEL_KIND = "bounded-multiobjective-trigger-v2" as const;
+export const SHADOW_MODEL_TOKEN_CAP = 20_000;
+export const SHADOW_MODEL_RECURRING_NAME_CAP = 10_000;
+export const SHADOW_MODEL_RECURRING_TARGET_CAP = 50_000;
+const SHA256_DIGEST = /^sha256:[0-9a-f]{64}$/u;
+const RUN_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 
 export const SHADOW_CALIBRATION_SALTS = Object.freeze({
   fold: "website-technologies-scraper/shadow/2026-08-20.1/fold/v1",
@@ -36,33 +49,110 @@ export interface ShadowFoldModelMetadata {
   readonly heldOutDomains: number;
   readonly trainingIncrementalPairLift: number;
   readonly globalMeanIncrementalPairLift: number;
+  readonly trainingRareSingletonLift: number;
+  readonly globalMeanRareSingletonLift: number;
+  readonly recurringNameHeads: number;
+  readonly pairDeficit: number;
+  readonly nameDeficit: number;
   readonly featureTokenCount: number;
   readonly smoothingPrior: number;
+}
+
+export interface ShadowRecurringTokenTarget {
+  readonly head: number;
+  readonly targetSum: number;
 }
 
 export interface ShadowDeploymentToken {
   readonly token: string;
   readonly domains: number;
-  readonly targetSum: number;
-  readonly estimate: number;
+  readonly pairTargetSum: number;
+  readonly rareTargetSum: number;
+  readonly recurringTargetSums: readonly ShadowRecurringTokenTarget[];
 }
 
-export interface ShadowDeploymentModel {
-  readonly kind: "smoothed-empirical-token-lift-v1";
+export interface ShadowRecurringNameHead {
+  readonly name: string;
+  readonly support: number;
+}
+
+export interface ShadowTrainingObjectives {
+  readonly fullPairs: number;
+  readonly baselineRetainedPairs: number;
+  readonly pairDeficit: number;
+  readonly fullCanonicalNames: number;
+  readonly baselineRetainedNames: number;
+  readonly nameDeficit: number;
+}
+
+export interface ShadowCandidateTrainingIdentity {
+  readonly artifactDigest: string;
+  readonly domainSetDigest: string;
+  readonly schemaVersion: 1;
+  readonly protocolRevision: typeof SHADOW_EVALUATION_PROTOCOL_REVISION;
+  readonly runId: string;
+  readonly provenance: Provenance;
+}
+
+export interface ShadowCandidateEvaluationCompatibility {
+  readonly schemaVersion: 1;
+  readonly protocolRevision: typeof SHADOW_EVALUATION_PROTOCOL_REVISION;
+  readonly scannerVersion: string;
+  readonly catalog: CatalogProvenance;
+  readonly configDigest: string;
+}
+
+export interface ShadowFrozenCandidate {
+  readonly kind: typeof SHADOW_MODEL_KIND;
   readonly calibrationRevision: typeof SHADOW_CALIBRATION_REVISION;
   readonly protocolRevision: typeof SHADOW_EVALUATION_PROTOCOL_REVISION;
-  readonly target: "incremental-domain-technology-pairs";
   readonly trainingDomains: typeof SHADOW_EVALUATION_DOMAIN_COUNT;
+  readonly objectives: {
+    readonly canonicalDirectNameRetentionMinimum: 0.95;
+    readonly domainTechnologyPairRetentionMinimum: 0.8;
+  };
+  readonly recurringNameMinimumSupport:
+    typeof SHADOW_RECURRING_NAME_MINIMUM_SUPPORT;
   readonly trainingIncrementalPairLift: number;
+  readonly trainingRareSingletonLift: number;
   readonly globalMeanIncrementalPairLift: number;
+  readonly globalMeanRareSingletonLift: number;
   readonly smoothingPrior: typeof SHADOW_CALIBRATION_SMOOTHING_PRIOR;
+  readonly trainingIdentity: ShadowCandidateTrainingIdentity;
+  readonly evaluationCompatibility: ShadowCandidateEvaluationCompatibility;
+  readonly trainingObjectives: ShadowTrainingObjectives;
+  readonly recurringNames: readonly ShadowRecurringNameHead[];
   readonly tokens: readonly ShadowDeploymentToken[];
+}
+
+/** @deprecated Use ShadowFrozenCandidate. */
+export type ShadowDeploymentModel = ShadowFrozenCandidate;
+
+export interface ShadowDevelopmentCalibrationOptions {
+  readonly trainingArtifactDigest: string;
+  readonly expectedEvaluationScannerVersion: string;
+  readonly expectedEvaluationConfigDigest: string;
+}
+
+export interface ShadowRecurringNamePrediction {
+  readonly name: string;
+  readonly probability: number;
+}
+
+export interface ShadowTriggerPrediction {
+  readonly pairLift: number;
+  readonly rareNovelty: number;
+  readonly recurringNames: readonly ShadowRecurringNamePrediction[];
+  readonly featureTokens: number;
 }
 
 export interface ShadowOofPrediction {
   readonly domain: string;
   readonly fold: number;
   readonly score: number;
+  readonly pairLift: number;
+  readonly rareNovelty: number;
+  readonly recurringExpectedLift: number;
   readonly featureTokens: number;
 }
 
@@ -140,11 +230,29 @@ export interface ShadowProvisionalGuardrailVerdict {
   readonly canonicalDirectNames: ShadowMinimumGuardrailVerdict;
   readonly domainTechnologyPairs: ShadowMinimumGuardrailVerdict;
   readonly routedDomains: ShadowMaximumGuardrailVerdict;
+  readonly realBrowserCosts: ShadowRealBrowserCostGuardrailVerdict;
+  readonly passed: boolean;
+}
+
+export interface ShadowCostGuardrailVerdict {
+  readonly selected: number;
+  readonly full: number;
+  readonly actual: number | null;
+  readonly maximum: typeof SHADOW_REAL_BROWSER_COST_MAXIMUM;
+  readonly passed: boolean;
+}
+
+export interface ShadowRealBrowserCostGuardrailVerdict {
+  readonly browserPagesAttempted: ShadowCostGuardrailVerdict;
+  readonly browserPagesAdmitted: ShadowCostGuardrailVerdict;
+  readonly browserRequests: ShadowCostGuardrailVerdict;
+  readonly browserTransferredBytes: ShadowCostGuardrailVerdict;
+  readonly browserMs: ShadowCostGuardrailVerdict;
   readonly passed: boolean;
 }
 
 export interface ShadowDeployableEvaluation {
-  readonly name: "deployable-oof-trigger";
+  readonly name: "development-oof-trigger" | "frozen-holdout-trigger";
   readonly triggerDomainCount: number;
   readonly controlDomainCount: number;
   readonly selected: readonly ShadowSelectedDomain[];
@@ -174,40 +282,93 @@ export interface ShadowGreedyEvaluation extends ShadowComparatorEvaluation {
   readonly steps: readonly ShadowGreedyStep[];
 }
 
-export interface ShadowCalibrationReport {
+interface ShadowCalibrationReportBase {
   readonly calibrationRevision: typeof SHADOW_CALIBRATION_REVISION;
   readonly protocolRevision: typeof SHADOW_EVALUATION_PROTOCOL_REVISION;
   readonly runId: string;
+  readonly evaluationProvenance: Provenance;
   readonly cohortDomains: typeof SHADOW_EVALUATION_DOMAIN_COUNT;
   readonly foldCount: typeof SHADOW_EVALUATION_FOLD_COUNT;
   readonly salts: typeof SHADOW_CALIBRATION_SALTS;
   readonly model: {
-    readonly kind: "smoothed-empirical-token-lift-v1";
-    readonly target: "incremental-domain-technology-pairs";
+    readonly kind: typeof SHADOW_MODEL_KIND;
+    readonly targets: readonly [
+      "incremental-domain-technology-pairs",
+      "recurring-canonical-name-presence",
+      "rare-singleton-novelty",
+    ];
     readonly smoothingPrior: typeof SHADOW_CALIBRATION_SMOOTHING_PRIOR;
     readonly folds: readonly ShadowFoldModelMetadata[];
   };
-  readonly deploymentModel: ShadowDeploymentModel;
   readonly oofPredictions: readonly ShadowOofPrediction[];
   readonly deployable: ShadowDeployableEvaluation;
   readonly deterministicRandom: ShadowComparatorEvaluation;
   readonly labelAwareGreedy: ShadowGreedyEvaluation;
 }
 
+
+export interface ShadowDevelopmentCalibrationReport
+  extends ShadowCalibrationReportBase {
+  readonly mode: "development-oof";
+  readonly trainingArtifactDigest: string;
+  readonly candidate: ShadowFrozenCandidate | null;
+  /** @deprecated Use candidate. */
+  readonly deploymentModel: ShadowFrozenCandidate | null;
+}
+
+export interface ShadowDevelopmentSourceReport
+  extends ShadowCalibrationReportBase {
+  readonly mode: "development-source";
+}
+
+export interface ShadowFrozenHoldoutReport {
+  readonly mode: "frozen-holdout";
+  readonly calibrationRevision: typeof SHADOW_CALIBRATION_REVISION;
+  readonly protocolRevision: typeof SHADOW_EVALUATION_PROTOCOL_REVISION;
+  readonly runId: string;
+  readonly cohortDomains: typeof SHADOW_EVALUATION_DOMAIN_COUNT;
+  readonly salts: typeof SHADOW_CALIBRATION_SALTS;
+  readonly candidateDigest: string;
+  readonly trainingIdentity: ShadowCandidateTrainingIdentity;
+  readonly evaluationProvenance: Provenance;
+  readonly predictions: readonly ShadowOofPrediction[];
+  readonly deployable: ShadowDeployableEvaluation;
+}
+
+export type ShadowCalibrationReport =
+  | ShadowDevelopmentSourceReport
+  | ShadowDevelopmentCalibrationReport;
+
 interface TokenAggregate {
   domains: number;
-  targetSum: number;
+  pairTargetSum: number;
+  rareTargetSum: number;
+  readonly recurringTargetSums: Map<number, number>;
 }
 
 interface FoldModel {
-  readonly globalMean: number;
-  readonly tokens: ReadonlyMap<string, TokenAggregate>;
+  readonly model: TrainedMultiHeadModel;
   readonly metadata: ShadowFoldModelMetadata;
+}
+
+interface TrainedMultiHeadModel {
+  readonly trainingDomains: number;
+  readonly trainingIncrementalPairLift: number;
+  readonly trainingRareSingletonLift: number;
+  readonly globalMeanIncrementalPairLift: number;
+  readonly globalMeanRareSingletonLift: number;
+  readonly trainingObjectives: ShadowTrainingObjectives;
+  readonly recurringNames: readonly ShadowRecurringNameHead[];
+  readonly tokens: ReadonlyMap<string, TokenAggregate>;
 }
 
 interface ScoredSnapshot {
   readonly snapshot: ShadowEvaluationSnapshot;
-  readonly prediction: ShadowOofPrediction;
+  readonly prediction: InternalShadowPrediction;
+}
+
+interface InternalShadowPrediction extends ShadowOofPrediction {
+  readonly recurringNames: readonly ShadowRecurringNamePrediction[];
 }
 
 interface ShadowFoldQuota {
@@ -467,6 +628,150 @@ function validateSnapshots(
   return Object.freeze(ordered);
 }
 
+function validateArtifact(
+  artifact: ShadowEvaluationArtifact,
+): readonly ShadowEvaluationSnapshot[] {
+  if (
+    artifact.schemaVersion !== 1
+    || artifact.protocolRevision !== SHADOW_EVALUATION_PROTOCOL_REVISION
+    || artifact.inputDomains !== SHADOW_EVALUATION_DOMAIN_COUNT
+    || !RUN_ID.test(artifact.runId)
+  ) {
+    throw new TypeError("Shadow evaluation artifact identity does not match");
+  }
+  const snapshots = validateSnapshots(artifact.snapshots);
+  if (snapshots[0]?.runId !== artifact.runId) {
+    throw new TypeError("Shadow evaluation artifact runId does not match snapshots");
+  }
+  return snapshots;
+}
+
+function normalizeSha256Digest(value: string, label: string): string {
+  if (!SHA256_DIGEST.test(value)) {
+    throw new TypeError(`${label} must be a SHA-256 digest`);
+  }
+  return value;
+}
+
+function cloneCatalog(catalog: CatalogProvenance): CatalogProvenance {
+  return Object.freeze({
+    source: catalog.source,
+    revision: catalog.revision,
+    digest: catalog.digest,
+  });
+}
+
+function cloneProvenance(provenance: Provenance): Provenance {
+  return Object.freeze({
+    scannerVersion: provenance.scannerVersion,
+    runtime: Object.freeze({
+      node: provenance.runtime.node,
+      playwright: provenance.runtime.playwright,
+      chromiumRevision: provenance.runtime.chromiumRevision,
+    }),
+    catalog: cloneCatalog(provenance.catalog),
+    configDigest: provenance.configDigest,
+  });
+}
+
+function exactRecord(
+  value: unknown,
+  keys: readonly string[],
+  label: string,
+): Record<string, unknown> {
+  if (
+    typeof value !== "object"
+    || value === null
+    || Array.isArray(value)
+    || (Object.getPrototypeOf(value) !== Object.prototype
+      && Object.getPrototypeOf(value) !== null)
+  ) {
+    throw new TypeError(`${label} must be a plain object`);
+  }
+  const actual = Object.keys(value).sort(compareString);
+  const expected = [...keys].sort(compareString);
+  if (
+    actual.length !== expected.length
+    || actual.some((key, index) => key !== expected[index])
+  ) {
+    throw new TypeError(`${label} does not have the exact frozen shape`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function boundedString(value: unknown, label: string, maximum = 65_536): string {
+  if (
+    typeof value !== "string"
+    || value.length === 0
+    || value.length > maximum
+    || !value.isWellFormed()
+  ) {
+    throw new TypeError(`${label} is invalid`);
+  }
+  return value;
+}
+
+function safeCount(value: unknown, label: string): number {
+  if (
+    typeof value !== "number"
+    || !Number.isSafeInteger(value)
+    || value < 0
+    || Object.is(value, -0)
+  ) {
+    throw new TypeError(`${label} must be a non-negative safe integer`);
+  }
+  return value;
+}
+
+function finiteNonNegative(value: unknown, label: string): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    throw new TypeError(`${label} must be finite and non-negative`);
+  }
+  return value;
+}
+
+function canonicalProvenance(value: unknown, label: string): Provenance {
+  const provenance = exactRecord(
+    value,
+    ["scannerVersion", "runtime", "catalog", "configDigest"],
+    label,
+  );
+  const runtime = exactRecord(
+    provenance.runtime,
+    ["node", "playwright", "chromiumRevision"],
+    `${label}.runtime`,
+  );
+  const catalog = exactRecord(
+    provenance.catalog,
+    ["source", "revision", "digest"],
+    `${label}.catalog`,
+  );
+  return cloneProvenance({
+    scannerVersion: boundedString(provenance.scannerVersion, `${label}.scannerVersion`, 128),
+    runtime: {
+      node: boundedString(runtime.node, `${label}.runtime.node`, 128),
+      playwright: boundedString(runtime.playwright, `${label}.runtime.playwright`, 128),
+      chromiumRevision: boundedString(
+        runtime.chromiumRevision,
+        `${label}.runtime.chromiumRevision`,
+        128,
+      ),
+    },
+    catalog: {
+      source: boundedString(catalog.source, `${label}.catalog.source`, 1_024),
+      revision: boundedString(catalog.revision, `${label}.catalog.revision`, 1_024),
+      digest: normalizeSha256Digest(
+        boundedString(catalog.digest, `${label}.catalog.digest`, 128),
+        `${label}.catalog.digest`,
+      ),
+    },
+    configDigest: normalizeSha256Digest(
+      boundedString(provenance.configDigest, `${label}.configDigest`, 128),
+      `${label}.configDigest`,
+    ),
+  });
+}
+
 function incrementalPairLift(snapshot: ShadowEvaluationSnapshot): number {
   const baseline = new Set(directNames(snapshot.t2));
   let lift = 0;
@@ -476,190 +781,853 @@ function incrementalPairLift(snapshot: ShadowEvaluationSnapshot): number {
   return lift;
 }
 
+function requiredRetention(total: number, numerator: number, denominator: number): number {
+  const required = (
+    (BigInt(total) * BigInt(numerator)) + BigInt(denominator - 1)
+  ) / BigInt(denominator);
+  const result = Number(required);
+  assertSafeCount(result, "Required retention");
+  return result;
+}
+
+function trainingObjectives(
+  snapshots: readonly ShadowEvaluationSnapshot[],
+): ShadowTrainingObjectives {
+  const fullNames = new Set<string>();
+  const baselineNames = new Set<string>();
+  let fullPairs = 0;
+  let baselineRetainedPairs = 0;
+  for (const snapshot of snapshots) {
+    const baseline = new Set(directNames(snapshot.t2));
+    for (const name of snapshot.full.directNames) {
+      fullNames.add(name);
+      fullPairs += 1;
+      if (baseline.has(name)) baselineRetainedPairs += 1;
+    }
+    for (const name of baseline) baselineNames.add(name);
+  }
+  let baselineRetainedNames = 0;
+  for (const name of fullNames) {
+    if (baselineNames.has(name)) baselineRetainedNames += 1;
+  }
+  return Object.freeze({
+    fullPairs,
+    baselineRetainedPairs,
+    pairDeficit: Math.max(
+      1,
+      requiredRetention(fullPairs, 4, 5) - baselineRetainedPairs,
+    ),
+    fullCanonicalNames: fullNames.size,
+    baselineRetainedNames,
+    nameDeficit: Math.max(
+      1,
+      requiredRetention(fullNames.size, 19, 20) - baselineRetainedNames,
+    ),
+  });
+}
+
+function trainMultiHeadModel(
+  snapshots: readonly ShadowEvaluationSnapshot[],
+): TrainedMultiHeadModel {
+  if (snapshots.length === 0) {
+    throw new TypeError("A calibration model requires training domains");
+  }
+  const globalT2Names = new Set<string>();
+  for (const snapshot of snapshots) {
+    for (const name of directNames(snapshot.t2)) globalT2Names.add(name);
+  }
+  const novelByDomain = new Map<string, readonly string[]>();
+  const novelSupport = new Map<string, number>();
+  for (const snapshot of snapshots) {
+    const novel = snapshot.full.directNames.filter((name) => !globalT2Names.has(name));
+    novelByDomain.set(snapshot.domain, novel);
+    for (const name of novel) {
+      novelSupport.set(name, (novelSupport.get(name) ?? 0) + 1);
+    }
+  }
+  const recurringNames = Object.freeze([...novelSupport.entries()]
+    .filter(([, support]) => support >= SHADOW_RECURRING_NAME_MINIMUM_SUPPORT)
+    .sort(([left], [right]) => compareString(left, right))
+    .map(([name, support]) => Object.freeze({ name, support })));
+  if (recurringNames.length > SHADOW_MODEL_RECURRING_NAME_CAP) {
+    throw new TypeError("Calibration recurring-name model exceeds its bound");
+  }
+  const recurringIndex = new Map(
+    recurringNames.map(({ name }, index) => [name, index] as const),
+  );
+  const tokenAggregates = new Map<string, TokenAggregate>();
+  let pairTargetSum = 0;
+  let rareTargetSum = 0;
+  let recurringTargets = 0;
+  for (const snapshot of snapshots) {
+    const pairTarget = incrementalPairLift(snapshot);
+    pairTargetSum += pairTarget;
+    const positiveHeads: number[] = [];
+    let rareTarget = 0;
+    for (const name of novelByDomain.get(snapshot.domain) ?? []) {
+      const head = recurringIndex.get(name);
+      if (head === undefined) rareTarget += 1;
+      else positiveHeads.push(head);
+    }
+    rareTargetSum += rareTarget;
+    for (const token of shadowTriggerFeatureTokens(snapshot)) {
+      const aggregate = tokenAggregates.get(token) ?? {
+        domains: 0,
+        pairTargetSum: 0,
+        rareTargetSum: 0,
+        recurringTargetSums: new Map<number, number>(),
+      };
+      aggregate.domains += 1;
+      aggregate.pairTargetSum += pairTarget;
+      aggregate.rareTargetSum += rareTarget;
+      for (const head of positiveHeads) {
+        if (!aggregate.recurringTargetSums.has(head)) recurringTargets += 1;
+        aggregate.recurringTargetSums.set(
+          head,
+          (aggregate.recurringTargetSums.get(head) ?? 0) + 1,
+        );
+      }
+      tokenAggregates.set(token, aggregate);
+    }
+  }
+  if (
+    tokenAggregates.size > SHADOW_MODEL_TOKEN_CAP
+    || recurringTargets > SHADOW_MODEL_RECURRING_TARGET_CAP
+  ) {
+    throw new TypeError("Calibration token model exceeds its bound");
+  }
+  return Object.freeze({
+    trainingDomains: snapshots.length,
+    trainingIncrementalPairLift: pairTargetSum,
+    trainingRareSingletonLift: rareTargetSum,
+    globalMeanIncrementalPairLift: pairTargetSum / snapshots.length,
+    globalMeanRareSingletonLift: rareTargetSum / snapshots.length,
+    trainingObjectives: trainingObjectives(snapshots),
+    recurringNames,
+    tokens: tokenAggregates,
+  });
+}
+
+function serializedTokens(
+  model: TrainedMultiHeadModel,
+): readonly ShadowDeploymentToken[] {
+  return Object.freeze([...model.tokens.entries()]
+    .sort(([left], [right]) => compareString(left, right))
+    .map(([token, aggregate]): ShadowDeploymentToken => Object.freeze({
+      token,
+      domains: aggregate.domains,
+      pairTargetSum: aggregate.pairTargetSum,
+      rareTargetSum: aggregate.rareTargetSum,
+      recurringTargetSums: Object.freeze([...aggregate.recurringTargetSums]
+        .sort(([left], [right]) => left - right)
+        .map(([head, targetSum]) => Object.freeze({ head, targetSum }))),
+    })));
+}
+
+function buildFrozenCandidate(
+  model: TrainedMultiHeadModel,
+  artifact: ShadowEvaluationArtifact,
+  options: ShadowDevelopmentCalibrationOptions,
+): ShadowFrozenCandidate {
+  if (model.trainingDomains !== SHADOW_EVALUATION_DOMAIN_COUNT) {
+    throw new TypeError("A frozen candidate requires the full development cohort");
+  }
+  const expectedScannerVersion = boundedString(
+    options.expectedEvaluationScannerVersion,
+    "Expected evaluation scanner version",
+    128,
+  );
+  const trainingProvenance = canonicalProvenance(
+    artifact.provenance,
+    "Training provenance",
+  );
+  const expectedConfigDigest = normalizeSha256Digest(
+    options.expectedEvaluationConfigDigest,
+    "Expected evaluation config digest",
+  );
+  return Object.freeze({
+    kind: SHADOW_MODEL_KIND,
+    calibrationRevision: SHADOW_CALIBRATION_REVISION,
+    protocolRevision: SHADOW_EVALUATION_PROTOCOL_REVISION,
+    trainingDomains: SHADOW_EVALUATION_DOMAIN_COUNT,
+    objectives: Object.freeze({
+      canonicalDirectNameRetentionMinimum: 0.95 as const,
+      domainTechnologyPairRetentionMinimum: 0.8 as const,
+    }),
+    recurringNameMinimumSupport: SHADOW_RECURRING_NAME_MINIMUM_SUPPORT,
+    trainingIncrementalPairLift: model.trainingIncrementalPairLift,
+    trainingRareSingletonLift: model.trainingRareSingletonLift,
+    globalMeanIncrementalPairLift: model.globalMeanIncrementalPairLift,
+    globalMeanRareSingletonLift: model.globalMeanRareSingletonLift,
+    smoothingPrior: SHADOW_CALIBRATION_SMOOTHING_PRIOR,
+    trainingIdentity: Object.freeze({
+      artifactDigest: normalizeSha256Digest(
+        options.trainingArtifactDigest,
+        "Training artifact digest",
+      ),
+      domainSetDigest: computeDomainSetDigest(
+        artifact.snapshots.map(({ domain }) => domain),
+      ),
+      schemaVersion: 1 as const,
+      protocolRevision: SHADOW_EVALUATION_PROTOCOL_REVISION,
+      runId: artifact.runId,
+      provenance: trainingProvenance,
+    }),
+    evaluationCompatibility: Object.freeze({
+      schemaVersion: 1 as const,
+      protocolRevision: SHADOW_EVALUATION_PROTOCOL_REVISION,
+      scannerVersion: expectedScannerVersion,
+      catalog: cloneCatalog(trainingProvenance.catalog),
+      configDigest: expectedConfigDigest,
+    }),
+    trainingObjectives: model.trainingObjectives,
+    recurringNames: model.recurringNames,
+    tokens: serializedTokens(model),
+  });
+}
+
+export function validateShadowFrozenCandidate(value: unknown): ShadowFrozenCandidate {
+  const candidate = exactRecord(value, [
+    "kind",
+    "calibrationRevision",
+    "protocolRevision",
+    "trainingDomains",
+    "objectives",
+    "recurringNameMinimumSupport",
+    "trainingIncrementalPairLift",
+    "trainingRareSingletonLift",
+    "globalMeanIncrementalPairLift",
+    "globalMeanRareSingletonLift",
+    "smoothingPrior",
+    "trainingIdentity",
+    "evaluationCompatibility",
+    "trainingObjectives",
+    "recurringNames",
+    "tokens",
+  ], "Frozen candidate");
+  if (
+    candidate.kind !== SHADOW_MODEL_KIND
+    || candidate.calibrationRevision !== SHADOW_CALIBRATION_REVISION
+    || candidate.protocolRevision !== SHADOW_EVALUATION_PROTOCOL_REVISION
+    || candidate.trainingDomains !== SHADOW_EVALUATION_DOMAIN_COUNT
+    || candidate.recurringNameMinimumSupport
+      !== SHADOW_RECURRING_NAME_MINIMUM_SUPPORT
+    || candidate.smoothingPrior !== SHADOW_CALIBRATION_SMOOTHING_PRIOR
+  ) {
+    throw new TypeError("Frozen candidate revision or constants do not match");
+  }
+  const objectives = exactRecord(candidate.objectives, [
+    "canonicalDirectNameRetentionMinimum",
+    "domainTechnologyPairRetentionMinimum",
+  ], "Frozen candidate objectives");
+  if (
+    objectives.canonicalDirectNameRetentionMinimum !== 0.95
+    || objectives.domainTechnologyPairRetentionMinimum !== 0.8
+  ) {
+    throw new TypeError("Frozen candidate objectives do not match");
+  }
+  const pairLift = safeCount(
+    candidate.trainingIncrementalPairLift,
+    "Frozen candidate pair target",
+  );
+  const rareLift = safeCount(
+    candidate.trainingRareSingletonLift,
+    "Frozen candidate rare target",
+  );
+  const pairMean = finiteNonNegative(
+    candidate.globalMeanIncrementalPairLift,
+    "Frozen candidate pair mean",
+  );
+  const rareMean = finiteNonNegative(
+    candidate.globalMeanRareSingletonLift,
+    "Frozen candidate rare mean",
+  );
+  if (
+    pairMean !== pairLift / SHADOW_EVALUATION_DOMAIN_COUNT
+    || rareMean !== rareLift / SHADOW_EVALUATION_DOMAIN_COUNT
+  ) {
+    throw new TypeError("Frozen candidate target means are inconsistent");
+  }
+
+  const identity = exactRecord(candidate.trainingIdentity, [
+    "artifactDigest",
+    "domainSetDigest",
+    "schemaVersion",
+    "protocolRevision",
+    "runId",
+    "provenance",
+  ], "Frozen candidate training identity");
+  if (
+    identity.schemaVersion !== 1
+    || identity.protocolRevision !== SHADOW_EVALUATION_PROTOCOL_REVISION
+  ) {
+    throw new TypeError("Frozen candidate training identity does not match");
+  }
+  const trainingProvenance = canonicalProvenance(
+    identity.provenance,
+    "Frozen candidate training provenance",
+  );
+  const compatibility = exactRecord(candidate.evaluationCompatibility, [
+    "schemaVersion",
+    "protocolRevision",
+    "scannerVersion",
+    "catalog",
+    "configDigest",
+  ], "Frozen candidate evaluation compatibility");
+  if (
+    compatibility.schemaVersion !== 1
+    || compatibility.protocolRevision !== SHADOW_EVALUATION_PROTOCOL_REVISION
+  ) {
+    throw new TypeError("Frozen candidate evaluation compatibility does not match");
+  }
+  const compatibilityCatalogRecord = exactRecord(
+    compatibility.catalog,
+    ["source", "revision", "digest"],
+    "Frozen candidate evaluation catalog",
+  );
+  const compatibilityCatalog = cloneCatalog({
+    source: boundedString(
+      compatibilityCatalogRecord.source,
+      "Frozen candidate evaluation catalog source",
+      1_024,
+    ),
+    revision: boundedString(
+      compatibilityCatalogRecord.revision,
+      "Frozen candidate evaluation catalog revision",
+      1_024,
+    ),
+    digest: normalizeSha256Digest(
+      boundedString(
+        compatibilityCatalogRecord.digest,
+        "Frozen candidate evaluation catalog digest",
+        128,
+      ),
+      "Frozen candidate evaluation catalog digest",
+    ),
+  });
+  if (
+    compatibilityCatalog.source !== trainingProvenance.catalog.source
+    || compatibilityCatalog.revision !== trainingProvenance.catalog.revision
+    || compatibilityCatalog.digest !== trainingProvenance.catalog.digest
+  ) {
+    throw new TypeError("Frozen candidate catalogs are inconsistent");
+  }
+
+  const objectiveRecord = exactRecord(candidate.trainingObjectives, [
+    "fullPairs",
+    "baselineRetainedPairs",
+    "pairDeficit",
+    "fullCanonicalNames",
+    "baselineRetainedNames",
+    "nameDeficit",
+  ], "Frozen candidate training objectives");
+  const trainingObjective: ShadowTrainingObjectives = Object.freeze({
+    fullPairs: safeCount(objectiveRecord.fullPairs, "Training full pairs"),
+    baselineRetainedPairs: safeCount(
+      objectiveRecord.baselineRetainedPairs,
+      "Training baseline pairs",
+    ),
+    pairDeficit: safeCount(objectiveRecord.pairDeficit, "Training pair deficit"),
+    fullCanonicalNames: safeCount(
+      objectiveRecord.fullCanonicalNames,
+      "Training full names",
+    ),
+    baselineRetainedNames: safeCount(
+      objectiveRecord.baselineRetainedNames,
+      "Training baseline names",
+    ),
+    nameDeficit: safeCount(objectiveRecord.nameDeficit, "Training name deficit"),
+  });
+  if (
+    trainingObjective.baselineRetainedPairs > trainingObjective.fullPairs
+    || trainingObjective.baselineRetainedNames
+      > trainingObjective.fullCanonicalNames
+    || trainingObjective.pairDeficit !== Math.max(
+      1,
+      requiredRetention(trainingObjective.fullPairs, 4, 5)
+        - trainingObjective.baselineRetainedPairs,
+    )
+    || trainingObjective.nameDeficit !== Math.max(
+      1,
+      requiredRetention(trainingObjective.fullCanonicalNames, 19, 20)
+        - trainingObjective.baselineRetainedNames,
+    )
+  ) {
+    throw new TypeError("Frozen candidate training objectives are inconsistent");
+  }
+
+  if (
+    !Array.isArray(candidate.recurringNames)
+    || candidate.recurringNames.length > SHADOW_MODEL_RECURRING_NAME_CAP
+  ) {
+    throw new TypeError("Frozen candidate recurring-name heads exceed their bound");
+  }
+  let previousName: string | undefined;
+  const recurringNames = candidate.recurringNames.map((value, index) => {
+    const head = exactRecord(value, ["name", "support"], `Recurring head ${index}`);
+    const name = boundedString(head.name, `Recurring head ${index} name`, 4_096);
+    const support = safeCount(head.support, `Recurring head ${index} support`);
+    if (
+      support < SHADOW_RECURRING_NAME_MINIMUM_SUPPORT
+      || support > SHADOW_EVALUATION_DOMAIN_COUNT
+      || (previousName !== undefined && compareString(previousName, name) >= 0)
+    ) {
+      throw new TypeError("Frozen candidate recurring-name heads are invalid");
+    }
+    previousName = name;
+    return Object.freeze({ name, support });
+  });
+  const recurringSupport = recurringNames.reduce(
+    (sum, { support }) => sum + support,
+    0,
+  );
+  if (
+    !Number.isSafeInteger(recurringSupport)
+    || !Number.isSafeInteger(recurringSupport + rareLift)
+    || recurringSupport + rareLift > pairLift
+  ) {
+    throw new TypeError("Frozen candidate breadth targets exceed pair lift");
+  }
+
+  if (!Array.isArray(candidate.tokens) || candidate.tokens.length > SHADOW_MODEL_TOKEN_CAP) {
+    throw new TypeError("Frozen candidate tokens exceed their bound");
+  }
+  let previousToken: string | undefined;
+  let recurringTargetCount = 0;
+  const tokens = candidate.tokens.map((value, tokenIndex) => {
+    const token = exactRecord(value, [
+      "token",
+      "domains",
+      "pairTargetSum",
+      "rareTargetSum",
+      "recurringTargetSums",
+    ], `Frozen candidate token ${tokenIndex}`);
+    const tokenName = boundedString(
+      token.token,
+      `Frozen candidate token ${tokenIndex} name`,
+    );
+    const domains = safeCount(token.domains, `Frozen candidate token ${tokenIndex} domains`);
+    if (
+      domains === 0
+      || domains > SHADOW_EVALUATION_DOMAIN_COUNT
+      || (previousToken !== undefined && compareString(previousToken, tokenName) >= 0)
+    ) {
+      throw new TypeError("Frozen candidate tokens are invalid or unsorted");
+    }
+    previousToken = tokenName;
+    if (!Array.isArray(token.recurringTargetSums)) {
+      throw new TypeError("Frozen candidate recurring targets must be an array");
+    }
+    recurringTargetCount += token.recurringTargetSums.length;
+    if (recurringTargetCount > SHADOW_MODEL_RECURRING_TARGET_CAP) {
+      throw new TypeError("Frozen candidate recurring targets exceed their bound");
+    }
+    let previousHead = -1;
+    const recurringTargetSums = token.recurringTargetSums.map((target, targetIndex) => {
+      const record = exactRecord(
+        target,
+        ["head", "targetSum"],
+        `Frozen candidate token ${tokenIndex} recurring target ${targetIndex}`,
+      );
+      const head = safeCount(record.head, "Frozen candidate recurring target head");
+      const targetSum = safeCount(
+        record.targetSum,
+        "Frozen candidate recurring target sum",
+      );
+      if (
+        head <= previousHead
+        || head >= recurringNames.length
+        || targetSum === 0
+        || targetSum > domains
+        || targetSum > (recurringNames[head]?.support ?? -1)
+      ) {
+        throw new TypeError("Frozen candidate recurring targets are invalid");
+      }
+      previousHead = head;
+      return Object.freeze({ head, targetSum });
+    });
+    const tokenPairTarget = safeCount(
+      token.pairTargetSum,
+      `Frozen candidate token ${tokenIndex} pair target`,
+    );
+    const tokenRareTarget = safeCount(
+      token.rareTargetSum,
+      `Frozen candidate token ${tokenIndex} rare target`,
+    );
+    if (tokenPairTarget > pairLift || tokenRareTarget > rareLift) {
+      throw new TypeError("Frozen candidate token targets exceed training totals");
+    }
+    return Object.freeze({
+      token: tokenName,
+      domains,
+      pairTargetSum: tokenPairTarget,
+      rareTargetSum: tokenRareTarget,
+      recurringTargetSums: Object.freeze(recurringTargetSums),
+    });
+  });
+  const artifactDigest = normalizeSha256Digest(
+    boundedString(identity.artifactDigest, "Training artifact digest", 128),
+    "Training artifact digest",
+  );
+  const domainSetDigest = normalizeSha256Digest(
+    boundedString(identity.domainSetDigest, "Training domain-set digest", 128),
+    "Training domain-set digest",
+  );
+  const canonical = Object.freeze({
+    kind: SHADOW_MODEL_KIND,
+    calibrationRevision: SHADOW_CALIBRATION_REVISION,
+    protocolRevision: SHADOW_EVALUATION_PROTOCOL_REVISION,
+    trainingDomains: SHADOW_EVALUATION_DOMAIN_COUNT,
+    objectives: Object.freeze({
+      canonicalDirectNameRetentionMinimum: 0.95 as const,
+      domainTechnologyPairRetentionMinimum: 0.8 as const,
+    }),
+    recurringNameMinimumSupport: SHADOW_RECURRING_NAME_MINIMUM_SUPPORT,
+    trainingIncrementalPairLift: pairLift,
+    trainingRareSingletonLift: rareLift,
+    globalMeanIncrementalPairLift: pairMean,
+    globalMeanRareSingletonLift: rareMean,
+    smoothingPrior: SHADOW_CALIBRATION_SMOOTHING_PRIOR,
+    trainingIdentity: Object.freeze({
+      artifactDigest,
+      domainSetDigest,
+      schemaVersion: 1 as const,
+      protocolRevision: SHADOW_EVALUATION_PROTOCOL_REVISION,
+      runId: (() => {
+        const runId = boundedString(identity.runId, "Training runId", 128);
+        if (!RUN_ID.test(runId)) throw new TypeError("Training runId is invalid");
+        return runId;
+      })(),
+      provenance: trainingProvenance,
+    }),
+    evaluationCompatibility: Object.freeze({
+      schemaVersion: 1 as const,
+      protocolRevision: SHADOW_EVALUATION_PROTOCOL_REVISION,
+      scannerVersion: boundedString(
+        compatibility.scannerVersion,
+        "Expected evaluation scanner version",
+        128,
+      ),
+      catalog: compatibilityCatalog,
+      configDigest: normalizeSha256Digest(
+        boundedString(
+          compatibility.configDigest,
+          "Expected evaluation config digest",
+          128,
+        ),
+        "Expected evaluation config digest",
+      ),
+    }),
+    trainingObjectives: trainingObjective,
+    recurringNames: Object.freeze(recurringNames),
+    tokens: Object.freeze(tokens),
+  });
+  return canonical;
+}
+
+function modelFromCandidate(candidate: ShadowFrozenCandidate): TrainedMultiHeadModel {
+  return Object.freeze({
+    trainingDomains: candidate.trainingDomains,
+    trainingIncrementalPairLift: candidate.trainingIncrementalPairLift,
+    trainingRareSingletonLift: candidate.trainingRareSingletonLift,
+    globalMeanIncrementalPairLift: candidate.globalMeanIncrementalPairLift,
+    globalMeanRareSingletonLift: candidate.globalMeanRareSingletonLift,
+    trainingObjectives: candidate.trainingObjectives,
+    recurringNames: candidate.recurringNames,
+    tokens: new Map(candidate.tokens.map((token) => [token.token, {
+      domains: token.domains,
+      pairTargetSum: token.pairTargetSum,
+      rareTargetSum: token.rareTargetSum,
+      recurringTargetSums: new Map(
+        token.recurringTargetSums.map(({ head, targetSum }) => [head, targetSum]),
+      ),
+    }] as const)),
+  });
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value === "boolean" || typeof value === "number") {
+    return JSON.stringify(value);
+  }
+  if (typeof value === "string") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record).sort(compareString).map((key) =>
+    `${JSON.stringify(key)}:${canonicalJson(record[key])}`).join(",")}}`;
+}
+
+export function canonicalizeShadowFrozenCandidate(value: unknown): string {
+  return canonicalJson(validateShadowFrozenCandidate(value));
+}
+
+export function digestShadowFrozenCandidate(value: unknown): string {
+  return `sha256:${createHash("sha256")
+    .update(canonicalizeShadowFrozenCandidate(value), "utf8")
+    .digest("hex")}`;
+}
+
+export interface ShadowFrozenCandidateCompatibilityInput {
+  readonly schemaVersion: 1;
+  readonly protocolRevision: typeof SHADOW_EVALUATION_PROTOCOL_REVISION;
+  readonly scannerVersion: string;
+  readonly catalog: CatalogProvenance;
+  readonly configDigest: string;
+}
+
+export interface ShadowFrozenHoldoutOptions {
+  readonly candidateDigest: string;
+}
+
+export function assertShadowFrozenCandidateCompatibility(
+  value: unknown,
+  evaluation: ShadowFrozenCandidateCompatibilityInput,
+): ShadowFrozenCandidate {
+  const candidate = validateShadowFrozenCandidate(value);
+  const expected = candidate.evaluationCompatibility;
+  if (
+    evaluation.schemaVersion !== expected.schemaVersion
+    || evaluation.protocolRevision !== expected.protocolRevision
+    || evaluation.scannerVersion !== expected.scannerVersion
+    || evaluation.catalog.source !== expected.catalog.source
+    || evaluation.catalog.revision !== expected.catalog.revision
+    || evaluation.catalog.digest !== expected.catalog.digest
+    || evaluation.configDigest !== expected.configDigest
+  ) {
+    throw new TypeError("Frozen candidate is incompatible with the evaluation run");
+  }
+  return candidate;
+}
+
+export function predictShadowSnapshot(
+  value: unknown,
+  snapshot: Pick<ShadowEvaluationSnapshot, "t1" | "t2" | "preBrowser">,
+): ShadowTriggerPrediction {
+  return predictWithModel(modelFromCandidate(validateShadowFrozenCandidate(value)), snapshot);
+}
+
 function trainFoldModel(
   snapshots: readonly ShadowEvaluationSnapshot[],
   heldOutFold: number,
 ): FoldModel {
-  const tokenAggregates = new Map<string, TokenAggregate>();
-  let trainingDomains = 0;
-  let targetSum = 0;
-  let heldOutDomains = 0;
-
-  for (const snapshot of snapshots) {
-    if (shadowFoldForDomain(snapshot.domain) === heldOutFold) {
-      heldOutDomains += 1;
-      continue;
-    }
-    trainingDomains += 1;
-    const target = incrementalPairLift(snapshot);
-    targetSum += target;
-    for (const token of shadowTriggerFeatureTokens(snapshot)) {
-      const aggregate = tokenAggregates.get(token) ?? { domains: 0, targetSum: 0 };
-      aggregate.domains += 1;
-      aggregate.targetSum += target;
-      tokenAggregates.set(token, aggregate);
-    }
-  }
-
-  if (trainingDomains === 0) {
-    throw new TypeError("A calibration fold has no training domains");
-  }
-  const globalMean = targetSum / trainingDomains;
+  const training = snapshots.filter(
+    (snapshot) => shadowFoldForDomain(snapshot.domain) !== heldOutFold,
+  );
+  const heldOutDomains = snapshots.length - training.length;
+  const model = trainMultiHeadModel(training);
   return Object.freeze({
-    globalMean,
-    tokens: tokenAggregates,
+    model,
     metadata: Object.freeze({
       fold: heldOutFold,
-      trainingDomains,
+      trainingDomains: training.length,
       heldOutDomains,
-      trainingIncrementalPairLift: targetSum,
-      globalMeanIncrementalPairLift: globalMean,
-      featureTokenCount: tokenAggregates.size,
+      trainingIncrementalPairLift: model.trainingIncrementalPairLift,
+      globalMeanIncrementalPairLift: model.globalMeanIncrementalPairLift,
+      trainingRareSingletonLift: model.trainingRareSingletonLift,
+      globalMeanRareSingletonLift: model.globalMeanRareSingletonLift,
+      recurringNameHeads: model.recurringNames.length,
+      pairDeficit: model.trainingObjectives.pairDeficit,
+      nameDeficit: model.trainingObjectives.nameDeficit,
+      featureTokenCount: model.tokens.size,
       smoothingPrior: SHADOW_CALIBRATION_SMOOTHING_PRIOR,
     }),
   });
 }
 
-function predict(model: FoldModel, tokens: readonly string[]): number {
-  let sum = model.globalMean;
-  let estimates = 1;
-  for (const token of tokens) {
-    const aggregate = model.tokens.get(token);
-    if (aggregate === undefined) continue;
-    sum += deploymentTokenEstimate(aggregate, model.globalMean);
-    estimates += 1;
-  }
-  return sum / estimates;
-}
-
 function deploymentTokenEstimate(
-  aggregate: TokenAggregate,
+  targetSum: number,
+  domains: number,
   globalMean: number,
 ): number {
   return (
-    aggregate.targetSum
+    targetSum
     + (SHADOW_CALIBRATION_SMOOTHING_PRIOR * globalMean)
-  ) / (aggregate.domains + SHADOW_CALIBRATION_SMOOTHING_PRIOR);
+  ) / (domains + SHADOW_CALIBRATION_SMOOTHING_PRIOR);
 }
 
-function trainDeploymentModel(
-  snapshots: readonly ShadowEvaluationSnapshot[],
-): ShadowDeploymentModel {
-  const aggregates = new Map<string, TokenAggregate>();
-  let targetSum = 0;
-  for (const snapshot of snapshots) {
-    const target = incrementalPairLift(snapshot);
-    targetSum += target;
-    for (const token of shadowTriggerFeatureTokens(snapshot)) {
-      const aggregate = aggregates.get(token) ?? { domains: 0, targetSum: 0 };
-      aggregate.domains += 1;
-      aggregate.targetSum += target;
-      aggregates.set(token, aggregate);
-    }
-  }
-  const globalMean = targetSum / snapshots.length;
-  const tokens = Object.freeze([...aggregates.entries()]
-    .sort(([left], [right]) => compareString(left, right))
-    .map(([token, aggregate]): ShadowDeploymentToken => Object.freeze({
-      token,
-      domains: aggregate.domains,
-      targetSum: aggregate.targetSum,
-      estimate: deploymentTokenEstimate(aggregate, globalMean),
-    })));
-  return Object.freeze({
-    kind: "smoothed-empirical-token-lift-v1" as const,
-    calibrationRevision: SHADOW_CALIBRATION_REVISION,
-    protocolRevision: SHADOW_EVALUATION_PROTOCOL_REVISION,
-    target: "incremental-domain-technology-pairs" as const,
-    trainingDomains: SHADOW_EVALUATION_DOMAIN_COUNT,
-    trainingIncrementalPairLift: targetSum,
-    globalMeanIncrementalPairLift: globalMean,
-    smoothingPrior: SHADOW_CALIBRATION_SMOOTHING_PRIOR,
-    tokens,
-  });
-}
-
-export function scoreShadowSnapshot(
-  model: ShadowDeploymentModel,
+function predictWithModel(
+  model: TrainedMultiHeadModel,
   snapshot: Pick<ShadowEvaluationSnapshot, "t1" | "t2" | "preBrowser">,
-): number {
-  if (
-    model.kind !== "smoothed-empirical-token-lift-v1"
-    || model.calibrationRevision !== SHADOW_CALIBRATION_REVISION
-    || model.protocolRevision !== SHADOW_EVALUATION_PROTOCOL_REVISION
-    || model.target !== "incremental-domain-technology-pairs"
-    || model.trainingDomains !== SHADOW_EVALUATION_DOMAIN_COUNT
-    || model.smoothingPrior !== SHADOW_CALIBRATION_SMOOTHING_PRIOR
-    || !Number.isFinite(model.globalMeanIncrementalPairLift)
-    || model.globalMeanIncrementalPairLift < 0
-  ) {
-    throw new TypeError("Deployment model does not match the frozen calibration");
+): ShadowTriggerPrediction {
+  const featureTokens = shadowTriggerFeatureTokens(snapshot);
+  const matched = featureTokens
+    .map((token) => model.tokens.get(token))
+    .filter((aggregate): aggregate is TokenAggregate => aggregate !== undefined);
+  let pairSum = model.globalMeanIncrementalPairLift;
+  let rareSum = model.globalMeanRareSingletonLift;
+  for (const aggregate of matched) {
+    pairSum += deploymentTokenEstimate(
+      aggregate.pairTargetSum,
+      aggregate.domains,
+      model.globalMeanIncrementalPairLift,
+    );
+    rareSum += deploymentTokenEstimate(
+      aggregate.rareTargetSum,
+      aggregate.domains,
+      model.globalMeanRareSingletonLift,
+    );
   }
-
-  const estimates = new Map<string, number>();
-  let previous: string | undefined;
-  for (const entry of model.tokens) {
-    if (
-      entry.token.length === 0
-      || (previous !== undefined && compareString(previous, entry.token) >= 0)
-      || !Number.isFinite(entry.estimate)
-      || entry.estimate < 0
-    ) {
-      throw new TypeError("Deployment model tokens are invalid or unsorted");
-    }
-    previous = entry.token;
-    estimates.set(entry.token, entry.estimate);
-  }
-
-  let sum = model.globalMeanIncrementalPairLift;
-  let matchedEstimates = 1;
-  for (const token of shadowTriggerFeatureTokens(snapshot)) {
-    const estimate = estimates.get(token);
-    if (estimate === undefined) continue;
-    sum += estimate;
-    matchedEstimates += 1;
-  }
-  return sum / matchedEstimates;
+  const estimates = matched.length + 1;
+  const recurringNames = model.recurringNames.map(
+    ({ name, support }, head): ShadowRecurringNamePrediction => {
+      const globalMean = support / model.trainingDomains;
+      let sum = globalMean;
+      for (const aggregate of matched) {
+        sum += deploymentTokenEstimate(
+          aggregate.recurringTargetSums.get(head) ?? 0,
+          aggregate.domains,
+          globalMean,
+        );
+      }
+      return Object.freeze({
+        name,
+        probability: Math.min(1, Math.max(0, sum / estimates)),
+      });
+    },
+  );
+  return Object.freeze({
+    pairLift: pairSum / estimates,
+    rareNovelty: rareSum / estimates,
+    recurringNames: Object.freeze(recurringNames),
+    featureTokens: featureTokens.length,
+  });
 }
 
 function scoreSnapshots(
   snapshots: readonly ShadowEvaluationSnapshot[],
 ): {
-  readonly models: readonly ShadowFoldModelMetadata[];
+  readonly models: readonly FoldModel[];
   readonly scored: readonly ScoredSnapshot[];
 } {
   const models = Array.from(
     { length: SHADOW_EVALUATION_FOLD_COUNT },
     (_, fold) => trainFoldModel(snapshots, fold),
   );
+  const baselineNames = t2BaselineNames(snapshots);
   const scored = snapshots.map((snapshot): ScoredSnapshot => {
     const fold = shadowFoldForDomain(snapshot.domain);
-    const tokens = shadowTriggerFeatureTokens(snapshot);
-    const model = models[fold];
-    if (model === undefined) throw new TypeError("Missing calibration fold model");
+    const foldModel = models[fold];
+    if (foldModel === undefined) throw new TypeError("Missing calibration fold model");
+    const prediction = predictWithModel(foldModel.model, snapshot);
     return Object.freeze({
       snapshot,
       prediction: Object.freeze({
         domain: snapshot.domain,
         fold,
-        score: predict(model, tokens),
-        featureTokens: tokens.length,
+        score: initialPredictionUtility(
+          prediction,
+          foldModel.model,
+          baselineNames,
+        ),
+        pairLift: prediction.pairLift,
+        rareNovelty: prediction.rareNovelty,
+        recurringExpectedLift: prediction.recurringNames.reduce(
+          (sum, { name, probability }) =>
+            sum + (baselineNames.has(name) ? 0 : probability),
+          0,
+        ),
+        recurringNames: prediction.recurringNames,
+        featureTokens: prediction.featureTokens,
       }),
     });
   });
   return Object.freeze({
-    models: Object.freeze(models.map(({ metadata }) => metadata)),
+    models: Object.freeze(models),
     scored: Object.freeze(scored),
   });
 }
 
-function compareOofRank(left: ScoredSnapshot, right: ScoredSnapshot): number {
-  const scoreOrder = right.prediction.score - left.prediction.score;
-  if (scoreOrder !== 0) return scoreOrder;
-  return compareString(
-    saltedHashHex(SHADOW_CALIBRATION_SALTS.scoreTieBreak, left.snapshot.domain),
-    saltedHashHex(SHADOW_CALIBRATION_SALTS.scoreTieBreak, right.snapshot.domain),
-  ) || compareString(left.snapshot.domain, right.snapshot.domain);
+function t2BaselineNames(
+  snapshots: readonly Pick<ShadowEvaluationSnapshot, "t2">[],
+): ReadonlySet<string> {
+  const names = new Set<string>();
+  for (const snapshot of snapshots) {
+    for (const name of directNames(snapshot.t2)) names.add(name);
+  }
+  return names;
+}
+
+function predictionNovelty(
+  prediction: Pick<InternalShadowPrediction, "rareNovelty" | "recurringNames">,
+  baselineNames: ReadonlySet<string>,
+  covered: ReadonlyMap<string, number> = new Map(),
+): number {
+  let novelty = prediction.rareNovelty;
+  for (const { name, probability } of prediction.recurringNames) {
+    if (baselineNames.has(name)) continue;
+    novelty += probability * (1 - (covered.get(name) ?? 0));
+  }
+  return novelty;
+}
+
+function initialPredictionUtility(
+  prediction: ShadowTriggerPrediction,
+  model: TrainedMultiHeadModel,
+  baselineNames: ReadonlySet<string>,
+): number {
+  const pair = model.trainingObjectives.pairDeficit === 0
+    ? 0
+    : prediction.pairLift / model.trainingObjectives.pairDeficit;
+  const names = model.trainingObjectives.nameDeficit === 0
+    ? 0
+    : predictionNovelty(prediction, baselineNames)
+      / model.trainingObjectives.nameDeficit;
+  return pair + names;
+}
+
+function selectGreedyPredictions(
+  scored: readonly ScoredSnapshot[],
+  count: number,
+  model: TrainedMultiHeadModel,
+  baselineNames: ReadonlySet<string>,
+): readonly ScoredSnapshot[] {
+  const remaining = new Map(
+    scored.map((item) => [item.snapshot.domain, item] as const),
+  );
+  const covered = new Map<string, number>();
+  const selected: ScoredSnapshot[] = [];
+  while (selected.length < count) {
+    let best: ScoredSnapshot | undefined;
+    let bestUtility = -1;
+    for (const item of remaining.values()) {
+      const pairContribution = item.prediction.pairLift
+        / model.trainingObjectives.pairDeficit;
+      const novelty = predictionNovelty(item.prediction, baselineNames, covered);
+      const nameContribution = novelty / model.trainingObjectives.nameDeficit;
+      const utility = pairContribution + nameContribution;
+      const better = utility > bestUtility || (
+        utility === bestUtility
+        && best !== undefined
+        && compareString(
+          saltedHashHex(
+            SHADOW_CALIBRATION_SALTS.scoreTieBreak,
+            item.snapshot.domain,
+          ),
+          saltedHashHex(
+            SHADOW_CALIBRATION_SALTS.scoreTieBreak,
+            best.snapshot.domain,
+          ),
+        ) < 0
+      );
+      if (best === undefined || better) {
+        best = item;
+        bestUtility = utility;
+      }
+    }
+    if (best === undefined) {
+      throw new TypeError("Multi-objective trigger exhausted its cohort");
+    }
+    remaining.delete(best.snapshot.domain);
+    for (const { name, probability } of best.prediction.recurringNames) {
+      if (baselineNames.has(name)) continue;
+      const previous = covered.get(name) ?? 0;
+      covered.set(name, 1 - ((1 - previous) * (1 - probability)));
+    }
+    selected.push(Object.freeze({
+      snapshot: best.snapshot,
+      prediction: Object.freeze({ ...best.prediction, score: bestUtility }),
+    }));
+  }
+  return Object.freeze(selected);
 }
 
 function largestRemainderQuotas(
@@ -786,12 +1754,40 @@ function costMetric(selected: number, full: number): ShadowCostMetric {
   return Object.freeze({ selected, full, relative: ratio(selected, full) });
 }
 
+function addSafeCost(left: number, right: number, label: string): number {
+  const result = left + right;
+  if (!Number.isSafeInteger(result)) {
+    throw new TypeError(`${label} aggregate exceeds the safe-integer boundary`);
+  }
+  return result;
+}
+
 function addCost(target: MutableCostTotals, snapshot: ShadowEvaluationSnapshot): void {
-  target.browserPagesAttempted += snapshot.fullCost.browserPagesAttempted;
-  target.browserPagesAdmitted += snapshot.fullCost.browserPagesAdmitted;
-  target.browserRequests += snapshot.fullCost.browserRequests;
-  target.browserTransferredBytes += snapshot.fullCost.browserTransferredBytes;
-  target.browserMs += snapshot.fullCost.browserMs;
+  target.browserPagesAttempted = addSafeCost(
+    target.browserPagesAttempted,
+    snapshot.fullCost.browserPagesAttempted,
+    "Browser pages attempted",
+  );
+  target.browserPagesAdmitted = addSafeCost(
+    target.browserPagesAdmitted,
+    snapshot.fullCost.browserPagesAdmitted,
+    "Browser pages admitted",
+  );
+  target.browserRequests = addSafeCost(
+    target.browserRequests,
+    snapshot.fullCost.browserRequests,
+    "Browser requests",
+  );
+  target.browserTransferredBytes = addSafeCost(
+    target.browserTransferredBytes,
+    snapshot.fullCost.browserTransferredBytes,
+    "Browser transferred bytes",
+  );
+  target.browserMs = addSafeCost(
+    target.browserMs,
+    snapshot.fullCost.browserMs,
+    "Browser milliseconds",
+  );
 }
 
 function costsForSelection(
@@ -974,6 +1970,34 @@ function provisionalGuardrailVerdict(
       .domainTechnologyPairRetentionMinimum;
   const routedPassed = metrics.routedDomains
     <= SHADOW_PROVISIONAL_GUARDRAILS.routedDomainMaximum;
+  const costVerdict = (
+    metric: ShadowCostMetric,
+  ): ShadowCostGuardrailVerdict => Object.freeze({
+    selected: metric.selected,
+    full: metric.full,
+    actual: metric.relative,
+    maximum: SHADOW_REAL_BROWSER_COST_MAXIMUM,
+    passed: BigInt(metric.selected) * 10n <= BigInt(metric.full) * 3n,
+  });
+  const browserPagesAttempted = costVerdict(metrics.costs.browserPagesAttempted);
+  const browserPagesAdmitted = costVerdict(metrics.costs.browserPagesAdmitted);
+  const browserRequests = costVerdict(metrics.costs.browserRequests);
+  const browserTransferredBytes = costVerdict(
+    metrics.costs.browserTransferredBytes,
+  );
+  const browserMs = costVerdict(metrics.costs.browserMs);
+  const realBrowserCosts = Object.freeze({
+    browserPagesAttempted,
+    browserPagesAdmitted,
+    browserRequests,
+    browserTransferredBytes,
+    browserMs,
+    passed: browserPagesAttempted.passed
+      && browserPagesAdmitted.passed
+      && browserRequests.passed
+      && browserTransferredBytes.passed
+      && browserMs.passed,
+  });
   return Object.freeze({
     scope: "provisional-shadow-challenge" as const,
     canonicalDirectNames: Object.freeze({
@@ -993,7 +2017,8 @@ function provisionalGuardrailVerdict(
       maximum: SHADOW_PROVISIONAL_GUARDRAILS.routedDomainMaximum,
       passed: routedPassed,
     }),
-    passed: namePassed && pairPassed && routedPassed,
+    realBrowserCosts,
+    passed: namePassed && pairPassed && routedPassed && realBrowserCosts.passed,
   });
 }
 
@@ -1113,26 +2138,48 @@ function greedySelection(
   });
 }
 
-export function calibrateShadowEvaluation(
-  inputSnapshots: readonly ShadowEvaluationSnapshot[],
-): ShadowCalibrationReport {
-  const snapshots = validateSnapshots(inputSnapshots);
+function publishedPrediction(prediction: InternalShadowPrediction): ShadowOofPrediction {
+  return Object.freeze({
+    domain: prediction.domain,
+    fold: prediction.fold,
+    score: prediction.score,
+    pairLift: prediction.pairLift,
+    rareNovelty: prediction.rareNovelty,
+    recurringExpectedLift: prediction.recurringExpectedLift,
+    featureTokens: prediction.featureTokens,
+  });
+}
+
+function developmentCalibration(
+  artifact: ShadowEvaluationArtifact,
+): {
+  readonly report: ShadowDevelopmentSourceReport;
+  readonly snapshots: readonly ShadowEvaluationSnapshot[];
+} {
+  const snapshots = validateArtifact(artifact);
   const { models, scored } = scoreSnapshots(snapshots);
   const quotas = foldQuotas(scored);
+  const baselineNames = t2BaselineNames(snapshots);
   const triggered: ScoredSnapshot[] = [];
   const controls: ScoredSnapshot[] = [];
   for (const quota of quotas) {
-    const ranked = scored
-      .filter(({ prediction }) => prediction.fold === quota.fold)
-      .sort(compareOofRank);
-    if (ranked.length !== quota.domains) {
+    const foldScored = scored
+      .filter(({ prediction }) => prediction.fold === quota.fold);
+    if (foldScored.length !== quota.domains) {
       throw new TypeError("Calibration fold membership does not match its quota");
     }
-    const foldTriggered = ranked.slice(0, quota.trigger);
+    const foldModel = models[quota.fold];
+    if (foldModel === undefined) throw new TypeError("Missing calibration fold model");
+    const foldTriggered = selectGreedyPredictions(
+      foldScored,
+      quota.trigger,
+      foldModel.model,
+      baselineNames,
+    );
     const triggeredDomains = new Set(
       foldTriggered.map(({ snapshot }) => snapshot.domain),
     );
-    const foldControls = ranked
+    const foldControls = foldScored
       .filter(({ snapshot }) => !triggeredDomains.has(snapshot.domain))
       .sort((left, right) =>
         compareString(
@@ -1187,26 +2234,31 @@ export function calibrateShadowEvaluation(
     snapshots,
     SHADOW_TRIGGER_DOMAIN_CAP + SHADOW_CONTROL_DOMAIN_COUNT,
   );
-  const deploymentModel = trainDeploymentModel(snapshots);
   const deployableMetrics = metricsForSelection(snapshots, deployableDomains);
-
-  return Object.freeze({
+  const report: ShadowDevelopmentSourceReport = Object.freeze({
+    mode: "development-source" as const,
     calibrationRevision: SHADOW_CALIBRATION_REVISION,
     protocolRevision: SHADOW_EVALUATION_PROTOCOL_REVISION,
     runId: snapshots[0]?.runId ?? "",
+    evaluationProvenance: cloneProvenance(artifact.provenance),
     cohortDomains: SHADOW_EVALUATION_DOMAIN_COUNT,
     foldCount: SHADOW_EVALUATION_FOLD_COUNT,
     salts: SHADOW_CALIBRATION_SALTS,
     model: Object.freeze({
-      kind: "smoothed-empirical-token-lift-v1" as const,
-      target: "incremental-domain-technology-pairs" as const,
+      kind: SHADOW_MODEL_KIND,
+      targets: Object.freeze([
+        "incremental-domain-technology-pairs",
+        "recurring-canonical-name-presence",
+        "rare-singleton-novelty",
+      ] as const),
       smoothingPrior: SHADOW_CALIBRATION_SMOOTHING_PRIOR,
-      folds: models,
+      folds: Object.freeze(models.map(({ metadata }) => metadata)),
     }),
-    deploymentModel,
-    oofPredictions: Object.freeze(scored.map(({ prediction }) => prediction)),
+    oofPredictions: Object.freeze(
+      scored.map(({ prediction }) => publishedPrediction(prediction)),
+    ),
     deployable: Object.freeze({
-      name: "deployable-oof-trigger" as const,
+      name: "development-oof-trigger" as const,
       triggerDomainCount: triggered.length,
       controlDomainCount: controls.length,
       selected: Object.freeze(selected),
@@ -1224,6 +2276,150 @@ export function calibrateShadowEvaluation(
       selectedDomains: greedy.domains,
       steps: greedy.steps,
       metrics: metricsForSelection(snapshots, greedy.domains),
+    }),
+  });
+  return Object.freeze({ report, snapshots });
+}
+
+export function calibrateShadowDevelopmentSource(
+  artifact: ShadowEvaluationArtifact,
+): ShadowDevelopmentSourceReport {
+  return developmentCalibration(artifact).report;
+}
+
+export function calibrateShadowDevelopment(
+  artifact: ShadowEvaluationArtifact,
+  options: ShadowDevelopmentCalibrationOptions,
+): ShadowDevelopmentCalibrationReport {
+  const { report, snapshots } = developmentCalibration(artifact);
+  const trainingArtifactDigest = normalizeSha256Digest(
+    options.trainingArtifactDigest,
+    "Training artifact digest",
+  );
+  const candidate = report.deployable.provisionalGuardrails.passed
+    ? buildFrozenCandidate(trainMultiHeadModel(snapshots), artifact, {
+      ...options,
+      trainingArtifactDigest,
+    })
+    : null;
+  return Object.freeze({
+    ...report,
+    mode: "development-oof" as const,
+    trainingArtifactDigest,
+    candidate,
+    deploymentModel: candidate,
+  });
+}
+
+export function evaluateFrozenShadowCandidate(
+  artifact: ShadowEvaluationArtifact,
+  candidateValue: unknown,
+  options: ShadowFrozenHoldoutOptions,
+): ShadowFrozenHoldoutReport {
+  const snapshots = validateArtifact(artifact);
+  const candidate = assertShadowFrozenCandidateCompatibility(candidateValue, {
+    schemaVersion: artifact.schemaVersion,
+    protocolRevision: artifact.protocolRevision,
+    scannerVersion: artifact.provenance.scannerVersion,
+    catalog: artifact.provenance.catalog,
+    configDigest: artifact.provenance.configDigest,
+  });
+  const model = modelFromCandidate(candidate);
+  const candidateDigest = digestShadowFrozenCandidate(candidate);
+  if (
+    normalizeSha256Digest(options.candidateDigest, "Pinned candidate digest")
+      !== candidateDigest
+  ) {
+    throw new TypeError("Pinned candidate digest does not match candidate");
+  }
+  if (
+    artifact.runId === candidate.trainingIdentity.runId
+    || computeDomainSetDigest(snapshots.map(({ domain }) => domain))
+      === candidate.trainingIdentity.domainSetDigest
+  ) {
+    throw new TypeError("Frozen holdout must use a distinct run and domain set");
+  }
+  const baselineNames = t2BaselineNames(snapshots);
+  const scored = snapshots.map((snapshot): ScoredSnapshot => {
+    const prediction = predictWithModel(model, snapshot);
+    return Object.freeze({
+      snapshot,
+      prediction: Object.freeze({
+        domain: snapshot.domain,
+        fold: shadowFoldForDomain(snapshot.domain),
+        score: initialPredictionUtility(prediction, model, baselineNames),
+        pairLift: prediction.pairLift,
+        rareNovelty: prediction.rareNovelty,
+        recurringExpectedLift: prediction.recurringNames.reduce(
+          (sum, { name, probability }) =>
+            sum + (baselineNames.has(name) ? 0 : probability),
+          0,
+        ),
+        recurringNames: prediction.recurringNames,
+        featureTokens: prediction.featureTokens,
+      }),
+    });
+  });
+  const triggered = selectGreedyPredictions(
+    scored,
+    SHADOW_TRIGGER_DOMAIN_CAP,
+    model,
+    baselineNames,
+  );
+  const triggeredDomains = new Set(
+    triggered.map(({ snapshot }) => snapshot.domain),
+  );
+  const controls = scored
+    .filter(({ snapshot }) => !triggeredDomains.has(snapshot.domain))
+    .sort((left, right) => compareString(
+      saltedHashHex(SHADOW_CALIBRATION_SALTS.control, left.snapshot.domain),
+      saltedHashHex(SHADOW_CALIBRATION_SALTS.control, right.snapshot.domain),
+    ) || compareString(left.snapshot.domain, right.snapshot.domain))
+    .slice(0, SHADOW_CONTROL_DOMAIN_COUNT);
+  if (
+    triggered.length !== SHADOW_TRIGGER_DOMAIN_CAP
+    || controls.length !== SHADOW_CONTROL_DOMAIN_COUNT
+  ) {
+    throw new TypeError("Frozen trigger cannot fill the exact 38+2 quota");
+  }
+  const selected: ShadowSelectedDomain[] = [
+    ...triggered.map((item, index) => Object.freeze({
+      rank: index + 1,
+      domain: item.snapshot.domain,
+      fold: item.prediction.fold,
+      score: item.prediction.score,
+      source: "trigger" as const,
+    })),
+    ...controls.map((item, index) => Object.freeze({
+      rank: SHADOW_TRIGGER_DOMAIN_CAP + index + 1,
+      domain: item.snapshot.domain,
+      fold: item.prediction.fold,
+      score: item.prediction.score,
+      source: "control" as const,
+    })),
+  ];
+  const selectedDomains = selected.map(({ domain }) => domain);
+  const metrics = metricsForSelection(snapshots, selectedDomains);
+  return Object.freeze({
+    mode: "frozen-holdout" as const,
+    calibrationRevision: SHADOW_CALIBRATION_REVISION,
+    protocolRevision: SHADOW_EVALUATION_PROTOCOL_REVISION,
+    runId: artifact.runId,
+    cohortDomains: SHADOW_EVALUATION_DOMAIN_COUNT,
+    salts: SHADOW_CALIBRATION_SALTS,
+    candidateDigest,
+    trainingIdentity: candidate.trainingIdentity,
+    evaluationProvenance: cloneProvenance(artifact.provenance),
+    predictions: Object.freeze(
+      scored.map(({ prediction }) => publishedPrediction(prediction)),
+    ),
+    deployable: Object.freeze({
+      name: "frozen-holdout-trigger" as const,
+      triggerDomainCount: triggered.length,
+      controlDomainCount: controls.length,
+      selected: Object.freeze(selected),
+      metrics,
+      provisionalGuardrails: provisionalGuardrailVerdict(metrics),
     }),
   });
 }
