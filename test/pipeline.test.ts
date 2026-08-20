@@ -358,6 +358,7 @@ interface FakeBrowserScenario {
   readonly continuationPages?: readonly PageId[];
   readonly finishErrors?: readonly ScanError[];
   readonly throwOnPage?: PageId;
+  readonly thrownLimitHits?: Partial<Record<PageId, readonly BrowserLimitHit[]>>;
   readonly onClose?: () => void;
   readonly events?: string[];
   readonly limitHits?: Partial<Record<PageId, readonly BrowserLimitHit[]>>;
@@ -407,6 +408,15 @@ class FakeBrowserSession implements BrowserDomainSession {
       limitTelemetry: Object.freeze({
         hits: Object.freeze([...(this.#scenario.limitHits?.[input.pageId] ?? [])]),
       }),
+    });
+  }
+
+  getFailureLimitTelemetry() {
+    const pageId = this.inputs.at(-1)?.pageId;
+    return Object.freeze({
+      hits: Object.freeze(pageId === undefined
+        ? []
+        : [...(this.#scenario.thrownLimitHits?.[pageId] ?? [])]),
     });
   }
 
@@ -1378,6 +1388,63 @@ test("runs independent raw-free shadow detections without changing the full resu
   ]);
   assert.equal(JSON.stringify(snapshot).includes(rawMarker), false);
   assert.equal(Object.isFrozen(snapshot), true);
+});
+
+test("retains proxy limit telemetry when browser collection throws before returning", async () => {
+  const config = configWith();
+  const catalog = catalogWith();
+  const transport = new ScriptedTransport([
+    [ENTRY_URL, htmlResponse(ENTRY_URL)],
+  ]);
+  const browserPool = new FakeBrowserPool({
+    throwOnPage: "p1",
+    thrownLimitHits: {
+      p1: [Object.freeze({
+        category: "inspection.domMatches",
+        domSelectorOrdinal: 42,
+      }), Object.freeze({
+        category: "proxy.requestsPerPage",
+        domSelectorOrdinal: null,
+      }), Object.freeze({
+        category: "proxy.requestsPerPage",
+        domSelectorOrdinal: null,
+      })],
+    },
+  });
+  const snapshots: ShadowEvaluationSnapshot[] = [];
+
+  const result = await scanDomain(DOMAIN, {
+    runId: RUN_ID,
+    config,
+    provenance: provenanceFor(config, catalog),
+    transport,
+    robots: new FakeRobotsService(),
+    browserPool,
+    detectorPool: new RecordingDetectorPool(catalog),
+    catalog,
+  }, {
+    ...deterministicOptions(),
+    shadowDetectorPools: isolatedShadowDetectorPools(catalog),
+    onShadowSnapshot: (snapshot: ShadowEvaluationSnapshot) => {
+      snapshots.push(snapshot);
+    },
+  });
+
+  assert.deepEqual(
+    result.errors.map(({ code }) => code),
+    ["BROWSER_NAVIGATION_FAILED"],
+  );
+  assert.equal(snapshots.length, 1);
+  assert.deepEqual(snapshots[0]?.browserLimitHits, [{
+    pageId: "p1",
+    category: "inspection.domMatches",
+    domSelectorOrdinal: 42,
+  }, {
+    pageId: "p1",
+    category: "proxy.requestsPerPage",
+    domSelectorOrdinal: null,
+  }]);
+  assert.equal(Object.isFrozen(snapshots[0]?.browserLimitHits), true);
 });
 
 test("emits one shadow snapshot for controlled success, partial, and failed results", async () => {

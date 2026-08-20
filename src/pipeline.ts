@@ -1085,6 +1085,9 @@ export async function scanDomain(
       recordNetworkErrorTimings(collected.errors, elapsed(now, started));
       return collected;
     } catch {
+      for (const hit of browserSession.getFailureLimitTelemetry().hits) {
+        browserLimitHits.push(Object.freeze({ ...hit, pageId }));
+      }
       options.signal?.throwIfAborted();
       if (
         deadlineFired

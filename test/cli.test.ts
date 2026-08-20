@@ -498,7 +498,7 @@ test("prints help, version, and usage failures without initializing the run", as
     stdout: version.stdout,
     stderr: version.stderr,
   }), 0);
-  assert.equal(version.stdout.text(), "0.1.5\n");
+  assert.equal(version.stdout.text(), "0.1.6\n");
   assert.equal(version.stderr.text(), "");
   assert.deepEqual(version.events, []);
 
@@ -522,7 +522,7 @@ test("loads one complete bounded JSON configuration before input preflight", asy
     await writeFile(
       configPath,
       JSON.stringify(createDefaultScanConfig(
-        "WebsiteTechScraper/0.1.5 (https://crawler.veridion.com/contact)",
+        "WebsiteTechScraper/0.1.6 (https://crawler.veridion.com/contact)",
       )),
       { encoding: "utf8", mode: 0o600 },
     );
@@ -565,11 +565,11 @@ test("loads one complete bounded JSON configuration before input preflight", asy
 
     const invalidContactPath = join(directory, "invalid-contact.json");
     const invalidContact = createDefaultScanConfig(
-      "WebsiteTechScraper/0.1.5 (https://crawler.veridion.com/contact)",
+      "WebsiteTechScraper/0.1.6 (https://crawler.veridion.com/contact)",
     );
     await writeFile(
       invalidContactPath,
-      JSON.stringify({ ...invalidContact, userAgent: "WebsiteTechScraper/0.1.5 (https://x)" }),
+      JSON.stringify({ ...invalidContact, userAgent: "WebsiteTechScraper/0.1.6 (https://x)" }),
       { encoding: "utf8", mode: 0o600 },
     );
     const rejectedContact = createHarness();
@@ -1099,7 +1099,7 @@ async function waitForContext(
   const event = harness.events.find((value) => value.startsWith("writer:open:"));
   assert.ok(event);
   return {
-    scannerVersion: "0.1.5",
+    scannerVersion: "0.1.6",
     runtime: {
       node: "24.19.0",
       playwright: "1.62.1",

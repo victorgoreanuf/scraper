@@ -1180,6 +1180,7 @@ test("reuses a healthy browser after repeated domain-scoped proxy limits", async
       "BROWSER_LIMIT_EXCEEDED",
       "browser",
       false,
+      ["proxy.requestsPerPage"],
     ));
     await assert.rejects(
       session.collectPage({
@@ -1192,6 +1193,12 @@ test("reuses a healthy browser after repeated domain-scoped proxy limits", async
         error instanceof TransportFailure
         && error.code === "BROWSER_LIMIT_EXCEEDED",
     );
+    assert.deepEqual(session.getFailureLimitTelemetry(), {
+      hits: [{
+        category: "proxy.requestsPerPage",
+        domSelectorOrdinal: null,
+      }],
+    });
     await session.close();
     assert.equal(pool.isAvailable(), true);
   }

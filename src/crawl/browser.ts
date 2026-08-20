@@ -156,6 +156,7 @@ export interface BrowserDomainResult {
 
 export interface BrowserDomainSession {
   collectPage(input: BrowserPageInput): Promise<BrowserPageCollection>;
+  getFailureLimitTelemetry(): BrowserLimitTelemetry;
   finish(): Promise<BrowserDomainResult>;
   getUsage(): ProtectedBrowserProxyUsage & {
     readonly scriptBodiesInspected: number;
@@ -2683,6 +2684,21 @@ class BrowserDomainSessionImpl implements BrowserDomainSession {
       errors,
       navigationLinks: admittedNavigationLinks,
       limitTelemetry: browserLimitTelemetry(state),
+    });
+  }
+
+  getFailureLimitTelemetry(): BrowserLimitTelemetry {
+    const hits = new Map<string, BrowserLimitHit>();
+    if (this.#activeState !== null) {
+      for (const hit of browserLimitTelemetry(this.#activeState).hits) {
+        addLimitHit(hits, hit.category, hit.domSelectorOrdinal);
+      }
+    }
+    for (const category of this.#slot.proxy.getLimitHits()) {
+      addLimitHit(hits, category);
+    }
+    return Object.freeze({
+      hits: Object.freeze([...hits.values()].sort(compareLimitHit)),
     });
   }
 
