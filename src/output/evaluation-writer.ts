@@ -13,16 +13,42 @@ import { basename, dirname, join, resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 
 import {
+  SHADOW_BASELINE_FEATURE_SET,
+  SHADOW_CATEGORY_FEATURE_SET,
+  SHADOW_CATEGORY_FOLD_WIN_MINIMUM,
+  calibrateShadowPairedDevelopment,
   calibrateShadowDevelopmentSource,
+  canonicalizeShadowPairedCohortManifest,
+  canonicalizeShadowPairedFrozenCandidate,
+  canonicalizeShadowPairedPreregistration,
   canonicalizeShadowFrozenCandidate,
+  digestShadowPairedCohortManifest,
+  digestShadowPairedFrozenCandidate,
+  digestShadowPairedPreregistration,
   digestShadowFrozenCandidate,
+  evaluateFrozenShadowPairedCandidate,
   evaluateFrozenShadowCandidate,
+  createShadowPairedDevelopmentSource,
+  projectShadowT2Categories,
+  validateShadowPairedCohortManifest,
+  validateShadowPairedDevelopmentSource,
+  validateShadowPairedFrozenCandidate,
+  validateShadowPairedPreregistration,
   validateShadowFrozenCandidate,
+  type ShadowPairedCohortManifest,
+  type ShadowPairedDevelopmentReport,
+  type ShadowPairedDevelopmentSourceOptions,
+  type ShadowPairedDevelopmentSourceReport,
+  type ShadowPairedFrozenCandidate,
+  type ShadowPairedFrozenHoldoutReport,
+  type ShadowPairedPreregistration,
+  type ShadowT2CategoryProjection,
   type ShadowCalibrationReport,
   type ShadowDevelopmentCalibrationReport,
   type ShadowFrozenCandidate,
   type ShadowFrozenHoldoutReport,
 } from "../evaluation-calibration.ts";
+import type { CompiledFingerprintCatalog } from "../detect/catalog.ts";
 import {
   createShadowEvaluationAccumulator,
   SHADOW_EVALUATION_DOMAIN_COUNT,
@@ -40,6 +66,7 @@ const SHA256_DIGEST = /^sha256:[0-9a-f]{64}$/u;
 const MAX_STRUCTURE_ITEMS = 500_000;
 const MAX_STRUCTURE_DEPTH = 32;
 const PATH_CODE_UNITS = 4_096;
+const trustedPairedDevelopmentReports = new WeakSet<object>();
 
 export const SHADOW_EVALUATION_ARTIFACT_BYTES = 64 * 1_024 * 1_024;
 
@@ -94,13 +121,31 @@ export interface PreparedShadowCandidateOutput {
   readonly parentInode: number;
 }
 
+export interface PreflightShadowPairedReportOutputOptions {
+  readonly reportPath: string;
+  readonly reservedPaths?: readonly string[] | undefined;
+  readonly sourcePaths?: readonly string[] | undefined;
+}
+
+export interface PreparedShadowPairedReportOutput {
+  readonly reportPath: string;
+  readonly parentPath: string;
+  readonly parentDevice: number;
+  readonly parentInode: number;
+}
+
 export interface PublishedShadowEvaluationArtifact
   extends ShadowEvaluationArtifact {
-  readonly calibration: ShadowCalibrationReport | ShadowFrozenHoldoutReport;
+  readonly calibration:
+    | ShadowCalibrationReport
+    | ShadowFrozenHoldoutReport
+    | ShadowPairedDevelopmentSourceReport
+    | ShadowPairedFrozenHoldoutReport;
 }
 
 export interface LoadedShadowDevelopmentArtifact {
   readonly artifact: ShadowEvaluationArtifact;
+  readonly pairedDevelopmentSource: ShadowPairedDevelopmentSourceReport | null;
   readonly sourcePath: string;
   readonly digest: string;
 }
@@ -111,10 +156,74 @@ export interface LoadedShadowFrozenCandidate {
   readonly digest: string;
 }
 
-export interface ShadowEvaluationPublicationOptions {
-  readonly frozenCandidate?: ShadowFrozenCandidate | undefined;
-  readonly candidateDigest?: string | undefined;
+export interface LoadedShadowPairedFrozenCandidate {
+  readonly candidate: ShadowPairedFrozenCandidate;
+  readonly sourcePath: string;
+  readonly digest: string;
 }
+
+export type LoadedShadowCandidate =
+  | Readonly<{
+      readonly kind: "legacy";
+      readonly candidate: ShadowFrozenCandidate;
+      readonly sourcePath: string;
+      readonly digest: string;
+    }>
+  | Readonly<{
+      readonly kind: "paired";
+      readonly candidate: ShadowPairedFrozenCandidate;
+      readonly sourcePath: string;
+      readonly digest: string;
+    }>;
+
+export interface LoadedShadowPairedPreregistration {
+  readonly preregistration: ShadowPairedPreregistration;
+  readonly sourcePath: string;
+  readonly digest: string;
+}
+
+export interface LoadedShadowPairedCohortManifest {
+  readonly manifest: ShadowPairedCohortManifest;
+  readonly sourcePath: string;
+  readonly digest: string;
+}
+
+export interface PinnedShadowPairedDevelopmentOptions {
+  readonly developmentArtifactPath: string;
+  readonly developmentArtifactDigest: string;
+  readonly preregistrationPath: string;
+  readonly preregistrationDigest: string;
+  readonly cohortManifestPath: string;
+  readonly cohortManifestDigest: string;
+  readonly sealedHoldoutManifestPath: string;
+  readonly sealedHoldoutManifestDigest: string;
+  readonly catalog: CompiledFingerprintCatalog;
+}
+
+export interface LoadedShadowPairedDevelopment {
+  readonly report: ShadowPairedDevelopmentReport;
+  readonly projection: ShadowT2CategoryProjection;
+  readonly sourcePaths: readonly string[];
+}
+
+export type ShadowEvaluationPublicationOptions =
+  | Readonly<Record<never, never>>
+  | Readonly<{
+      readonly frozenCandidate: ShadowFrozenCandidate;
+      readonly candidateDigest: string;
+    }>
+  | Readonly<{
+      readonly pairedDevelopmentSource: ShadowPairedDevelopmentSourceOptions;
+    }>
+  | Readonly<{
+      readonly pairedFrozenCandidate: ShadowPairedFrozenCandidate;
+      readonly candidateDigest: string;
+      readonly categoryProjection: ShadowT2CategoryProjection;
+      readonly preregistration: ShadowPairedPreregistration;
+      readonly preregistrationDigest: string;
+      readonly cohortManifest: ShadowPairedCohortManifest;
+      readonly cohortManifestDigest: string;
+    }>;
 
 function evaluationError(
   code: EvaluationWriterErrorCode,
@@ -424,31 +533,93 @@ function canonicalPublishedArtifact(
   options: ShadowEvaluationPublicationOptions,
 ): PublishedShadowEvaluationArtifact {
   const canonical = canonicalShadowEvaluationArtifact(value, false);
-  const hasCandidate = options.frozenCandidate !== undefined;
-  const hasDigest = options.candidateDigest !== undefined;
-  if (hasCandidate !== hasDigest) {
-    invalidArtifact("A frozen shadow candidate and digest must be provided together.");
+  assertPlainRecord(options, "shadow evaluation publication options");
+  const hasPairedCandidate = Object.hasOwn(options, "pairedFrozenCandidate");
+  const hasLegacyCandidate = Object.hasOwn(options, "frozenCandidate");
+  const hasPairedDevelopmentSource = Object.hasOwn(
+    options,
+    "pairedDevelopmentSource",
+  );
+  if (
+    Number(hasPairedCandidate)
+      + Number(hasLegacyCandidate)
+      + Number(hasPairedDevelopmentSource)
+      > 1
+  ) {
+    invalidArtifact("Only one shadow calibration mode may be published.");
+  }
+  assertExactKeys(
+    options,
+    hasPairedCandidate
+      ? [
+          "pairedFrozenCandidate",
+          "candidateDigest",
+          "categoryProjection",
+          "preregistration",
+          "preregistrationDigest",
+          "cohortManifest",
+          "cohortManifestDigest",
+        ]
+      : hasLegacyCandidate
+      ? ["frozenCandidate", "candidateDigest"]
+      : hasPairedDevelopmentSource
+      ? ["pairedDevelopmentSource"]
+      : [],
+    "shadow evaluation publication options",
+  );
+  let calibration: PublishedShadowEvaluationArtifact["calibration"];
+  if (hasPairedCandidate) {
+    const pairedOptions = options as Extract<
+      ShadowEvaluationPublicationOptions,
+      { readonly pairedFrozenCandidate: unknown }
+    >;
+    calibration = evaluateFrozenShadowPairedCandidate(
+      canonical,
+      pairedOptions.categoryProjection,
+      pairedOptions.preregistration,
+      pairedOptions.cohortManifest,
+      pairedOptions.pairedFrozenCandidate,
+      {
+        candidateDigest: pairedOptions.candidateDigest,
+        preregistrationDigest: pairedOptions.preregistrationDigest,
+        cohortManifestDigest: pairedOptions.cohortManifestDigest,
+      },
+    );
+  } else if (hasLegacyCandidate) {
+    const legacyOptions = options as Extract<
+      ShadowEvaluationPublicationOptions,
+      { readonly frozenCandidate: unknown }
+    >;
+    calibration = evaluateFrozenShadowCandidate(
+      canonical,
+      legacyOptions.frozenCandidate,
+      { candidateDigest: legacyOptions.candidateDigest },
+    );
+  } else if (hasPairedDevelopmentSource) {
+    const pairedSourceOptions = options as Extract<
+      ShadowEvaluationPublicationOptions,
+      { readonly pairedDevelopmentSource: unknown }
+    >;
+    calibration = createShadowPairedDevelopmentSource(
+      canonical,
+      pairedSourceOptions.pairedDevelopmentSource,
+    );
+  } else {
+    calibration = calibrateShadowDevelopmentSource(canonical);
   }
   return Object.freeze({
     ...canonical,
-    calibration: hasCandidate
-      ? evaluateFrozenShadowCandidate(
-          canonical,
-          options.frozenCandidate!,
-          { candidateDigest: options.candidateDigest! },
-        )
-      : calibrateShadowDevelopmentSource(canonical),
+    calibration,
   });
 }
 
-async function readPinnedJsonSource(
+async function readPinnedBytesSource(
   requestedPath: string,
   expectedDigest: string,
 ): Promise<{
   readonly sourcePath: string;
   readonly digest: string;
-  readonly text: string;
-  readonly value: unknown;
+  readonly contents: Buffer;
 }> {
   if (!SHA256_DIGEST.test(expectedDigest)) {
     throw evaluationError(
@@ -544,15 +715,10 @@ async function readPinnedJsonSource(
         "The shadow artifact does not match its operator-pinned digest.",
       );
     }
-    const text = new TextDecoder("utf-8", {
-      fatal: true,
-      ignoreBOM: true,
-    }).decode(contents);
     return Object.freeze({
       sourcePath,
       digest,
-      text,
-      value: JSON.parse(text) as unknown,
+      contents,
     });
   } catch (error) {
     if (error instanceof EvaluationWriterError) throw error;
@@ -566,6 +732,47 @@ async function readPinnedJsonSource(
   }
 }
 
+async function readPinnedJsonSource(
+  requestedPath: string,
+  expectedDigest: string,
+): Promise<{
+  readonly sourcePath: string;
+  readonly digest: string;
+  readonly text: string;
+  readonly value: unknown;
+}> {
+  const loaded = await readPinnedBytesSource(requestedPath, expectedDigest);
+  try {
+    const text = new TextDecoder("utf-8", {
+      fatal: true,
+      ignoreBOM: true,
+    }).decode(loaded.contents);
+    return Object.freeze({
+      sourcePath: loaded.sourcePath,
+      digest: loaded.digest,
+      text,
+      value: JSON.parse(text) as unknown,
+    });
+  } catch (error) {
+    throw evaluationError(
+      "EVALUATION_SOURCE_INVALID",
+      "The pinned shadow artifact is unavailable or invalid.",
+      error,
+    );
+  }
+}
+
+export async function readPinnedShadowInputFile(
+  path: string,
+  expectedDigest: string,
+): Promise<{ readonly sourcePath: string; readonly digest: string }> {
+  const loaded = await readPinnedBytesSource(path, expectedDigest);
+  return Object.freeze({
+    sourcePath: loaded.sourcePath,
+    digest: loaded.digest,
+  });
+}
+
 export async function readPinnedShadowDevelopmentArtifact(
   path: string,
   expectedDigest: string,
@@ -574,8 +781,33 @@ export async function readPinnedShadowDevelopmentArtifact(
   try {
     preflightJsonStructure(loaded.value);
     const artifact = canonicalShadowEvaluationArtifact(loaded.value, true);
+    const published = loaded.value as Record<string, unknown>;
+    const calibration = published.calibration;
+    let pairedDevelopmentSource: ShadowPairedDevelopmentSourceReport | null;
+    if (
+      isRecord(calibration)
+      && calibration.mode === "paired-development-source"
+    ) {
+      pairedDevelopmentSource = validateShadowPairedDevelopmentSource(
+        calibration,
+        artifact,
+      );
+      const expectedWire = `${JSON.stringify({
+        ...artifact,
+        calibration: pairedDevelopmentSource,
+      })}\n`;
+      if (loaded.text !== expectedWire) {
+        throw evaluationError(
+          "EVALUATION_SOURCE_INVALID",
+          "The paired development sidecar is not canonical.",
+        );
+      }
+    } else {
+      pairedDevelopmentSource = null;
+    }
     return Object.freeze({
       artifact,
+      pairedDevelopmentSource,
       sourcePath: loaded.sourcePath,
       digest: loaded.digest,
     });
@@ -584,6 +816,68 @@ export async function readPinnedShadowDevelopmentArtifact(
     throw evaluationError(
       "EVALUATION_SOURCE_INVALID",
       "The pinned development artifact failed validation.",
+      error,
+    );
+  }
+}
+
+export async function readPinnedShadowPairedPreregistration(
+  path: string,
+  expectedDigest: string,
+): Promise<LoadedShadowPairedPreregistration> {
+  const loaded = await readPinnedJsonSource(path, expectedDigest);
+  try {
+    preflightJsonStructure(loaded.value);
+    const preregistration = validateShadowPairedPreregistration(loaded.value);
+    const canonical = canonicalizeShadowPairedPreregistration(preregistration);
+    const digest = digestShadowPairedPreregistration(preregistration);
+    if (loaded.text !== canonical || loaded.digest !== digest) {
+      throw evaluationError(
+        "EVALUATION_SOURCE_INVALID",
+        "The paired shadow preregistration file is not canonical.",
+      );
+    }
+    return Object.freeze({
+      preregistration,
+      sourcePath: loaded.sourcePath,
+      digest,
+    });
+  } catch (error) {
+    if (error instanceof EvaluationWriterError) throw error;
+    throw evaluationError(
+      "EVALUATION_SOURCE_INVALID",
+      "The paired shadow preregistration failed validation.",
+      error,
+    );
+  }
+}
+
+export async function readPinnedShadowPairedCohortManifest(
+  path: string,
+  expectedDigest: string,
+): Promise<LoadedShadowPairedCohortManifest> {
+  const loaded = await readPinnedJsonSource(path, expectedDigest);
+  try {
+    preflightJsonStructure(loaded.value);
+    const manifest = validateShadowPairedCohortManifest(loaded.value);
+    const canonical = canonicalizeShadowPairedCohortManifest(manifest);
+    const digest = digestShadowPairedCohortManifest(manifest);
+    if (loaded.text !== canonical || loaded.digest !== digest) {
+      throw evaluationError(
+        "EVALUATION_SOURCE_INVALID",
+        "The paired shadow cohort manifest file is not canonical.",
+      );
+    }
+    return Object.freeze({
+      manifest,
+      sourcePath: loaded.sourcePath,
+      digest,
+    });
+  } catch (error) {
+    if (error instanceof EvaluationWriterError) throw error;
+    throw evaluationError(
+      "EVALUATION_SOURCE_INVALID",
+      "The paired shadow cohort manifest failed validation.",
       error,
     );
   }
@@ -618,6 +912,156 @@ export async function readPinnedShadowFrozenCandidate(
       error,
     );
   }
+}
+
+export async function readPinnedShadowPairedFrozenCandidate(
+  path: string,
+  expectedDigest: string,
+): Promise<LoadedShadowPairedFrozenCandidate> {
+  const loaded = await readPinnedJsonSource(path, expectedDigest);
+  try {
+    preflightJsonStructure(loaded.value);
+    const candidate = validateShadowPairedFrozenCandidate(loaded.value);
+    const canonical = canonicalizeShadowPairedFrozenCandidate(candidate);
+    const digest = digestShadowPairedFrozenCandidate(candidate);
+    if (loaded.text !== canonical || loaded.digest !== digest) {
+      throw evaluationError(
+        "EVALUATION_SOURCE_INVALID",
+        "The paired frozen shadow candidate file is not canonical.",
+      );
+    }
+    return Object.freeze({
+      candidate,
+      sourcePath: loaded.sourcePath,
+      digest,
+    });
+  } catch (error) {
+    if (error instanceof EvaluationWriterError) throw error;
+    throw evaluationError(
+      "EVALUATION_SOURCE_INVALID",
+      "The paired frozen shadow candidate failed validation.",
+      error,
+    );
+  }
+}
+
+export async function readPinnedShadowCandidate(
+  path: string,
+  expectedDigest: string,
+): Promise<LoadedShadowCandidate> {
+  const loaded = await readPinnedJsonSource(path, expectedDigest);
+  try {
+    preflightJsonStructure(loaded.value);
+    if (
+      isRecord(loaded.value)
+      && loaded.value.kind === "paired-shadow-trigger-v1"
+    ) {
+      const candidate = validateShadowPairedFrozenCandidate(loaded.value);
+      const canonical = canonicalizeShadowPairedFrozenCandidate(candidate);
+      const digest = digestShadowPairedFrozenCandidate(candidate);
+      if (loaded.text !== canonical || loaded.digest !== digest) {
+        throw evaluationError(
+          "EVALUATION_SOURCE_INVALID",
+          "The paired frozen shadow candidate is not canonical.",
+        );
+      }
+      return Object.freeze({
+        kind: "paired" as const,
+        candidate,
+        sourcePath: loaded.sourcePath,
+        digest,
+      });
+    }
+    const candidate = validateShadowFrozenCandidate(loaded.value);
+    const canonical = canonicalizeShadowFrozenCandidate(candidate);
+    const digest = digestShadowFrozenCandidate(candidate);
+    if (loaded.text !== canonical || loaded.digest !== digest) {
+      throw evaluationError(
+        "EVALUATION_SOURCE_INVALID",
+        "The frozen shadow candidate is not canonical.",
+      );
+    }
+    return Object.freeze({
+      kind: "legacy" as const,
+      candidate,
+      sourcePath: loaded.sourcePath,
+      digest,
+    });
+  } catch (error) {
+    if (error instanceof EvaluationWriterError) throw error;
+    throw evaluationError(
+      "EVALUATION_SOURCE_INVALID",
+      "The pinned frozen shadow candidate failed validation.",
+      error,
+    );
+  }
+}
+
+export async function calibratePinnedShadowPairedDevelopment(
+  options: PinnedShadowPairedDevelopmentOptions,
+): Promise<LoadedShadowPairedDevelopment> {
+  const [development, preregistration, manifest, sealedHoldoutManifest] =
+    await Promise.all([
+    readPinnedShadowDevelopmentArtifact(
+      options.developmentArtifactPath,
+      options.developmentArtifactDigest,
+    ),
+    readPinnedShadowPairedPreregistration(
+      options.preregistrationPath,
+      options.preregistrationDigest,
+    ),
+    readPinnedShadowPairedCohortManifest(
+      options.cohortManifestPath,
+      options.cohortManifestDigest,
+    ),
+    readPinnedShadowPairedCohortManifest(
+      options.sealedHoldoutManifestPath,
+      options.sealedHoldoutManifestDigest,
+    ),
+  ]);
+  const projection = projectShadowT2Categories(options.catalog);
+  let report: ShadowPairedDevelopmentReport;
+  try {
+    if (development.pairedDevelopmentSource === null) {
+      throw new TypeError(
+        "Paired calibration requires a bound paired development sidecar",
+      );
+    }
+    report = calibrateShadowPairedDevelopment(
+      development.artifact,
+      development.pairedDevelopmentSource,
+      projection,
+      preregistration.preregistration,
+      manifest.manifest,
+      sealedHoldoutManifest.manifest,
+      {
+        trainingArtifactDigest: development.digest,
+        expectedEvaluationScannerVersion:
+          manifest.manifest.expected.scannerVersion,
+        expectedEvaluationConfigDigest: manifest.manifest.expected.configDigest,
+        preregistrationDigest: preregistration.digest,
+        cohortManifestDigest: manifest.digest,
+        sealedHoldoutManifestDigest: sealedHoldoutManifest.digest,
+      },
+    );
+    trustedPairedDevelopmentReports.add(report);
+  } catch (error) {
+    throw evaluationError(
+      "EVALUATION_INVALID_ARTIFACT",
+      "The pinned paired development inputs are incompatible.",
+      error,
+    );
+  }
+  return Object.freeze({
+    report,
+    projection,
+    sourcePaths: Object.freeze([
+      development.sourcePath,
+      preregistration.sourcePath,
+      manifest.sourcePath,
+      sealedHoldoutManifest.sourcePath,
+    ]),
+  });
 }
 
 export async function preflightShadowEvaluationOutput(
@@ -751,6 +1195,26 @@ export async function preflightShadowCandidateOutput(
     parentPath,
     parentDevice: parentStats.dev,
     parentInode: parentStats.ino,
+  });
+}
+
+export async function preflightShadowPairedReportOutput(
+  options: PreflightShadowPairedReportOutputOptions,
+): Promise<PreparedShadowPairedReportOutput> {
+  const prepared = await preflightShadowCandidateOutput({
+    candidatePath: options.reportPath,
+    ...(options.reservedPaths === undefined
+      ? {}
+      : { reservedPaths: options.reservedPaths }),
+    ...(options.sourcePaths === undefined
+      ? {}
+      : { sourcePaths: options.sourcePaths }),
+  });
+  return Object.freeze({
+    reportPath: prepared.candidatePath,
+    parentPath: prepared.parentPath,
+    parentDevice: prepared.parentDevice,
+    parentInode: prepared.parentInode,
   });
 }
 
@@ -959,6 +1423,126 @@ export async function writeShadowFrozenCandidateArtifact(
     Buffer.from(canonical, "utf8"),
   );
   return digest;
+}
+
+export async function writeShadowPairedFrozenCandidateArtifact(
+  prepared: PreparedShadowCandidateOutput,
+  report: ShadowPairedDevelopmentReport,
+): Promise<string> {
+  if (!trustedPairedDevelopmentReports.has(report)) {
+    throw evaluationError(
+      "EVALUATION_INVALID_ARTIFACT",
+      "The paired candidate must come from the pinned offline evaluator.",
+    );
+  }
+  const candidate = report.candidate;
+  if (
+    candidate === null
+    || report.decision.selectedFeatureSet === null
+    || report.decision.selectedFeatureSet !== candidate.featureSet
+    || report.preregistrationDigest !== candidate.preregistrationDigest
+    || report.cohortManifestDigest !== candidate.trainingCohort.manifestDigest
+    || report.sealedHoldoutManifestDigest
+      !== candidate.trainingCohort.sealedHoldoutManifestDigest
+    || report.categoryProjectionDigest !== candidate.categoryProjectionDigest
+  ) {
+    throw evaluationError(
+      "EVALUATION_CANDIDATE_REJECTED",
+      "The paired development verdict does not permit candidate publication.",
+    );
+  }
+  const selectedReport = candidate.featureSet === SHADOW_BASELINE_FEATURE_SET
+    ? report.baseline
+    : report.category;
+  if (
+    !selectedReport.deployable.provisionalGuardrails.passed
+    || (
+      candidate.featureSet === SHADOW_CATEGORY_FEATURE_SET
+      && report.categoryFoldWins < SHADOW_CATEGORY_FOLD_WIN_MINIMUM
+    )
+  ) {
+    throw evaluationError(
+      "EVALUATION_CANDIDATE_REJECTED",
+      "The paired candidate does not pass every frozen acceptance gate.",
+    );
+  }
+
+  let canonical: string;
+  let digest: string;
+  try {
+    preflightJsonStructure(candidate);
+    const validated = validateShadowPairedFrozenCandidate(candidate);
+    canonical = canonicalizeShadowPairedFrozenCandidate(validated);
+    digest = digestShadowPairedFrozenCandidate(validated);
+    if (Buffer.byteLength(canonical, "utf8") > SHADOW_EVALUATION_ARTIFACT_BYTES) {
+      artifactLimit("The paired frozen shadow candidate exceeds 64 MiB.");
+    }
+  } catch (error) {
+    if (error instanceof EvaluationWriterError) throw error;
+    throw evaluationError(
+      "EVALUATION_INVALID_ARTIFACT",
+      "The paired frozen shadow candidate failed structural validation.",
+      error,
+    );
+  }
+  await publishAtomicBytes(
+    prepared,
+    prepared.candidatePath,
+    Buffer.from(canonical, "utf8"),
+  );
+  return digest;
+}
+
+export async function writeShadowPairedDevelopmentReport(
+  prepared: PreparedShadowPairedReportOutput,
+  report: ShadowPairedDevelopmentReport,
+): Promise<void> {
+  try {
+    if (!trustedPairedDevelopmentReports.has(report)) {
+      invalidArtifact(
+        "The paired report must come from the pinned offline evaluator.",
+      );
+    }
+    preflightJsonStructure(report);
+    if (
+      report.mode !== "paired-development-oof"
+      || (report.candidate === null)
+        !== (report.decision.selectedFeatureSet === null)
+    ) {
+      invalidArtifact("The paired development report verdict is inconsistent.");
+    }
+    if (report.candidate !== null) {
+      const candidate = validateShadowPairedFrozenCandidate(report.candidate);
+      if (
+        candidate.featureSet !== report.decision.selectedFeatureSet
+        || candidate.preregistrationDigest !== report.preregistrationDigest
+        || candidate.trainingCohort.manifestDigest
+          !== report.cohortManifestDigest
+        || candidate.trainingCohort.sealedHoldoutManifestDigest
+          !== report.sealedHoldoutManifestDigest
+        || candidate.categoryProjectionDigest
+          !== report.categoryProjectionDigest
+      ) {
+        invalidArtifact("The paired development report candidate is inconsistent.");
+      }
+    }
+    const json = JSON.stringify(report);
+    if (Buffer.byteLength(json, "utf8") + 1 > SHADOW_EVALUATION_ARTIFACT_BYTES) {
+      artifactLimit("The paired development report exceeds 64 MiB.");
+    }
+    await publishAtomicBytes(
+      prepared,
+      prepared.reportPath,
+      Buffer.from(`${json}\n`, "utf8"),
+    );
+  } catch (error) {
+    if (error instanceof EvaluationWriterError) throw error;
+    throw evaluationError(
+      "EVALUATION_INVALID_ARTIFACT",
+      "The paired development report failed structural validation.",
+      error,
+    );
+  }
 }
 
 export async function writeShadowEvaluationArtifact(

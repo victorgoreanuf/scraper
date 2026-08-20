@@ -1,6 +1,6 @@
 {
   "name": "website-technologies-scraper",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "Batch CLI that detects website technologies with verifiable evidence.",
   "private": true,
   "type": "module",

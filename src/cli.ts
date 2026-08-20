@@ -42,7 +42,10 @@ import {
 } from "./evaluation.ts";
 import {
   assertShadowFrozenCandidateCompatibility,
+  digestShadowT2CategoryProjection,
+  projectShadowT2Categories,
   type ShadowFrozenCandidate,
+  type ShadowPairedFrozenCandidate,
 } from "./evaluation-calibration.ts";
 import {
   openParquetDomainsFromFile,
@@ -53,8 +56,13 @@ import type { Provenance, DomainResult } from "./model.ts";
 import {
   EvaluationWriterError,
   preflightShadowEvaluationOutput,
-  readPinnedShadowFrozenCandidate,
+  readPinnedShadowCandidate,
+  readPinnedShadowInputFile,
+  readPinnedShadowPairedCohortManifest,
+  readPinnedShadowPairedPreregistration,
   writeShadowEvaluationArtifact,
+  type LoadedShadowPairedCohortManifest,
+  type LoadedShadowPairedPreregistration,
   type PreparedShadowEvaluationOutput,
 } from "./output/evaluation-writer.ts";
 import {
@@ -103,6 +111,12 @@ export type CliOptions =
       readonly shadowEvaluation: boolean;
       readonly shadowCandidatePath: string | null;
       readonly shadowCandidateDigest: string | null;
+      readonly shadowPreregistrationPath: string | null;
+      readonly shadowPreregistrationDigest: string | null;
+      readonly shadowCohortManifestPath: string | null;
+      readonly shadowCohortManifestDigest: string | null;
+      readonly shadowSealedHoldoutManifestPath: string | null;
+      readonly shadowSealedHoldoutManifestDigest: string | null;
     };
 
 export interface CliDependencies {
@@ -115,7 +129,12 @@ export interface CliDependencies {
   readonly openResultWriter: typeof openResultWriter;
   readonly resolveResultOutputPaths: typeof resolveResultOutputPaths;
   readonly preflightShadowEvaluationOutput: typeof preflightShadowEvaluationOutput;
-  readonly readPinnedShadowFrozenCandidate: typeof readPinnedShadowFrozenCandidate;
+  readonly readPinnedShadowCandidate: typeof readPinnedShadowCandidate;
+  readonly readPinnedShadowInputFile: typeof readPinnedShadowInputFile;
+  readonly readPinnedShadowPairedCohortManifest:
+    typeof readPinnedShadowPairedCohortManifest;
+  readonly readPinnedShadowPairedPreregistration:
+    typeof readPinnedShadowPairedPreregistration;
   readonly writeShadowEvaluationArtifact: typeof writeShadowEvaluationArtifact;
   readonly scanDomain: typeof scanDomain;
 }
@@ -164,7 +183,10 @@ const productionDependencies: CliDependencies = Object.freeze({
   openResultWriter,
   resolveResultOutputPaths,
   preflightShadowEvaluationOutput,
-  readPinnedShadowFrozenCandidate,
+  readPinnedShadowCandidate,
+  readPinnedShadowInputFile,
+  readPinnedShadowPairedCohortManifest,
+  readPinnedShadowPairedPreregistration,
   writeShadowEvaluationArtifact,
   scanDomain,
 });
@@ -220,6 +242,18 @@ function usage(): string {
     "                      Evaluate a frozen standalone shadow candidate",
     "  --shadow-candidate-digest <sha256:digest>",
     "                      Pin the exact frozen candidate file",
+    "  --shadow-preregistration <path>",
+    "                      Use the paired experiment preregistration",
+    "  --shadow-preregistration-digest <sha256:digest>",
+    "                      Pin the exact preregistration file",
+    "  --shadow-cohort-manifest <path>",
+    "                      Use the paired development/holdout manifest",
+    "  --shadow-cohort-manifest-digest <sha256:digest>",
+    "                      Pin the exact cohort manifest file",
+    "  --shadow-sealed-holdout-manifest <path>",
+    "                      Freeze H1 together with paired development",
+    "  --shadow-sealed-holdout-manifest-digest <sha256:digest>",
+    "                      Pin the exact sealed H1 manifest file",
     "  --quiet              Suppress per-domain progress on stderr",
     "  --help                Show this help",
     "  --version             Show the scanner version",
@@ -345,6 +379,12 @@ export function parseCliArgs(argv: readonly string[]): CliOptions {
         "shadow-evaluation": { type: "boolean" },
         "shadow-candidate": { type: "string" },
         "shadow-candidate-digest": { type: "string" },
+        "shadow-preregistration": { type: "string" },
+        "shadow-preregistration-digest": { type: "string" },
+        "shadow-cohort-manifest": { type: "string" },
+        "shadow-cohort-manifest-digest": { type: "string" },
+        "shadow-sealed-holdout-manifest": { type: "string" },
+        "shadow-sealed-holdout-manifest-digest": { type: "string" },
         quiet: { type: "boolean" },
         help: { type: "boolean", short: "h" },
         version: { type: "boolean", short: "V" },
@@ -413,6 +453,88 @@ export function parseCliArgs(argv: readonly string[]): CliOptions {
     );
   }
 
+  const shadowPreregistrationValue =
+    typeof parsed.values["shadow-preregistration"] === "string"
+      ? parsed.values["shadow-preregistration"]
+      : undefined;
+  const shadowPreregistrationDigestValue =
+    typeof parsed.values["shadow-preregistration-digest"] === "string"
+      ? parsed.values["shadow-preregistration-digest"]
+      : undefined;
+  const shadowCohortManifestValue =
+    typeof parsed.values["shadow-cohort-manifest"] === "string"
+      ? parsed.values["shadow-cohort-manifest"]
+      : undefined;
+  const shadowCohortManifestDigestValue =
+    typeof parsed.values["shadow-cohort-manifest-digest"] === "string"
+      ? parsed.values["shadow-cohort-manifest-digest"]
+      : undefined;
+  const shadowSealedHoldoutManifestValue =
+    typeof parsed.values["shadow-sealed-holdout-manifest"] === "string"
+      ? parsed.values["shadow-sealed-holdout-manifest"]
+      : undefined;
+  const shadowSealedHoldoutManifestDigestValue =
+    typeof parsed.values["shadow-sealed-holdout-manifest-digest"] === "string"
+      ? parsed.values["shadow-sealed-holdout-manifest-digest"]
+      : undefined;
+  const pairedBoundaryValues = [
+    shadowPreregistrationValue,
+    shadowPreregistrationDigestValue,
+    shadowCohortManifestValue,
+    shadowCohortManifestDigestValue,
+  ];
+  const pairedBoundaryCount = pairedBoundaryValues.filter(
+    (value) => value !== undefined,
+  ).length;
+  if (pairedBoundaryCount !== 0 && pairedBoundaryCount !== 4) {
+    throw new CliUsageError(
+      "The paired shadow preregistration and cohort manifest paths and digests must be provided together.",
+    );
+  }
+  if (pairedBoundaryCount === 4 && !shadowEvaluation) {
+    throw new CliUsageError(
+      "The paired shadow preregistration and cohort manifest require --shadow-evaluation.",
+    );
+  }
+  if (
+    (shadowSealedHoldoutManifestValue === undefined)
+      !== (shadowSealedHoldoutManifestDigestValue === undefined)
+  ) {
+    throw new CliUsageError(
+      "--shadow-sealed-holdout-manifest and its digest must be provided together.",
+    );
+  }
+  const hasSealedHoldoutManifest =
+    shadowSealedHoldoutManifestValue !== undefined;
+  if (
+    hasSealedHoldoutManifest
+      !== (pairedBoundaryCount === 4 && shadowCandidateValue === undefined)
+  ) {
+    throw new CliUsageError(
+      "Paired development must freeze exactly one sealed holdout manifest; holdout evaluation must not provide one.",
+    );
+  }
+  for (const [value, label] of [
+    [
+      shadowPreregistrationDigestValue,
+      "--shadow-preregistration-digest",
+    ],
+    [
+      shadowCohortManifestDigestValue,
+      "--shadow-cohort-manifest-digest",
+    ],
+    [
+      shadowSealedHoldoutManifestDigestValue,
+      "--shadow-sealed-holdout-manifest-digest",
+    ],
+  ] as const) {
+    if (value !== undefined && !SHA256_DIGEST.test(value)) {
+      throw new CliUsageError(
+        `${label} must be sha256 followed by 64 lowercase hex digits.`,
+      );
+    }
+  }
+
   const inputValue = typeof parsed.values.input === "string"
     ? parsed.values.input
     : undefined;
@@ -450,6 +572,29 @@ export function parseCliArgs(argv: readonly string[]): CliOptions {
       ? null
       : validatedPath(shadowCandidateValue, "--shadow-candidate"),
     shadowCandidateDigest: shadowCandidateDigestValue ?? null,
+    shadowPreregistrationPath: shadowPreregistrationValue === undefined
+      ? null
+      : validatedPath(
+          shadowPreregistrationValue,
+          "--shadow-preregistration",
+        ),
+    shadowPreregistrationDigest: shadowPreregistrationDigestValue ?? null,
+    shadowCohortManifestPath: shadowCohortManifestValue === undefined
+      ? null
+      : validatedPath(
+          shadowCohortManifestValue,
+          "--shadow-cohort-manifest",
+        ),
+    shadowCohortManifestDigest: shadowCohortManifestDigestValue ?? null,
+    shadowSealedHoldoutManifestPath:
+      shadowSealedHoldoutManifestValue === undefined
+        ? null
+        : validatedPath(
+            shadowSealedHoldoutManifestValue,
+            "--shadow-sealed-holdout-manifest",
+          ),
+    shadowSealedHoldoutManifestDigest:
+      shadowSealedHoldoutManifestDigestValue ?? null,
   });
 }
 
@@ -634,6 +779,129 @@ function progressLine(completed: number, result: DomainResult): string {
   return `[PROGRESS] completed=${completed} domain=${result.domain} status=${result.status}\n`;
 }
 
+function sameCatalogIdentity(
+  left: { readonly source: string; readonly revision: string; readonly digest: string },
+  right: { readonly source: string; readonly revision: string; readonly digest: string },
+): boolean {
+  return left.source === right.source
+    && left.revision === right.revision
+    && left.digest === right.digest;
+}
+
+function assertPairedBoundaryBeforeCatalog(input: {
+  readonly prepared: PreparedParquetDomains;
+  readonly metadata: ScannerMetadata;
+  readonly configDigest: string;
+  readonly hasCandidate: boolean;
+  readonly preregistration: LoadedShadowPairedPreregistration;
+  readonly manifest: LoadedShadowPairedCohortManifest;
+}): void {
+  const preregistration = input.preregistration.preregistration;
+  const manifest = input.manifest.manifest;
+  const expectedRole = input.hasCandidate ? "holdout" : "development";
+  if (
+    manifest.role !== expectedRole
+    || manifest.preregistrationDigest !== input.preregistration.digest
+    || manifest.input.domains !== input.prepared.domainCount
+    || manifest.input.domainSetDigest !== input.prepared.domainSetDigest
+    || manifest.expected.scannerVersion !== input.metadata.version
+    || manifest.expected.configDigest !== input.configDigest
+    || preregistration.expectedDevelopmentScannerVersion
+      !== input.metadata.version
+    || preregistration.expectedDevelopmentConfigDigest !== input.configDigest
+    || !sameCatalogIdentity(manifest.expected.catalog, preregistration.catalog)
+    || manifest.zeroOverlapWith[0]?.domainSetDigest
+      !== preregistration.discoveryDomainSetDigest
+  ) {
+    throw new CliStartupError(
+      "CLI_EVALUATION_BOUNDARY_INVALID",
+      "The paired shadow preregistration or cohort manifest does not match this run.",
+    );
+  }
+  for (const proof of manifest.zeroOverlapWith) {
+    if (
+      proof.domainSetDigest === input.prepared.domainSetDigest
+      || proof.domains.some((domain) => input.prepared.hasDomain(domain))
+    ) {
+      throw new CliStartupError(
+        "CLI_EVALUATION_BOUNDARY_INVALID",
+        "The paired shadow cohort overlaps a frozen earlier cohort.",
+      );
+    }
+  }
+}
+
+function assertSealedHoldoutForDevelopment(input: {
+  readonly prepared: PreparedParquetDomains;
+  readonly preregistration: LoadedShadowPairedPreregistration;
+  readonly developmentManifest: LoadedShadowPairedCohortManifest;
+  readonly sealedHoldoutManifest: LoadedShadowPairedCohortManifest;
+}): void {
+  const preregistration = input.preregistration.preregistration;
+  const development = input.developmentManifest.manifest;
+  const holdout = input.sealedHoldoutManifest.manifest;
+  const d1 = holdout.zeroOverlapWith[0];
+  const d2 = holdout.zeroOverlapWith[1];
+  if (
+    development.role !== "development"
+    || holdout.role !== "holdout"
+    || development.sealedHoldoutManifestDigest
+      !== input.sealedHoldoutManifest.digest
+    || holdout.preregistrationDigest !== input.preregistration.digest
+    || holdout.expected.scannerVersion
+      !== development.expected.scannerVersion
+    || holdout.expected.configDigest !== development.expected.configDigest
+    || holdout.expected.schemaVersion !== development.expected.schemaVersion
+    || holdout.expected.protocolRevision
+      !== development.expected.protocolRevision
+    || !sameCatalogIdentity(holdout.expected.catalog, development.expected.catalog)
+    || holdout.source.name !== development.source.name
+    || holdout.source.revision !== development.source.revision
+    || holdout.source.digest !== development.source.digest
+    || holdout.sampling.revision !== development.sampling.revision
+    || holdout.sampling.salt !== development.sampling.salt
+    || d1?.domainSetDigest !== preregistration.discoveryDomainSetDigest
+    || d2?.domainSetDigest !== input.prepared.domainSetDigest
+    || d2.domains.some((domain) => !input.prepared.hasDomain(domain))
+    || holdout.input.domainSetDigest === preregistration.discoveryDomainSetDigest
+    || holdout.input.domainSetDigest === input.prepared.domainSetDigest
+  ) {
+    throw new CliStartupError(
+      "CLI_EVALUATION_BOUNDARY_INVALID",
+      "The paired development and sealed holdout manifests were not frozen together.",
+    );
+  }
+}
+
+function assertPairedBoundaryCatalog(input: {
+  readonly catalog: CompiledFingerprintCatalog;
+  readonly preregistration: LoadedShadowPairedPreregistration;
+  readonly manifest: LoadedShadowPairedCohortManifest;
+}): ReturnType<typeof projectShadowT2Categories> {
+  const expectedCatalog = input.manifest.manifest.expected.catalog;
+  const preregistration = input.preregistration.preregistration;
+  if (
+    !sameCatalogIdentity(input.catalog, expectedCatalog)
+    || !sameCatalogIdentity(input.catalog, preregistration.catalog)
+  ) {
+    throw new CliStartupError(
+      "CLI_EVALUATION_BOUNDARY_INVALID",
+      "The paired shadow catalog does not match its frozen identities.",
+    );
+  }
+  const projection = projectShadowT2Categories(input.catalog);
+  if (
+    digestShadowT2CategoryProjection(projection)
+      !== preregistration.categoryProjectionDigest
+  ) {
+    throw new CliStartupError(
+      "CLI_EVALUATION_BOUNDARY_INVALID",
+      "The paired shadow category projection does not match the preregistration.",
+    );
+  }
+  return projection;
+}
+
 async function scheduleDomains(input: {
   readonly prepared: PreparedParquetDomains;
   readonly writer: ResultWriter;
@@ -727,8 +995,15 @@ async function executeRun(
   let writer: ResultWriter | undefined;
   let preparedEvaluation: PreparedShadowEvaluationOutput | undefined;
   let frozenCandidate: ShadowFrozenCandidate | undefined;
+  let pairedFrozenCandidate: ShadowPairedFrozenCandidate | undefined;
   let frozenCandidateDigest: string | undefined;
   let frozenCandidateSourcePath: string | undefined;
+  let pairedPreregistration: LoadedShadowPairedPreregistration | undefined;
+  let pairedManifest: LoadedShadowPairedCohortManifest | undefined;
+  let sealedHoldoutManifest: LoadedShadowPairedCohortManifest | undefined;
+  let pairedCategoryProjection:
+    | ReturnType<typeof projectShadowT2Categories>
+    | undefined;
   let pendingEvaluationArtifact: ShadowEvaluationArtifact | undefined;
   let finalized = false;
   let runFailure: unknown;
@@ -747,12 +1022,15 @@ async function executeRun(
       options.shadowCandidatePath !== null
       && options.shadowCandidateDigest !== null
     ) {
-      const loadedCandidate = await dependencies.readPinnedShadowFrozenCandidate(
+      const loadedCandidate = await dependencies.readPinnedShadowCandidate(
         options.shadowCandidatePath,
         options.shadowCandidateDigest,
       );
+      const candidateModel = loadedCandidate.kind === "paired"
+        ? loadedCandidate.candidate.model
+        : loadedCandidate.candidate;
       if (
-        loadedCandidate.candidate.trainingIdentity.domainSetDigest
+        candidateModel.trainingIdentity.domainSetDigest
           === prepared.domainSetDigest
       ) {
         throw new CliStartupError(
@@ -760,15 +1038,141 @@ async function executeRun(
           "The frozen shadow candidate requires a distinct evaluation cohort.",
         );
       }
-      frozenCandidate = loadedCandidate.candidate;
+      if (loadedCandidate.kind === "paired") {
+        pairedFrozenCandidate = loadedCandidate.candidate;
+      } else {
+        frozenCandidate = loadedCandidate.candidate;
+      }
       frozenCandidateDigest = loadedCandidate.digest;
       frozenCandidateSourcePath = loadedCandidate.sourcePath;
+    }
+    if (
+      options.shadowPreregistrationPath !== null
+      && options.shadowPreregistrationDigest !== null
+      && options.shadowCohortManifestPath !== null
+      && options.shadowCohortManifestDigest !== null
+    ) {
+      pairedPreregistration =
+        await dependencies.readPinnedShadowPairedPreregistration(
+          options.shadowPreregistrationPath,
+          options.shadowPreregistrationDigest,
+        );
+      pairedManifest = await dependencies.readPinnedShadowPairedCohortManifest(
+        options.shadowCohortManifestPath,
+        options.shadowCohortManifestDigest,
+      );
+      if (
+        options.shadowSealedHoldoutManifestPath !== null
+        && options.shadowSealedHoldoutManifestDigest !== null
+      ) {
+        sealedHoldoutManifest =
+          await dependencies.readPinnedShadowPairedCohortManifest(
+            options.shadowSealedHoldoutManifestPath,
+            options.shadowSealedHoldoutManifestDigest,
+          );
+      }
+      const configDigest = computeConfigDigest(loaded.config);
+      assertPairedBoundaryBeforeCatalog({
+        prepared,
+        metadata,
+        configDigest,
+        hasCandidate:
+          frozenCandidate !== undefined || pairedFrozenCandidate !== undefined,
+        preregistration: pairedPreregistration,
+        manifest: pairedManifest,
+      });
+      const pinnedInput = await dependencies.readPinnedShadowInputFile(
+        prepared.sourcePath,
+        pairedManifest.manifest.input.fileDigest,
+      );
+      if (pinnedInput.sourcePath !== prepared.sourcePath) {
+        throw new CliStartupError(
+          "CLI_EVALUATION_BOUNDARY_INVALID",
+          "The paired shadow input file identity changed after preflight.",
+        );
+      }
+      if (pairedFrozenCandidate === undefined) {
+        if (sealedHoldoutManifest === undefined) {
+          throw new CliStartupError(
+            "CLI_EVALUATION_BOUNDARY_INVALID",
+            "Paired development requires a sealed holdout manifest.",
+          );
+        }
+        assertSealedHoldoutForDevelopment({
+          prepared,
+          preregistration: pairedPreregistration,
+          developmentManifest: pairedManifest,
+          sealedHoldoutManifest,
+        });
+      }
+    }
+    if (
+      pairedFrozenCandidate !== undefined
+      && (pairedPreregistration === undefined || pairedManifest === undefined)
+    ) {
+      throw new CliStartupError(
+        "CLI_EVALUATION_BOUNDARY_INVALID",
+        "A paired frozen candidate requires its pinned preregistration and holdout manifest.",
+      );
+    }
+    if (
+      frozenCandidate !== undefined
+      && (pairedPreregistration !== undefined || pairedManifest !== undefined)
+    ) {
+      throw new CliStartupError(
+        "CLI_EVALUATION_BOUNDARY_INVALID",
+        "A legacy frozen candidate cannot use the paired experiment boundary.",
+      );
+    }
+    if (
+      pairedFrozenCandidate !== undefined
+      && pairedPreregistration !== undefined
+      && pairedManifest !== undefined
+    ) {
+      const manifest = pairedManifest.manifest;
+      const d2 = manifest.zeroOverlapWith[1];
+      if (
+        pairedFrozenCandidate.preregistrationDigest
+          !== pairedPreregistration.digest
+        || pairedFrozenCandidate.trainingCohort.sealedHoldoutManifestDigest
+          !== pairedManifest.digest
+        || pairedFrozenCandidate.categoryProjectionDigest
+          !== pairedPreregistration.preregistration.categoryProjectionDigest
+        || d2?.domainSetDigest
+          !== pairedFrozenCandidate.model.trainingIdentity.domainSetDigest
+        || manifest.source.name
+          !== pairedFrozenCandidate.trainingCohort.source.name
+        || manifest.source.revision
+          !== pairedFrozenCandidate.trainingCohort.source.revision
+        || manifest.source.digest
+          !== pairedFrozenCandidate.trainingCohort.source.digest
+        || manifest.sampling.revision
+          !== pairedFrozenCandidate.trainingCohort.sampling.revision
+        || manifest.sampling.salt
+          !== pairedFrozenCandidate.trainingCohort.sampling.salt
+      ) {
+        throw new CliStartupError(
+          "CLI_EVALUATION_BOUNDARY_INVALID",
+          "The paired frozen candidate does not match the holdout boundary.",
+        );
+      }
     }
     await assertDistinctSources(
       prepared,
       loaded.sourcePath,
       outputPaths,
-      frozenCandidateSourcePath === undefined ? [] : [frozenCandidateSourcePath],
+      [
+        ...(frozenCandidateSourcePath === undefined
+          ? []
+          : [frozenCandidateSourcePath]),
+        ...(pairedPreregistration === undefined
+          ? []
+          : [pairedPreregistration.sourcePath]),
+        ...(pairedManifest === undefined ? [] : [pairedManifest.sourcePath]),
+        ...(sealedHoldoutManifest === undefined
+          ? []
+          : [sealedHoldoutManifest.sourcePath]),
+      ],
     );
     if (options.shadowEvaluation) {
       if (prepared.domainCount !== SHADOW_EVALUATION_DOMAIN_COUNT) {
@@ -786,16 +1190,32 @@ async function executeRun(
           ...(frozenCandidateSourcePath === undefined
             ? []
             : [frozenCandidateSourcePath]),
+          ...(pairedPreregistration === undefined
+            ? []
+            : [pairedPreregistration.sourcePath]),
+          ...(pairedManifest === undefined ? [] : [pairedManifest.sourcePath]),
+          ...(sealedHoldoutManifest === undefined
+            ? []
+            : [sealedHoldoutManifest.sourcePath]),
         ],
       });
     }
 
     const catalog = dependencies.loadFingerprintCatalog(loaded.config);
     signal.throwIfAborted();
-    if (frozenCandidate !== undefined) {
+    if (pairedPreregistration !== undefined && pairedManifest !== undefined) {
+      pairedCategoryProjection = assertPairedBoundaryCatalog({
+        catalog,
+        preregistration: pairedPreregistration,
+        manifest: pairedManifest,
+      });
+    }
+    const compatibilityCandidate = pairedFrozenCandidate?.model
+      ?? frozenCandidate;
+    if (compatibilityCandidate !== undefined) {
       try {
-        frozenCandidate = assertShadowFrozenCandidateCompatibility(
-          frozenCandidate,
+        const compatibleModel = assertShadowFrozenCandidateCompatibility(
+          compatibilityCandidate,
           {
             schemaVersion: SHADOW_EVALUATION_SCHEMA_VERSION,
             protocolRevision: SHADOW_EVALUATION_PROTOCOL_REVISION,
@@ -808,6 +1228,9 @@ async function executeRun(
             configDigest: computeConfigDigest(loaded.config),
           },
         );
+        if (pairedFrozenCandidate === undefined) {
+          frozenCandidate = compatibleModel;
+        }
       } catch (error) {
         throw new CliStartupError(
           "CLI_EVALUATION_CANDIDATE_INVALID",
@@ -953,12 +1376,40 @@ async function executeRun(
     await dependencies.writeShadowEvaluationArtifact(
       preparedEvaluation,
       pendingEvaluationArtifact,
-      frozenCandidate === undefined || frozenCandidateDigest === undefined
-        ? undefined
-        : {
+      pairedFrozenCandidate !== undefined
+          && frozenCandidateDigest !== undefined
+          && pairedCategoryProjection !== undefined
+          && pairedPreregistration !== undefined
+          && pairedManifest !== undefined
+        ? {
+            pairedFrozenCandidate,
+            candidateDigest: frozenCandidateDigest,
+            categoryProjection: pairedCategoryProjection,
+            preregistration: pairedPreregistration.preregistration,
+            preregistrationDigest: pairedPreregistration.digest,
+            cohortManifest: pairedManifest.manifest,
+            cohortManifestDigest: pairedManifest.digest,
+          }
+        : pairedPreregistration !== undefined
+            && pairedManifest !== undefined
+            && sealedHoldoutManifest !== undefined
+            && pairedCategoryProjection !== undefined
+        ? {
+            pairedDevelopmentSource: {
+              preregistrationDigest: pairedPreregistration.digest,
+              cohortManifestDigest: pairedManifest.digest,
+              sealedHoldoutManifestDigest: sealedHoldoutManifest.digest,
+              categoryProjectionDigest: digestShadowT2CategoryProjection(
+                pairedCategoryProjection,
+              ),
+            },
+          }
+        : frozenCandidate !== undefined && frozenCandidateDigest !== undefined
+        ? {
             frozenCandidate,
             candidateDigest: frozenCandidateDigest,
-          },
+          }
+        : undefined,
     );
     signal.throwIfAborted();
   }

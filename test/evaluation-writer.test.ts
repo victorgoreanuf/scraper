@@ -9,6 +9,7 @@ import {
   readdir,
   rm,
   symlink,
+  truncate,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -16,14 +17,35 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import {
+  SHADOW_BASELINE_FEATURE_SET,
+  SHADOW_CALIBRATION_SALTS,
+  SHADOW_CATEGORY_FEATURE_SET,
+  SHADOW_CATEGORY_FOLD_WIN_MINIMUM,
+  SHADOW_PAIRED_COHORT_SALT,
+  SHADOW_PAIRED_EXPERIMENT_REVISION,
   calibrateShadowDevelopmentSource,
+  createShadowPairedDevelopmentSource,
+  canonicalizeShadowPairedCohortManifest,
+  canonicalizeShadowPairedFrozenCandidate,
+  canonicalizeShadowPairedPreregistration,
   canonicalizeShadowFrozenCandidate,
+  digestShadowPairedCohortManifest,
+  digestShadowPairedFrozenCandidate,
+  digestShadowPairedPreregistration,
+  digestShadowT2CategoryProjection,
   digestShadowFrozenCandidate,
   SHADOW_MODEL_RECURRING_TARGET_CAP,
   SHADOW_MODEL_TOKEN_CAP,
   type ShadowDevelopmentCalibrationReport,
+  type ShadowDevelopmentSourceReport,
   type ShadowFrozenCandidate,
+  type ShadowPairedCohortManifest,
+  type ShadowPairedDevelopmentReport,
+  type ShadowPairedFrozenCandidate,
+  type ShadowPairedPreregistration,
+  type ShadowT2CategoryProjection,
 } from "../src/evaluation-calibration.ts";
+import type { CompiledFingerprintCatalog } from "../src/detect/catalog.ts";
 import { computeDomainSetDigest } from "../src/domain-set.ts";
 import {
   createShadowEvaluationAccumulator,
@@ -35,22 +57,32 @@ import {
 } from "../src/evaluation.ts";
 import {
   EvaluationWriterError,
+  calibratePinnedShadowPairedDevelopment,
   preflightShadowCandidateOutput,
   preflightShadowEvaluationOutput,
+  preflightShadowPairedReportOutput,
+  readPinnedShadowCandidate,
   readPinnedShadowFrozenCandidate,
   readPinnedShadowDevelopmentArtifact,
+  readPinnedShadowInputFile,
+  readPinnedShadowPairedCohortManifest,
+  readPinnedShadowPairedFrozenCandidate,
+  readPinnedShadowPairedPreregistration,
   SHADOW_EVALUATION_ARTIFACT_BYTES,
   writeShadowFrozenCandidateArtifact,
   writeShadowEvaluationArtifact,
+  writeShadowPairedDevelopmentReport,
+  writeShadowPairedFrozenCandidateArtifact,
 } from "../src/output/evaluation-writer.ts";
 import type { Provenance } from "../src/model.ts";
 
 const RUN_ID = "12345678-1234-4123-8123-123456789abc";
 const TRAINING_RUN_ID = "87654321-4321-4321-8321-cba987654321";
-const TRAINING_DOMAIN_SET_DIGEST = computeDomainSetDigest(Array.from(
+const DISCOVERY_DOMAINS = Object.freeze(Array.from(
   { length: SHADOW_EVALUATION_DOMAIN_COUNT },
   (_, index) => `training-${String(index).padStart(3, "0")}.vendor.com`,
 ));
+const TRAINING_DOMAIN_SET_DIGEST = computeDomainSetDigest(DISCOVERY_DOMAINS);
 
 const provenance: Provenance = Object.freeze({
   scannerVersion: "0.1.5",
@@ -128,6 +160,44 @@ function evaluationArtifact(): ShadowEvaluationArtifact {
   return accumulator.build(SHADOW_EVALUATION_DOMAIN_COUNT);
 }
 
+function passingPairedArtifact(): ShadowEvaluationArtifact {
+  const accumulator = createShadowEvaluationAccumulator({ runId: RUN_ID, provenance });
+  for (let index = 0; index < SHADOW_EVALUATION_DOMAIN_COUNT; index += 1) {
+    const base = snapshot(index);
+    const detectorView = Object.freeze({
+      state: "available" as const,
+      directNames: Object.freeze(["Fixture Technology"]),
+      inferredNames: Object.freeze([]),
+      detectionStats: Object.freeze({
+        rawDirect: 1,
+        gatedDirect: 0,
+        suppressedDirect: 0,
+        retainedDirect: 1,
+      }),
+      completed: true,
+      errors: Object.freeze([]),
+    });
+    accumulator.add(Object.freeze({
+      ...base,
+      t1: detectorView,
+      t2: detectorView,
+      full: Object.freeze({
+        directNames: Object.freeze(["Fixture Technology"]),
+        inferredNames: Object.freeze([]),
+        status: "success" as const,
+      }),
+      fullCost: Object.freeze({
+        browserPagesAttempted: 1,
+        browserPagesAdmitted: 1,
+        browserRequests: 1,
+        browserTransferredBytes: 1_000,
+        browserMs: 10,
+      }),
+    }));
+  }
+  return accumulator.build(SHADOW_EVALUATION_DOMAIN_COUNT);
+}
+
 function identityCapArtifact(): ShadowEvaluationArtifact {
   const identitiesPerSnapshot =
     SHADOW_EVALUATION_IDENTITY_VALUE_CAP / SHADOW_EVALUATION_DOMAIN_COUNT;
@@ -174,6 +244,180 @@ const publishedArtifact = Object.freeze({
 
 function digest(bytes: string | Buffer): string {
   return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+}
+
+const pairedProjection: ShadowT2CategoryProjection = Object.freeze({
+  catalog: provenance.catalog,
+  technologies: Object.freeze([
+    Object.freeze({ name: "Fixture Technology", categoryIds: Object.freeze([7]) }),
+  ]),
+});
+
+const pairedCatalog = {
+  source: provenance.catalog.source,
+  revision: provenance.catalog.revision,
+  digest: provenance.catalog.digest,
+  technologies: [{
+    name: "Fixture Technology",
+    categories: [{ id: 7 }],
+  }],
+} as unknown as CompiledFingerprintCatalog;
+
+function pairedPreregistration(): ShadowPairedPreregistration {
+  return Object.freeze({
+    schemaVersion: 1 as const,
+    experimentRevision: SHADOW_PAIRED_EXPERIMENT_REVISION,
+    baselineImplementationCommit: "67890e61a16d74eb5bfade6d789f968fc2e1eee7",
+    discoveryArtifactDigest: `sha256:${"1".repeat(64)}`,
+    discoveryDomainSetDigest: TRAINING_DOMAIN_SET_DIGEST,
+    discoveryScannerVersion: "0.1.5" as const,
+    expectedDevelopmentScannerVersion: provenance.scannerVersion,
+    expectedDevelopmentConfigDigest: provenance.configDigest,
+    catalog: provenance.catalog,
+    protocolRevision: SHADOW_EVALUATION_PROTOCOL_REVISION,
+    categoryProjectionDigest: digestShadowT2CategoryProjection(pairedProjection),
+    categoryFeature: Object.freeze({
+      source: "t2.directNames" as const,
+      mapping: "effective-catalog-category-ids" as const,
+      token: "t2.directCategoryId=<decimal>" as const,
+      aggregation: "sorted-unique-union" as const,
+      missing: "reject" as const,
+      forbiddenInputs: Object.freeze([
+        "t1",
+        "inferred",
+        "full",
+        "count",
+        "category-name",
+        "category-group",
+      ] as const),
+    }),
+    cohortPolicy: Object.freeze({
+      developmentDomains: SHADOW_EVALUATION_DOMAIN_COUNT,
+      holdoutDomains: SHADOW_EVALUATION_DOMAIN_COUNT,
+      sourceIdentity: "delegated-to-immutable-manifest" as const,
+      selection: "sha256-rank-without-replacement-v1" as const,
+      salt: SHADOW_PAIRED_COHORT_SALT,
+      developmentSelection: "first-200-after-d1-exclusion" as const,
+      holdoutSelection: "next-200-after-d1-exclusion" as const,
+      overlap: "zero-canonical-d1-d2-h1" as const,
+      preScreen: "none" as const,
+      replacement: "none-after-freeze" as const,
+    }),
+    featureSets: Object.freeze([
+      SHADOW_BASELINE_FEATURE_SET,
+      SHADOW_CATEGORY_FEATURE_SET,
+    ] as const),
+    foldCount: 5 as const,
+    triggerDomainCount: 38 as const,
+    controlDomainCount: 2 as const,
+    smoothingPrior: 4 as const,
+    recurringNameMinimumSupport: 2 as const,
+    salts: SHADOW_CALIBRATION_SALTS,
+    guardrails: Object.freeze({
+      canonicalDirectNameRetentionMinimum: 0.95 as const,
+      domainTechnologyPairRetentionMinimum: 0.8 as const,
+      realBrowserCostMaximum: 0.3 as const,
+    }),
+    foldWin: Object.freeze({
+      minimumCategoryWins: SHADOW_CATEGORY_FOLD_WIN_MINIMUM,
+      scope: "trigger-only" as const,
+      pairLift: "sum-full-minus-t2" as const,
+      novelNameCoverage:
+        "selected-full-union-minus-global-t2-union" as const,
+      rule: "componentwise-non-regression-with-one-strict" as const,
+      requirePositiveTriggerQuotaEachFold: true as const,
+      globalT2Union: "same-cohort-union-shared-by-arms" as const,
+      interpretation: "stability-heuristic-not-statistical-test" as const,
+    }),
+    controlsIncludedInGlobalGuardrails: true as const,
+    decisionRule:
+      "baseline-first-else-category-if-eligible-else-no-go" as const,
+  });
+}
+
+function pairedManifest(
+  role: ShadowPairedCohortManifest["role"],
+  preregistrationDigest: string,
+  cohortDomains: readonly string[],
+  d2Domains: readonly string[] = [],
+  fileDigest = `sha256:${"2".repeat(64)}`,
+  sealedHoldoutManifestDigest = `sha256:${"5".repeat(64)}`,
+): ShadowPairedCohortManifest {
+  const zeroOverlapWith = role === "development"
+    ? [Object.freeze({
+        label: "D1",
+        domainSetDigest: TRAINING_DOMAIN_SET_DIGEST,
+        domains: DISCOVERY_DOMAINS,
+      })]
+    : [
+        Object.freeze({
+          label: "D1",
+          domainSetDigest: TRAINING_DOMAIN_SET_DIGEST,
+          domains: DISCOVERY_DOMAINS,
+        }),
+        Object.freeze({
+          label: "D2",
+          domainSetDigest: computeDomainSetDigest(d2Domains),
+          domains: Object.freeze([...d2Domains]),
+        }),
+      ];
+  const base = Object.freeze({
+    schemaVersion: 1 as const,
+    experimentRevision: SHADOW_PAIRED_EXPERIMENT_REVISION,
+    preregistrationDigest,
+    input: Object.freeze({
+      fileDigest,
+      domainSetDigest: computeDomainSetDigest(cohortDomains),
+      domains: SHADOW_EVALUATION_DOMAIN_COUNT,
+    }),
+    expected: Object.freeze({
+      scannerVersion: provenance.scannerVersion,
+      configDigest: provenance.configDigest,
+      catalog: provenance.catalog,
+      schemaVersion: 1 as const,
+      protocolRevision: SHADOW_EVALUATION_PROTOCOL_REVISION,
+    }),
+    source: Object.freeze({
+      name: "CrUX",
+      revision: "202607",
+      digest: `sha256:${"3".repeat(64)}`,
+    }),
+    sampling: Object.freeze({
+      revision: "sha256-rank-without-replacement-v1" as const,
+      salt: SHADOW_PAIRED_COHORT_SALT,
+    }),
+    zeroOverlapWith: Object.freeze(zeroOverlapWith),
+  });
+  return role === "development"
+    ? Object.freeze({
+        ...base,
+        role: "development" as const,
+        sealedHoldoutManifestDigest,
+      })
+    : Object.freeze({ ...base, role: "holdout" as const });
+}
+
+function pairedCandidate(
+  preregistration: ShadowPairedPreregistration,
+  manifest: ShadowPairedCohortManifest,
+  model: ShadowFrozenCandidate = frozenCandidate(),
+): ShadowPairedFrozenCandidate {
+  return Object.freeze({
+    kind: "paired-shadow-trigger-v1" as const,
+    experimentRevision: SHADOW_PAIRED_EXPERIMENT_REVISION,
+    featureSet: SHADOW_BASELINE_FEATURE_SET,
+    preregistrationDigest: digestShadowPairedPreregistration(preregistration),
+    trainingCohort: Object.freeze({
+      manifestDigest: digestShadowPairedCohortManifest(manifest),
+      sealedHoldoutManifestDigest: manifest.role === "development"
+        ? manifest.sealedHoldoutManifestDigest
+        : `sha256:${"5".repeat(64)}`,
+      source: manifest.source,
+      sampling: manifest.sampling,
+    }),
+    categoryProjectionDigest: preregistration.categoryProjectionDigest,
+    model,
+  });
 }
 
 function frozenCandidate(
@@ -339,6 +583,258 @@ test("reads a canonical development sidecar only through its exact pinned digest
   );
 });
 
+test("keeps historical legacy development calibration opaque", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "veridion-legacy-source-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const sourcePath = join(directory, "legacy.evaluation.json");
+  const historical = Object.freeze({
+    ...artifact,
+    calibration: Object.freeze({
+      mode: "development-source",
+      calibrationRevision: "historical-v0.1.5",
+      legacyMetric: 17,
+    }),
+  });
+  const wire = `${JSON.stringify(historical)}\n`;
+  await writeFile(sourcePath, wire, { encoding: "utf8", mode: 0o600 });
+
+  const loaded = await readPinnedShadowDevelopmentArtifact(
+    sourcePath,
+    digest(wire),
+  );
+  assert.deepEqual(loaded.artifact, artifact);
+  assert.equal(loaded.pairedDevelopmentSource, null);
+  assert.equal(loaded.digest, digest(wire));
+});
+
+test("reads every paired source only as canonical digest-pinned bytes", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "veridion-paired-sources-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const preregistration = pairedPreregistration();
+  const preregistrationWire = canonicalizeShadowPairedPreregistration(
+    preregistration,
+  );
+  assert.equal(preregistrationWire.endsWith("\n"), true);
+  const preregistrationPath = join(directory, "paired.preregistration.json");
+  await writeFile(preregistrationPath, preregistrationWire, { mode: 0o600 });
+  const loadedPreregistration = await readPinnedShadowPairedPreregistration(
+    preregistrationPath,
+    digestShadowPairedPreregistration(preregistration),
+  );
+  assert.deepEqual(loadedPreregistration.preregistration, preregistration);
+
+  const cohortDomains = artifact.snapshots.map(({ domain }) => domain);
+  const manifest = pairedManifest(
+    "development",
+    loadedPreregistration.digest,
+    cohortDomains,
+  );
+  const manifestWire = canonicalizeShadowPairedCohortManifest(manifest);
+  assert.equal(manifestWire.endsWith("\n"), true);
+  const manifestPath = join(directory, "paired.manifest.json");
+  await writeFile(manifestPath, manifestWire, { mode: 0o600 });
+  const loadedManifest = await readPinnedShadowPairedCohortManifest(
+    manifestPath,
+    digestShadowPairedCohortManifest(manifest),
+  );
+  assert.deepEqual(loadedManifest.manifest, manifest);
+
+  const candidate = pairedCandidate(preregistration, manifest);
+  const candidateWire = canonicalizeShadowPairedFrozenCandidate(candidate);
+  assert.equal(candidateWire.endsWith("\n"), true);
+  const candidatePath = join(directory, "paired.candidate.json");
+  await writeFile(candidatePath, candidateWire, { mode: 0o600 });
+  const loadedCandidate = await readPinnedShadowPairedFrozenCandidate(
+    candidatePath,
+    digestShadowPairedFrozenCandidate(candidate),
+  );
+  assert.deepEqual(loadedCandidate.candidate, candidate);
+  assert.equal(
+    (await readPinnedShadowCandidate(candidatePath, loadedCandidate.digest)).kind,
+    "paired",
+  );
+
+  const legacy = frozenCandidate();
+  const legacyWire = canonicalizeShadowFrozenCandidate(legacy);
+  assert.equal(legacyWire.endsWith("\n"), false);
+  const legacyPath = join(directory, "legacy.candidate.json");
+  await writeFile(legacyPath, legacyWire, { mode: 0o600 });
+  assert.equal(
+    (await readPinnedShadowCandidate(
+      legacyPath,
+      digestShadowFrozenCandidate(legacy),
+    )).kind,
+    "legacy",
+  );
+
+  const inputPath = join(directory, "cohort.parquet");
+  const inputBytes = Buffer.from("bounded-cohort-input", "utf8");
+  await writeFile(inputPath, inputBytes, { mode: 0o600 });
+  const loadedInput = await readPinnedShadowInputFile(
+    inputPath,
+    digest(inputBytes),
+  );
+  assert.equal(loadedInput.sourcePath, await realpath(inputPath));
+  await expectEvaluationError(
+    readPinnedShadowInputFile(inputPath, `sha256:${"0".repeat(64)}`),
+    "EVALUATION_DIGEST_MISMATCH",
+  );
+  const oversizedInputPath = join(directory, "oversized.parquet");
+  await writeFile(oversizedInputPath, "", { mode: 0o600 });
+  await truncate(
+    oversizedInputPath,
+    SHADOW_EVALUATION_ARTIFACT_BYTES + 1,
+  );
+  await expectEvaluationError(
+    readPinnedShadowInputFile(
+      oversizedInputPath,
+      `sha256:${"0".repeat(64)}`,
+    ),
+    "EVALUATION_SOURCE_INVALID",
+  );
+});
+
+test("runs the paired development evaluator only from pinned frozen inputs", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "veridion-paired-offline-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const developmentArtifact = passingPairedArtifact();
+  const preregistration = pairedPreregistration();
+  const preregistrationPath = join(directory, "paired.preregistration.json");
+  await writeFile(
+    preregistrationPath,
+    canonicalizeShadowPairedPreregistration(preregistration),
+    { mode: 0o600 },
+  );
+  const preregistrationDigest = digestShadowPairedPreregistration(
+    preregistration,
+  );
+  const developmentDomains = developmentArtifact.snapshots.map(
+    ({ domain }) => domain,
+  );
+  const holdoutDomains = Array.from(
+    { length: SHADOW_EVALUATION_DOMAIN_COUNT },
+    (_, index) => `holdout-${String(index).padStart(3, "0")}.vendor.com`,
+  );
+  const sealedHoldoutManifest = pairedManifest(
+    "holdout",
+    preregistrationDigest,
+    holdoutDomains,
+    developmentDomains,
+  );
+  const sealedHoldoutManifestDigest = digestShadowPairedCohortManifest(
+    sealedHoldoutManifest,
+  );
+  const manifest = pairedManifest(
+    "development",
+    preregistrationDigest,
+    developmentDomains,
+    [],
+    `sha256:${"2".repeat(64)}`,
+    sealedHoldoutManifestDigest,
+  );
+  const manifestDigest = digestShadowPairedCohortManifest(manifest);
+  const developmentPublished = Object.freeze({
+    ...developmentArtifact,
+    calibration: createShadowPairedDevelopmentSource(developmentArtifact, {
+      preregistrationDigest,
+      cohortManifestDigest: manifestDigest,
+      sealedHoldoutManifestDigest,
+      categoryProjectionDigest: preregistration.categoryProjectionDigest,
+    }),
+  });
+  const sidecarPath = join(directory, "development.evaluation.json");
+  const sidecarWire = `${JSON.stringify(developmentPublished)}\n`;
+  await writeFile(sidecarPath, sidecarWire, { mode: 0o600 });
+  const manifestPath = join(directory, "development.manifest.json");
+  await writeFile(
+    manifestPath,
+    canonicalizeShadowPairedCohortManifest(manifest),
+    { mode: 0o600 },
+  );
+  const sealedHoldoutManifestPath = join(directory, "holdout.manifest.json");
+  await writeFile(
+    sealedHoldoutManifestPath,
+    canonicalizeShadowPairedCohortManifest(sealedHoldoutManifest),
+    { mode: 0o600 },
+  );
+
+  const loaded = await calibratePinnedShadowPairedDevelopment({
+    developmentArtifactPath: sidecarPath,
+    developmentArtifactDigest: digest(sidecarWire),
+    preregistrationPath,
+    preregistrationDigest,
+    cohortManifestPath: manifestPath,
+    cohortManifestDigest: manifestDigest,
+    sealedHoldoutManifestPath,
+    sealedHoldoutManifestDigest,
+    catalog: pairedCatalog,
+  });
+  assert.equal(loaded.report.mode, "paired-development-oof");
+  assert.equal(loaded.report.trainingArtifactDigest, digest(sidecarWire));
+  assert.equal(loaded.report.preregistrationDigest, preregistrationDigest);
+  assert.equal(
+    loaded.report.sealedHoldoutManifestDigest,
+    sealedHoldoutManifestDigest,
+  );
+  assert.deepEqual(loaded.projection, pairedProjection);
+  assert.notEqual(loaded.report.candidate, null);
+
+  const swappedHoldoutManifest = pairedManifest(
+    "holdout",
+    preregistrationDigest,
+    holdoutDomains.map((domain) => `swapped-${domain}`),
+    developmentDomains,
+  );
+  const swappedHoldoutPath = join(directory, "swapped-holdout.manifest.json");
+  await writeFile(
+    swappedHoldoutPath,
+    canonicalizeShadowPairedCohortManifest(swappedHoldoutManifest),
+    { mode: 0o600 },
+  );
+  await expectEvaluationError(
+    calibratePinnedShadowPairedDevelopment({
+      developmentArtifactPath: sidecarPath,
+      developmentArtifactDigest: digest(sidecarWire),
+      preregistrationPath,
+      preregistrationDigest,
+      cohortManifestPath: manifestPath,
+      cohortManifestDigest: manifestDigest,
+      sealedHoldoutManifestPath: swappedHoldoutPath,
+      sealedHoldoutManifestDigest: digestShadowPairedCohortManifest(
+        swappedHoldoutManifest,
+      ),
+      catalog: pairedCatalog,
+    }),
+    "EVALUATION_INVALID_ARTIFACT",
+  );
+
+  const reportOutput = await preflightShadowPairedReportOutput({
+    reportPath: join(directory, "paired.report.json"),
+    sourcePaths: loaded.sourcePaths,
+  });
+  await writeShadowPairedDevelopmentReport(reportOutput, loaded.report);
+  const reportWire = await readFile(reportOutput.reportPath, "utf8");
+  assert.equal(reportWire.endsWith("\n"), true);
+  assert.equal((await lstat(reportOutput.reportPath)).mode & 0o777, 0o600);
+
+  const candidateOutput = await preflightShadowCandidateOutput({
+    candidatePath: join(directory, "paired.candidate.json"),
+    sourcePaths: loaded.sourcePaths,
+  });
+  const candidateDigest = await writeShadowPairedFrozenCandidateArtifact(
+    candidateOutput,
+    loaded.report,
+  );
+  assert.equal(
+    candidateDigest,
+    digestShadowPairedFrozenCandidate(loaded.report.candidate),
+  );
+  assert.equal(
+    await readFile(candidateOutput.candidatePath, "utf8"),
+    canonicalizeShadowPairedFrozenCandidate(loaded.report.candidate),
+  );
+});
+
 test("preflight rejects collisions and every existing target shape", async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "veridion-evaluation-preflight-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
@@ -489,6 +985,49 @@ test("refuses candidate publication after a development NO-GO", async (t) => {
     code: "ENOENT",
   });
   assert.deepEqual(await readdir(directory), []);
+});
+
+test("rejects paired candidate reports not produced by the pinned evaluator", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "veridion-paired-candidate-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const preregistration = pairedPreregistration();
+  const manifest = pairedManifest(
+    "development",
+    digestShadowPairedPreregistration(preregistration),
+    artifact.snapshots.map(({ domain }) => domain),
+  );
+  const candidate = pairedCandidate(preregistration, manifest);
+  const passingArm = developmentReport(
+    frozenCandidate(),
+    true,
+  ) as unknown as ShadowDevelopmentSourceReport;
+  const report: ShadowPairedDevelopmentReport = Object.freeze({
+    mode: "paired-development-oof" as const,
+    experimentRevision: SHADOW_PAIRED_EXPERIMENT_REVISION,
+    preregistrationDigest: candidate.preregistrationDigest,
+    cohortManifestDigest: candidate.trainingCohort.manifestDigest,
+    sealedHoldoutManifestDigest:
+      candidate.trainingCohort.sealedHoldoutManifestDigest,
+    categoryProjectionDigest: candidate.categoryProjectionDigest,
+    trainingArtifactDigest: `sha256:${"4".repeat(64)}`,
+    baseline: passingArm,
+    category: passingArm,
+    foldComparisons: Object.freeze([]),
+    categoryFoldWins: 0,
+    decision: Object.freeze({
+      selectedFeatureSet: SHADOW_BASELINE_FEATURE_SET,
+      reason: "baseline-passed-all-official-gates" as const,
+    }),
+    candidate,
+  });
+  const prepared = await preflightShadowCandidateOutput({
+    candidatePath: join(directory, "paired.candidate.json"),
+  });
+  await expectEvaluationError(
+    writeShadowPairedFrozenCandidateArtifact(prepared, report),
+    "EVALUATION_INVALID_ARTIFACT",
+  );
+  await assert.rejects(lstat(prepared.candidatePath), { code: "ENOENT" });
 });
 
 test("frozen holdout membership is independent of full labels and browser costs", async (t) => {

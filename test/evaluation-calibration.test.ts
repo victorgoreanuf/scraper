@@ -1,20 +1,49 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import {
   assertShadowFrozenCandidateCompatibility,
   calibrateShadowDevelopment,
   calibrateShadowDevelopmentSource,
+  calibrateShadowPairedDevelopment,
+  canonicalizeShadowPairedDevelopmentSource,
+  canonicalizeShadowPairedCohortManifest,
+  canonicalizeShadowPairedFrozenCandidate,
+  canonicalizeShadowPairedPreregistration,
+  canonicalizeShadowT2CategoryProjection,
   canonicalizeShadowFrozenCandidate,
+  createShadowPairedDevelopmentSource,
+  decideShadowPairedExperiment,
+  digestShadowPairedCohortManifest,
+  digestShadowPairedFrozenCandidate,
+  digestShadowPairedPreregistration,
+  digestShadowT2CategoryProjection,
   digestShadowFrozenCandidate,
   evaluateFrozenShadowCandidate,
+  evaluateFrozenShadowPairedCandidate,
   predictShadowSnapshot,
+  SHADOW_BASELINE_FEATURE_SET,
   SHADOW_CALIBRATION_SALTS,
+  SHADOW_CATEGORY_FEATURE_SET,
+  SHADOW_CATEGORY_FOLD_WIN_MINIMUM,
+  SHADOW_CATEGORY_ID_MAXIMUM,
+  SHADOW_CATEGORY_IDS_PER_TECHNOLOGY_MAXIMUM,
   SHADOW_MODEL_RECURRING_TARGET_CAP,
   SHADOW_MODEL_TOKEN_CAP,
+  SHADOW_PAIRED_COHORT_SALT,
+  SHADOW_PAIRED_EXPERIMENT_REVISION,
   shadowFoldForDomain,
+  shadowCategoryTriggerFeatureTokens,
+  validateShadowPairedCohortManifest,
+  validateShadowPairedPreregistration,
+  validateShadowT2CategoryProjection,
   validateShadowFrozenCandidate,
   type ShadowFrozenCandidate,
+  type ShadowPairedCohortManifest,
+  type ShadowPairedDevelopmentSourceReport,
+  type ShadowPairedPreregistration,
+  type ShadowT2CategoryProjection,
 } from "../src/evaluation-calibration.ts";
 import {
   SHADOW_EVALUATION_DOMAIN_COUNT,
@@ -24,6 +53,7 @@ import {
   type ShadowEvaluationSnapshot,
   type ShadowFullCost,
 } from "../src/evaluation.ts";
+import { computeDomainSetDigest } from "../src/domain-set.ts";
 import type { Provenance } from "../src/model.ts";
 
 const TRAINING_RUN_ID = "123e4567-e89b-42d3-a456-426614174001";
@@ -69,6 +99,12 @@ function available(directNames: readonly string[]): ShadowDetectorView {
     completed: true,
     errors: Object.freeze([]),
   });
+}
+
+function directName(view: ShadowDetectorView): string {
+  assert.equal(view.state, "available");
+  assert.equal(view.directNames.length, 1);
+  return view.directNames[0]!;
 }
 
 function domain(index: number): string {
@@ -163,6 +199,246 @@ const developmentOptions = Object.freeze({
   expectedEvaluationConfigDigest: EVALUATION_CONFIG_DIGEST,
 });
 
+const DISCOVERY_DOMAINS = Object.freeze(Array.from(
+  { length: SHADOW_EVALUATION_DOMAIN_COUNT },
+  (_, index) => `x${String(index).padStart(3, "0")}.example`,
+));
+
+function categoryProjection(
+  names: readonly string[] = BASE_NAMES,
+  categoryIds: (name: string, index: number) => readonly number[] = () => [1],
+): ShadowT2CategoryProjection {
+  return validateShadowT2CategoryProjection({
+    catalog: provenance("0.1.8", TRAINING_CONFIG_DIGEST).catalog,
+    technologies: names.map((name, index) => ({
+      name,
+      categoryIds: categoryIds(name, index),
+    })),
+  });
+}
+
+function pairedPreregistration(
+  projection: ShadowT2CategoryProjection,
+): ShadowPairedPreregistration {
+  return validateShadowPairedPreregistration({
+    schemaVersion: 1,
+    experimentRevision: SHADOW_PAIRED_EXPERIMENT_REVISION,
+    baselineImplementationCommit: "67890e61a16d74eb5bfade6d789f968fc2e1eee7",
+    discoveryArtifactDigest: `sha256:${"5".repeat(64)}`,
+    discoveryDomainSetDigest: computeDomainSetDigest(DISCOVERY_DOMAINS),
+    discoveryScannerVersion: "0.1.5",
+    expectedDevelopmentScannerVersion: "0.1.8",
+    expectedDevelopmentConfigDigest: TRAINING_CONFIG_DIGEST,
+    catalog: projection.catalog,
+    protocolRevision: SHADOW_EVALUATION_PROTOCOL_REVISION,
+    categoryProjectionDigest: digestShadowT2CategoryProjection(projection),
+    categoryFeature: {
+      source: "t2.directNames",
+      mapping: "effective-catalog-category-ids",
+      token: "t2.directCategoryId=<decimal>",
+      aggregation: "sorted-unique-union",
+      missing: "reject",
+      forbiddenInputs: [
+        "t1",
+        "inferred",
+        "full",
+        "count",
+        "category-name",
+        "category-group",
+      ],
+    },
+    cohortPolicy: {
+      developmentDomains: 200,
+      holdoutDomains: 200,
+      sourceIdentity: "delegated-to-immutable-manifest",
+      selection: "sha256-rank-without-replacement-v1",
+      salt: SHADOW_PAIRED_COHORT_SALT,
+      developmentSelection: "first-200-after-d1-exclusion",
+      holdoutSelection: "next-200-after-d1-exclusion",
+      overlap: "zero-canonical-d1-d2-h1",
+      preScreen: "none",
+      replacement: "none-after-freeze",
+    },
+    featureSets: [SHADOW_BASELINE_FEATURE_SET, SHADOW_CATEGORY_FEATURE_SET],
+    foldCount: 5,
+    triggerDomainCount: 38,
+    controlDomainCount: 2,
+    smoothingPrior: 4,
+    recurringNameMinimumSupport: 2,
+    salts: SHADOW_CALIBRATION_SALTS,
+    guardrails: {
+      canonicalDirectNameRetentionMinimum: 0.95,
+      domainTechnologyPairRetentionMinimum: 0.8,
+      realBrowserCostMaximum: 0.3,
+    },
+    foldWin: {
+      minimumCategoryWins: SHADOW_CATEGORY_FOLD_WIN_MINIMUM,
+      scope: "trigger-only",
+      pairLift: "sum-full-minus-t2",
+      novelNameCoverage: "selected-full-union-minus-global-t2-union",
+      rule: "componentwise-non-regression-with-one-strict",
+      requirePositiveTriggerQuotaEachFold: true,
+      globalT2Union: "same-cohort-union-shared-by-arms",
+      interpretation: "stability-heuristic-not-statistical-test",
+    },
+    controlsIncludedInGlobalGuardrails: true,
+    decisionRule: "baseline-first-else-category-if-eligible-else-no-go",
+  });
+}
+
+function developmentManifest(
+  inputArtifact: ShadowEvaluationArtifact,
+  preregistration: ShadowPairedPreregistration,
+  sealedHoldoutManifestDigest: string,
+): ShadowPairedCohortManifest {
+  return validateShadowPairedCohortManifest({
+    schemaVersion: 1,
+    experimentRevision: SHADOW_PAIRED_EXPERIMENT_REVISION,
+    role: "development",
+    sealedHoldoutManifestDigest,
+    preregistrationDigest: digestShadowPairedPreregistration(preregistration),
+    input: {
+      fileDigest: `sha256:${"6".repeat(64)}`,
+      domainSetDigest: computeDomainSetDigest(
+        inputArtifact.snapshots.map(({ domain: value }) => value),
+      ),
+      domains: SHADOW_EVALUATION_DOMAIN_COUNT,
+    },
+    expected: {
+      scannerVersion: inputArtifact.provenance.scannerVersion,
+      configDigest: inputArtifact.provenance.configDigest,
+      catalog: inputArtifact.provenance.catalog,
+      schemaVersion: 1,
+      protocolRevision: SHADOW_EVALUATION_PROTOCOL_REVISION,
+    },
+    source: {
+      name: "fixture-source",
+      revision: "fixture-source-v1",
+      digest: `sha256:${"7".repeat(64)}`,
+    },
+    sampling: {
+      revision: "sha256-rank-without-replacement-v1",
+      salt: SHADOW_PAIRED_COHORT_SALT,
+    },
+    zeroOverlapWith: [{
+      label: "D1",
+      domainSetDigest: computeDomainSetDigest(DISCOVERY_DOMAINS),
+      domains: DISCOVERY_DOMAINS,
+    }],
+  });
+}
+
+function holdoutManifest(
+  inputArtifact: ShadowEvaluationArtifact,
+  preregistration: ShadowPairedPreregistration,
+  developmentDomains: readonly string[],
+): ShadowPairedCohortManifest {
+  return validateShadowPairedCohortManifest({
+    schemaVersion: 1,
+    experimentRevision: SHADOW_PAIRED_EXPERIMENT_REVISION,
+    role: "holdout",
+    preregistrationDigest: digestShadowPairedPreregistration(preregistration),
+    input: {
+      fileDigest: `sha256:${"8".repeat(64)}`,
+      domainSetDigest: computeDomainSetDigest(
+        inputArtifact.snapshots.map(({ domain: value }) => value),
+      ),
+      domains: SHADOW_EVALUATION_DOMAIN_COUNT,
+    },
+    expected: {
+      scannerVersion: inputArtifact.provenance.scannerVersion,
+      configDigest: inputArtifact.provenance.configDigest,
+      catalog: inputArtifact.provenance.catalog,
+      schemaVersion: 1,
+      protocolRevision: SHADOW_EVALUATION_PROTOCOL_REVISION,
+    },
+    source: {
+      name: "fixture-source",
+      revision: "fixture-source-v1",
+      digest: `sha256:${"7".repeat(64)}`,
+    },
+    sampling: {
+      revision: "sha256-rank-without-replacement-v1",
+      salt: SHADOW_PAIRED_COHORT_SALT,
+    },
+    zeroOverlapWith: [
+      {
+        label: "D1",
+        domainSetDigest: computeDomainSetDigest(DISCOVERY_DOMAINS),
+        domains: DISCOVERY_DOMAINS,
+      },
+      {
+        label: "D2",
+        domainSetDigest: computeDomainSetDigest(developmentDomains),
+        domains: developmentDomains,
+      },
+    ],
+  });
+}
+
+function pairedDevelopmentOptions(
+  preregistration: ShadowPairedPreregistration,
+  manifest: ShadowPairedCohortManifest,
+  sealedHoldoutManifest: ShadowPairedCohortManifest,
+) {
+  return Object.freeze({
+    trainingArtifactDigest: TRAINING_ARTIFACT_DIGEST,
+    expectedEvaluationScannerVersion:
+      preregistration.expectedDevelopmentScannerVersion,
+    expectedEvaluationConfigDigest:
+      preregistration.expectedDevelopmentConfigDigest,
+    preregistrationDigest: digestShadowPairedPreregistration(preregistration),
+    cohortManifestDigest: digestShadowPairedCohortManifest(manifest),
+    sealedHoldoutManifestDigest:
+      digestShadowPairedCohortManifest(sealedHoldoutManifest),
+  });
+}
+
+function pairedDevelopmentBoundary(
+  inputArtifact: ShadowEvaluationArtifact,
+  projection: ShadowT2CategoryProjection,
+  preregistration: ShadowPairedPreregistration,
+): {
+  readonly source: ShadowPairedDevelopmentSourceReport;
+  readonly manifest: ShadowPairedCohortManifest;
+  readonly sealedHoldoutManifest: ShadowPairedCohortManifest;
+  readonly options: ReturnType<typeof pairedDevelopmentOptions>;
+} {
+  const sealedSnapshots = inputArtifact.snapshots.map((item, index) => Object.freeze({
+    ...item,
+    runId: HOLDOUT_RUN_ID,
+    domain: holdoutDomain(index),
+  }));
+  const sealedArtifact = artifact(
+    HOLDOUT_RUN_ID,
+    inputArtifact.provenance.scannerVersion,
+    inputArtifact.provenance.configDigest,
+    sealedSnapshots,
+  );
+  const sealedHoldoutManifest = holdoutManifest(
+    sealedArtifact,
+    preregistration,
+    inputArtifact.snapshots.map(({ domain: value }) => value),
+  );
+  const manifest = developmentManifest(
+    inputArtifact,
+    preregistration,
+    digestShadowPairedCohortManifest(sealedHoldoutManifest),
+  );
+  const options = pairedDevelopmentOptions(
+    preregistration,
+    manifest,
+    sealedHoldoutManifest,
+  );
+  const source = createShadowPairedDevelopmentSource(inputArtifact, {
+    preregistrationDigest: options.preregistrationDigest,
+    cohortManifestDigest: options.cohortManifestDigest,
+    sealedHoldoutManifestDigest: options.sealedHoldoutManifestDigest,
+    categoryProjectionDigest: digestShadowT2CategoryProjection(projection),
+  });
+  return Object.freeze({ source, manifest, sealedHoldoutManifest, options });
+}
+
 function passingCandidate(): ShadowFrozenCandidate {
   const report = calibrateShadowDevelopment(
     artifact(TRAINING_RUN_ID, "0.1.5", TRAINING_CONFIG_DIGEST),
@@ -191,6 +467,32 @@ function featureSnapshot(
     }),
     full: Object.freeze({
       directNames: Object.freeze([...BASE_NAMES, ...extraFullNames].sort()),
+      inferredNames: Object.freeze([]),
+      status: "success" as const,
+    }),
+  });
+}
+
+function pairedFeatureSnapshot(
+  index: number,
+  categorySignal: "high" | "low",
+): ShadowEvaluationSnapshot {
+  const name = `Tech-${String(index).padStart(3, "0")}`;
+  const base = snapshot(100, TRAINING_RUN_ID);
+  return Object.freeze({
+    ...base,
+    runId: TRAINING_RUN_ID,
+    domain: domain(index),
+    t1: available([name]),
+    t2: available([name]),
+    full: Object.freeze({
+      directNames: Object.freeze([
+        name,
+        ...(categorySignal === "high"
+          ? Array.from({ length: 10 }, (_, lift) =>
+            `Lift-${String(lift).padStart(2, "0")}`)
+          : []),
+      ].sort()),
       inferredNames: Object.freeze([]),
       status: "success" as const,
     }),
@@ -737,4 +1039,553 @@ test("calibration salts and folds remain frozen", () => {
       .map(shadowFoldForDomain),
     [1, 0, 0, 0],
   );
+});
+
+test("category feature maps only T2 direct names to a sorted unique ID union", () => {
+  const projection = categoryProjection(
+    [BASE_NAMES[0]!, BASE_NAMES[1]!],
+    (_, index) => index === 0 ? [3, 2, 2] : [2, 1],
+  );
+  const input = snapshot(0, TRAINING_RUN_ID, {
+    t1: available(["T1-only"]),
+    t2: available([BASE_NAMES[0]!, BASE_NAMES[1]!]),
+    full: Object.freeze({
+      directNames: Object.freeze(["Full-only"]),
+      inferredNames: Object.freeze(["Inferred-only"]),
+      status: "success" as const,
+    }),
+  });
+  const categoryTokens = shadowCategoryTriggerFeatureTokens(input, projection)
+    .filter((token) => token.startsWith("t2.directCategoryId="));
+  assert.deepEqual(categoryTokens, [
+    "t2.directCategoryId=1",
+    "t2.directCategoryId=2",
+    "t2.directCategoryId=3",
+  ]);
+  assert.equal(categoryTokens.some((token) => token.includes("count")), false);
+
+  const changedT1 = snapshot(0, TRAINING_RUN_ID, {
+    t1: available(["Different-T1"]),
+    t2: input.t2,
+    full: Object.freeze({
+      directNames: Object.freeze(["Different-full"]),
+      inferredNames: Object.freeze(["Different-inferred"]),
+      status: "failed" as const,
+    }),
+  });
+  assert.deepEqual(
+    shadowCategoryTriggerFeatureTokens(changedT1, projection)
+      .filter((token) => token.startsWith("t2.directCategoryId=")),
+    categoryTokens,
+  );
+  assert.throws(
+    () => shadowCategoryTriggerFeatureTokens(
+      snapshot(0, TRAINING_RUN_ID, { t2: available(["Missing"]) }),
+      projection,
+    ),
+    /missing from the category projection/u,
+  );
+
+  const reversed = {
+    catalog: projection.catalog,
+    technologies: [...projection.technologies].reverse().map((technology) => ({
+      ...technology,
+      categoryIds: [...technology.categoryIds].reverse(),
+    })),
+  };
+  assert.equal(
+    canonicalizeShadowT2CategoryProjection(reversed),
+    canonicalizeShadowT2CategoryProjection(projection),
+  );
+  assert.equal(
+    digestShadowT2CategoryProjection(reversed),
+    digestShadowT2CategoryProjection(projection),
+  );
+});
+
+test("category projection rejects missing categories and numeric bounds", () => {
+  const catalog = provenance("0.1.8", TRAINING_CONFIG_DIGEST).catalog;
+  assert.throws(
+    () => validateShadowT2CategoryProjection({
+      catalog,
+      technologies: [{ name: "Missing-category", categoryIds: [] }],
+    }),
+    /category IDs exceed/u,
+  );
+  assert.throws(
+    () => validateShadowT2CategoryProjection({
+      catalog,
+      technologies: [{
+        name: "Out-of-range",
+        categoryIds: [SHADOW_CATEGORY_ID_MAXIMUM + 1],
+      }],
+    }),
+    /invalid category ID/u,
+  );
+  assert.throws(
+    () => validateShadowT2CategoryProjection({
+      catalog,
+      technologies: [{
+        name: "Too-many",
+        categoryIds: Array.from(
+          { length: SHADOW_CATEGORY_IDS_PER_TECHNOLOGY_MAXIMUM + 1 },
+          (_, index) => index + 1,
+        ),
+      }],
+    }),
+    /category IDs exceed/u,
+  );
+});
+
+test("paired preregistration and manifest are canonical, bounded, and newline framed", () => {
+  const projection = categoryProjection();
+  const preregistration = pairedPreregistration(projection);
+  const inputArtifact = artifact(
+    TRAINING_RUN_ID,
+    "0.1.8",
+    TRAINING_CONFIG_DIGEST,
+  );
+  const boundary = pairedDevelopmentBoundary(
+    inputArtifact,
+    projection,
+    preregistration,
+  );
+  const manifest = boundary.manifest;
+  assert.equal(manifest.role, "development");
+  if (manifest.role !== "development") throw new Error("expected development manifest");
+  assert.equal(
+    manifest.sealedHoldoutManifestDigest,
+    digestShadowPairedCohortManifest(boundary.sealedHoldoutManifest),
+  );
+  assert.equal(boundary.sealedHoldoutManifest.role, "holdout");
+  assert.throws(
+    () => validateShadowPairedCohortManifest(Object.fromEntries(
+      Object.entries(manifest)
+        .filter(([key]) => key !== "sealedHoldoutManifestDigest"),
+    )),
+    /exact frozen shape/u,
+  );
+  assert.throws(
+    () => validateShadowPairedCohortManifest({
+      ...boundary.sealedHoldoutManifest,
+      sealedHoldoutManifestDigest: digestShadowPairedCohortManifest(
+        boundary.sealedHoldoutManifest,
+      ),
+    }),
+    /exact frozen shape/u,
+  );
+  assert.equal(canonicalizeShadowPairedPreregistration(preregistration).endsWith("\n"), true);
+  assert.equal(canonicalizeShadowPairedCohortManifest(manifest).endsWith("\n"), true);
+  assert.equal(
+    canonicalizeShadowPairedDevelopmentSource(boundary.source, inputArtifact)
+      .endsWith("\n"),
+    true,
+  );
+  assert.equal(
+    canonicalizeShadowPairedPreregistration(
+      Object.fromEntries(Object.entries(preregistration).reverse()),
+    ),
+    canonicalizeShadowPairedPreregistration(preregistration),
+  );
+  assert.equal(
+    digestShadowPairedCohortManifest(
+      Object.fromEntries(Object.entries(manifest).reverse()),
+    ),
+    digestShadowPairedCohortManifest(manifest),
+  );
+  assert.throws(
+    () => validateShadowPairedCohortManifest({
+      ...manifest,
+      zeroOverlapWith: [{
+        ...manifest.zeroOverlapWith[0],
+        domainSetDigest: `sha256:${"f".repeat(64)}`,
+      }],
+    }),
+    /digest does not match domains/u,
+  );
+  assert.throws(
+    () => validateShadowPairedPreregistration({
+      ...preregistration,
+      foldWin: { ...preregistration.foldWin, minimumCategoryWins: 3 },
+    }),
+    /fold-win rule does not match/u,
+  );
+});
+
+test("repository paired preregistration bytes match the frozen public digest", async () => {
+  const bytes = await readFile(new URL(
+    "../shadow-category-ablation.v1.json",
+    import.meta.url,
+  ));
+  assert.equal(bytes.at(-1), 0x0a);
+  assert.equal(bytes.includes(0x0d), false);
+  const text = bytes.toString("utf8");
+  const preregistration = validateShadowPairedPreregistration(JSON.parse(text));
+  assert.equal(text, canonicalizeShadowPairedPreregistration(preregistration));
+  assert.equal(
+    digestShadowPairedPreregistration(preregistration),
+    "sha256:bf924836872efc40ee30b92ae51eb456d08ce3172b19de25b401be422107f849",
+  );
+});
+
+test("paired decision is baseline-first and requires at least four fold wins", () => {
+  assert.deepEqual(decideShadowPairedExperiment(true, true, 5), {
+    selectedFeatureSet: SHADOW_BASELINE_FEATURE_SET,
+    reason: "baseline-passed-all-official-gates",
+  });
+  assert.deepEqual(decideShadowPairedExperiment(false, true, 3), {
+    selectedFeatureSet: null,
+    reason: "no-arm-eligible",
+  });
+  assert.deepEqual(decideShadowPairedExperiment(false, true, 4), {
+    selectedFeatureSet: SHADOW_CATEGORY_FEATURE_SET,
+    reason: "category-passed-all-official-gates-and-fold-win-minimum",
+  });
+  assert.deepEqual(decideShadowPairedExperiment(false, false, 5), {
+    selectedFeatureSet: null,
+    reason: "no-arm-eligible",
+  });
+  assert.throws(
+    () => decideShadowPairedExperiment(false, true, 6),
+    /decision inputs are invalid/u,
+  );
+});
+
+test("paired calibration preserves baseline bytes and selects a four-fold category winner", () => {
+  const inputSnapshots = Object.freeze(Array.from(
+    { length: SHADOW_EVALUATION_DOMAIN_COUNT },
+    (_, index) => pairedFeatureSnapshot(index, index < 50 ? "high" : "low"),
+  ));
+  const inputArtifact = artifact(
+    TRAINING_RUN_ID,
+    "0.1.8",
+    TRAINING_CONFIG_DIGEST,
+    inputSnapshots,
+  );
+  const names = inputSnapshots.map(({ t2 }) => directName(t2));
+  const projection = categoryProjection(
+    names,
+    (_, index) => [index < 50 ? 1 : 2],
+  );
+  const preregistration = pairedPreregistration(projection);
+  const boundary = pairedDevelopmentBoundary(
+    inputArtifact,
+    projection,
+    preregistration,
+  );
+  const result = calibrateShadowPairedDevelopment(
+    inputArtifact,
+    boundary.source,
+    projection,
+    preregistration,
+    boundary.manifest,
+    boundary.sealedHoldoutManifest,
+    boundary.options,
+  );
+  const replacementHoldout = validateShadowPairedCohortManifest({
+    ...boundary.sealedHoldoutManifest,
+    input: {
+      ...boundary.sealedHoldoutManifest.input,
+      fileDigest: `sha256:${"9".repeat(64)}`,
+    },
+  });
+  assert.throws(
+    () => calibrateShadowPairedDevelopment(
+      inputArtifact,
+      boundary.source,
+      projection,
+      preregistration,
+      boundary.manifest,
+      replacementHoldout,
+      boundary.options,
+    ),
+    /sealed holdout/u,
+  );
+  assert.equal(
+    JSON.stringify(result.baseline),
+    JSON.stringify(calibrateShadowDevelopmentSource(inputArtifact)),
+  );
+  assert.equal(result.baseline.deployable.provisionalGuardrails.passed, false);
+  assert.equal(result.category.deployable.provisionalGuardrails.passed, true);
+  assert.ok(result.categoryFoldWins >= SHADOW_CATEGORY_FOLD_WIN_MINIMUM);
+  assert.ok(result.foldComparisons.every((comparison) =>
+    comparison.baseline.triggerDomainCount > 0
+    && comparison.category.triggerDomainCount > 0));
+  assert.equal(
+    result.foldComparisons.reduce(
+      (sum, comparison) => sum + comparison.baseline.triggerDomainCount,
+      0,
+    ),
+    38,
+  );
+  assert.equal(result.category.deployable.selected.length, 40);
+  assert.equal(
+    result.category.deployable.selected.filter(({ source }) => source === "control")
+      .length,
+    2,
+  );
+  assert.equal(result.decision.selectedFeatureSet, SHADOW_CATEGORY_FEATURE_SET);
+  assert.ok(result.candidate);
+  assert.equal(result.candidate.featureSet, SHADOW_CATEGORY_FEATURE_SET);
+  assert.equal(result.candidate.preregistrationDigest, result.preregistrationDigest);
+  assert.equal(
+    result.candidate.trainingCohort.manifestDigest,
+    result.cohortManifestDigest,
+  );
+  assert.equal(
+    result.candidate.trainingCohort.sealedHoldoutManifestDigest,
+    result.sealedHoldoutManifestDigest,
+  );
+  assert.equal(canonicalizeShadowPairedFrozenCandidate(result.candidate).endsWith("\n"), true);
+  assert.equal(
+    digestShadowPairedFrozenCandidate(
+      Object.fromEntries(Object.entries(result.candidate).reverse()),
+    ),
+    digestShadowPairedFrozenCandidate(result.candidate),
+  );
+});
+
+test("paired category arm remains label-blind inside each held-out fold", () => {
+  const inputSnapshots = Object.freeze(Array.from(
+    { length: SHADOW_EVALUATION_DOMAIN_COUNT },
+    (_, index) => pairedFeatureSnapshot(index, index < 50 ? "high" : "low"),
+  ));
+  const originalArtifact = artifact(
+    TRAINING_RUN_ID,
+    "0.1.8",
+    TRAINING_CONFIG_DIGEST,
+    inputSnapshots,
+  );
+  const projection = categoryProjection(
+    inputSnapshots.map(({ t2 }) => directName(t2)),
+    (_, index) => [index < 50 ? 1 : 2],
+  );
+  const preregistration = pairedPreregistration(projection);
+  const boundary = pairedDevelopmentBoundary(
+    originalArtifact,
+    projection,
+    preregistration,
+  );
+  const targetFold = 2;
+  const changedSnapshots = inputSnapshots.map((item, index) =>
+    shadowFoldForDomain(item.domain) !== targetFold
+      ? item
+      : Object.freeze({
+        ...item,
+        full: Object.freeze({
+          directNames: Object.freeze([`Changed-${String(index).padStart(3, "0")}`]),
+          inferredNames: Object.freeze(["Changed-inferred"]),
+          status: "failed" as const,
+        }),
+        fullCost: cost(10_000 + index),
+        browserLimitHits: Object.freeze([]),
+      }));
+  const baseline = calibrateShadowPairedDevelopment(
+    originalArtifact,
+    boundary.source,
+    projection,
+    preregistration,
+    boundary.manifest,
+    boundary.sealedHoldoutManifest,
+    boundary.options,
+  );
+  const changedArtifact = artifact(
+    TRAINING_RUN_ID,
+    "0.1.8",
+    TRAINING_CONFIG_DIGEST,
+    changedSnapshots,
+  );
+  const changedSource = createShadowPairedDevelopmentSource(changedArtifact, {
+    preregistrationDigest: boundary.options.preregistrationDigest,
+    cohortManifestDigest: boundary.options.cohortManifestDigest,
+    sealedHoldoutManifestDigest:
+      boundary.options.sealedHoldoutManifestDigest,
+    categoryProjectionDigest: digestShadowT2CategoryProjection(projection),
+  });
+  assert.throws(
+    () => calibrateShadowPairedDevelopment(
+      changedArtifact,
+      boundary.source,
+      projection,
+      preregistration,
+      boundary.manifest,
+      boundary.sealedHoldoutManifest,
+      boundary.options,
+    ),
+    /source does not match its artifact/u,
+  );
+  const changed = calibrateShadowPairedDevelopment(
+    changedArtifact,
+    changedSource,
+    projection,
+    preregistration,
+    boundary.manifest,
+    boundary.sealedHoldoutManifest,
+    boundary.options,
+  );
+  for (const arm of ["baseline", "category"] as const) {
+    assert.deepEqual(
+      changed[arm].oofPredictions.filter(({ fold }) => fold === targetFold),
+      baseline[arm].oofPredictions.filter(({ fold }) => fold === targetFold),
+    );
+    assert.deepEqual(
+      changed[arm].deployable.selected.filter(({ fold }) => fold === targetFold),
+      baseline[arm].deployable.selected.filter(({ fold }) => fold === targetFold),
+    );
+  }
+});
+
+test("paired frozen holdout uses the frozen arm and remains label-blind", () => {
+  const developmentSnapshots = Object.freeze(Array.from(
+    { length: SHADOW_EVALUATION_DOMAIN_COUNT },
+    (_, index) => pairedFeatureSnapshot(index, index < 50 ? "high" : "low"),
+  ));
+  const developmentArtifact = artifact(
+    TRAINING_RUN_ID,
+    "0.1.8",
+    TRAINING_CONFIG_DIGEST,
+    developmentSnapshots,
+  );
+  const projection = categoryProjection(
+    developmentSnapshots.map(({ t2 }) => directName(t2)),
+    (_, index) => [index < 50 ? 1 : 2],
+  );
+  const preregistration = pairedPreregistration(projection);
+  const boundary = pairedDevelopmentBoundary(
+    developmentArtifact,
+    projection,
+    preregistration,
+  );
+  const development = calibrateShadowPairedDevelopment(
+    developmentArtifact,
+    boundary.source,
+    projection,
+    preregistration,
+    boundary.manifest,
+    boundary.sealedHoldoutManifest,
+    boundary.options,
+  );
+  assert.ok(development.candidate);
+
+  const holdoutSnapshots = Object.freeze(developmentSnapshots.map((item, index) =>
+    Object.freeze({
+      ...item,
+      runId: HOLDOUT_RUN_ID,
+      domain: holdoutDomain(index),
+    })));
+  const holdoutArtifact = artifact(
+    HOLDOUT_RUN_ID,
+    "0.1.8",
+    TRAINING_CONFIG_DIGEST,
+    holdoutSnapshots,
+  );
+  const h1Manifest = boundary.sealedHoldoutManifest;
+  const candidateDigest = digestShadowPairedFrozenCandidate(
+    development.candidate,
+  );
+  const options = {
+    candidateDigest,
+    preregistrationDigest: digestShadowPairedPreregistration(preregistration),
+    cohortManifestDigest: digestShadowPairedCohortManifest(h1Manifest),
+  };
+  const baseline = evaluateFrozenShadowPairedCandidate(
+    holdoutArtifact,
+    projection,
+    preregistration,
+    h1Manifest,
+    development.candidate,
+    options,
+  );
+  const changedSnapshots = holdoutSnapshots.map((item, index) => Object.freeze({
+    ...item,
+    full: Object.freeze({
+      directNames: Object.freeze([`Changed-${String(index).padStart(3, "0")}`]),
+      inferredNames: Object.freeze(["Changed-inferred"]),
+      status: "failed" as const,
+    }),
+    fullCost: cost(50_000 + index),
+    browserLimitHits: Object.freeze([]),
+  }));
+  const changed = evaluateFrozenShadowPairedCandidate(
+    artifact(
+      HOLDOUT_RUN_ID,
+      "0.1.8",
+      TRAINING_CONFIG_DIGEST,
+      changedSnapshots,
+    ),
+    projection,
+    preregistration,
+    h1Manifest,
+    development.candidate,
+    options,
+  );
+  assert.equal(baseline.candidateDigest, candidateDigest);
+  assert.equal(
+    development.candidate.trainingCohort.sealedHoldoutManifestDigest,
+    options.cohortManifestDigest,
+  );
+  assert.equal(baseline.featureSet, SHADOW_CATEGORY_FEATURE_SET);
+  assert.deepEqual(changed.evaluation.predictions, baseline.evaluation.predictions);
+  assert.deepEqual(
+    changed.evaluation.deployable.selected,
+    baseline.evaluation.deployable.selected,
+  );
+  assert.notDeepEqual(
+    changed.evaluation.deployable.metrics,
+    baseline.evaluation.deployable.metrics,
+  );
+  const missingProjection = categoryProjection(
+    developmentSnapshots.slice(1).map(({ t2 }) => directName(t2)),
+    (_, index) => [index < 49 ? 1 : 2],
+  );
+  assert.throws(
+    () => evaluateFrozenShadowPairedCandidate(
+      holdoutArtifact,
+      missingProjection,
+      preregistration,
+      h1Manifest,
+      development.candidate,
+      options,
+    ),
+    /incompatible/u,
+  );
+});
+
+test("paired calibration returns NO-GO when neither arm is eligible", () => {
+  const inputSnapshots = Object.freeze(Array.from(
+    { length: SHADOW_EVALUATION_DOMAIN_COUNT },
+    (_, index) => pairedFeatureSnapshot(index, index < 50 ? "high" : "low"),
+  ));
+  const inputArtifact = artifact(
+    TRAINING_RUN_ID,
+    "0.1.8",
+    TRAINING_CONFIG_DIGEST,
+    inputSnapshots,
+  );
+  const projection = categoryProjection(
+    inputSnapshots.map(({ t2 }) => directName(t2)),
+    () => [1],
+  );
+  const preregistration = pairedPreregistration(projection);
+  const boundary = pairedDevelopmentBoundary(
+    inputArtifact,
+    projection,
+    preregistration,
+  );
+  const result = calibrateShadowPairedDevelopment(
+    inputArtifact,
+    boundary.source,
+    projection,
+    preregistration,
+    boundary.manifest,
+    boundary.sealedHoldoutManifest,
+    boundary.options,
+  );
+  assert.equal(result.baseline.deployable.provisionalGuardrails.passed, false);
+  assert.equal(result.categoryFoldWins, 0);
+  assert.deepEqual(result.decision, {
+    selectedFeatureSet: null,
+    reason: "no-arm-eligible",
+  });
+  assert.equal(result.candidate, null);
 });

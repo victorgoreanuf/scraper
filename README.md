@@ -9,8 +9,9 @@
 > browser-limit telemetry, and the raw-free shadow evaluator/calibration
 > sidecar are also implemented and tested. The bounded v0.1.7 KISS+ trigger and
 > frozen-holdout boundary are implemented, but their pinned offline development
-> verdict is `NO-GO`; no candidate was published and functional tier routing
-> remains on hold pending better training signal or an approved raw-free feature.
+> verdict is `NO-GO`; no candidate was published. The next experiment is the
+> preregistered, paired v0.1.8 ablation of exactly one raw-free feature family,
+> direct `T2` catalog category IDs. Functional tier routing remains on hold.
 
 ## Goal
 
@@ -71,6 +72,7 @@ The provided benchmark contains 200 unique domains in a Snappy-compressed Parque
 
 ```text
 .
+├── shadow-category-ablation.v1.json
 ├── src/
 │   ├── cli.ts
 │   ├── config.ts
@@ -1656,22 +1658,29 @@ force mode.
 
 The primary JSONL and summary finalize first. The exact 200 snapshots are then
 validated and the browser-limit aggregates are built; run-owned
-input/browser/detector resources close before the sidecar is published. Without
-a candidate, the sidecar contains a `development-source` OOF report and cannot
-publish or imply a frozen model because its own byte digest does not exist until
-publication. With the paired candidate flags, the CLI verifies the exact file
-digest and scanner/config/catalog/protocol compatibility before starting pools,
-then publishes a `frozen-holdout` report which never trains. A snapshot,
-evaluation, serialization, or sidecar I/O failure is fatal.
+input/browser/detector resources close before the sidecar is published. A
+regular shadow run without a candidate contains a `development-source` OOF
+report and cannot publish or imply a frozen model because its own byte digest
+does not exist until publication. A paired `D2` run additionally requires the
+digest-pinned preregistration, development manifest, and already sealed `H1`
+manifest. It publishes a `paired-development-source` envelope which binds all
+three digests plus the category-projection digest before offline calibration.
+The development manifest itself pins the exact sealed-`H1` manifest digest.
+With the paired candidate and `H1` manifest flags, the CLI verifies the exact
+file digest and scanner/config/catalog/protocol compatibility before starting
+pools, then publishes a `paired-frozen-holdout` report which never trains. A
+snapshot, evaluation, serialization, or sidecar I/O failure is fatal.
 
 The candidate also pins the order-independent digest of its exact canonical
 training-domain set. Immediately after Parquet preflight and candidate loading,
 before catalog compilation, detector/browser pools, or network traffic, the CLI
 rejects an evaluation input with that same exact set. The frozen evaluator
 independently rejects either the training `runId` or the same exact set once the
-completed artifact identity exists. This equality check does not require the
-two cohorts to be disjoint: partial domain overlap is not prohibited by the
-v0.1.7 contract and remains an explicit representativeness judgment.
+completed artifact identity exists. That is the generic v0.1.7 implementation
+guard, not the sampling policy of the next experiment. The v0.1.8
+preregistration below requires zero canonical-domain overlap across `D1`, `D2`,
+and `H1`; a cohort manifest which violates that stronger rule is invalid before
+scan startup.
 
 Before serialization, the writer rejects non-plain, cyclic, accessor-bearing,
 sparse, non-finite, or unsupported structures, as well as structures deeper
@@ -2780,9 +2789,10 @@ remainder. Mutating any holdout `full` label, browser cost, or browser-limit hit
 must leave every prediction, greedy step, trigger, and control byte-identical.
 Only `T1`, `T2`, or allowlisted pre-browser features may affect membership.
 The candidate cannot be evaluated against its training `runId` or the same exact
-canonical domain set. Partial overlap alone is not rejected; this narrow KISS
-guard prevents exact cohort reuse without claiming to solve cohort
-representativeness automatically.
+canonical domain set. This narrow generic guard prevents exact cohort reuse but
+does not define the stricter v0.1.8 experiment: the preregistered cohort
+manifests must prove zero canonical overlap across `D1`, `D2`, and `H1` before
+any `D2` scan.
 
 Real cost is deliberately an evaluation veto, not a predicted score term. All
 five selected/full ratios use exact integer comparison against `3/10`; a zero
@@ -2824,6 +2834,100 @@ already informed catalog fixes and metric design, so even out-of-fold results
 are descriptive development evidence rather than a production generalization
 claim. A final KPI requires a deployable trigger which passes this protocol and
 then a fresh representative cohort.
+
+### Preregistered direct-category ablation (v0.1.8)
+
+`shadow-category-ablation.v1.json` is the immutable protocol artifact for the
+next experiment, revision `2026-08-20.3`. Its canonical serialization is hashed
+before any cohort is instantiated; its frozen digest is
+`sha256:bf924836872efc40ee30b92ae51eb456d08ce3172b19de25b401be422107f849`.
+The v0.1.5 dataset is named `D1` and is
+hypothesis-generation evidence only: it motivated this single feature, but it
+cannot train either arm, select the winner, change a threshold, or ratify a KPI.
+The preregistration pins its raw sidecar digest
+`sha256:1b53023cf747e7194adc3d0261f96f93a556cba041d8ee515e9b4a8dc37ef43e`
+and domain-set digest
+`sha256:4bd010e4fae36d5f50d468e4e0e47e377040281fa38be0be9dd1d97c48c7c523`.
+
+The paired experiment has exactly two arms over the same snapshots, folds,
+labels, quotas, and control-selection rule:
+
+| Feature set | Frozen definition |
+| --- | --- |
+| `baseline-v2` | The exact raw-free v0.1.7 multi-objective trigger, pinned to its implementation commit. |
+| `baseline-v2+t2-direct-category-id-v1` | The baseline plus tokens with the exact form `t2.directCategoryId=<decimal>`. |
+
+For the category arm, each canonical name in `T2.directNames` must resolve to
+its technology in the pinned compiled catalog. The feature is the sorted,
+deduplicated union of that technology's numeric category IDs. A missing or
+ambiguous technology mapping invalidates evaluation instead of silently
+dropping a name. The category projection and catalog are digest-bound. No `T1`
+name, inferred name, `full` field, browser field, category name/group, or
+explicit category-count token is admitted. This is the only new feature family;
+there is no weight search, new raw signal, or collector/routing change.
+
+`D2` is a new exact-200 development cohort and `H1` is a distinct exact-200
+sealed holdout. Both are frozen from the same named immutable source frame
+before the first `D2` scan, with zero canonical-domain overlap among `D1`, `D2`,
+and `H1`. Source identity and exact source digest belong to the cohort manifest,
+so this preregistration does not claim that any currently considered mirror is
+an official source. Candidate domains are normalized and deduplicated using the
+static hostname contract only. DNS, HTTP, browser availability, technology
+signals, or eventual scan success cannot pre-screen the sample, and a failed or
+unavailable domain is never replaced after the manifests are frozen.
+
+Sampling is one deterministic unstratified draw without replacement. Eligible
+canonical domains are ordered by
+`SHA-256(sampleSalt + NUL + canonicalDomain)`, then by canonical domain as the
+collision tie-break. After excluding `D1`, the first 200 become `D2` and the
+next 200 become `H1`. The single frozen salt is
+`website-technologies-scraper/shadow/2026-08-20.3/cohort-sample/v1`. Sampling is
+not stratified and no website probe may influence eligibility.
+
+Each cohort instance has a separate immutable canonical manifest, and both are
+frozen before the first `D2` scan. Each binds the preregistration digest, source
+name/revision/digest, sampling mode and salt, the ordered input count, the
+canonical domain-set digest, and the SHA-256 digest of the exact Parquet input
+bytes. The `D2` manifest additionally pins the exact sealed-`H1` manifest
+digest. The live `D2` CLI requires both manifests before catalog or pool startup,
+and its `paired-development-source` sidecar binds the preregistration, both
+manifest digests, and the category projection. The eventual candidate preserves
+the same `D2` and `H1` pins; `H1` evaluation accepts only that exact manifest and
+also pins the frozen candidate digest. A digest mismatch, overlap, wrong count,
+post-freeze replacement, or unbound artifact invalidates the experiment before
+interpretation.
+
+All v0.1.7 calibration constants remain fixed: five folds, smoothing prior
+four, recurring-name support two, 38 trigger domains plus two controls, minimum
+95% canonical direct-name retention, minimum 80% canonical direct pair
+retention, and at most 30% of each real browser-cost total. Every fold must have
+a positive trigger quota or the experiment is invalid. Fold wins compare only
+the trigger members; controls are excluded from this comparison but included
+in every full-cohort retention, quota, and cost guardrail.
+
+For a domain `d`, let `F(d)` be its canonical direct `full` names and `T2(d)` its
+canonical direct `T2` names. Let `U_T2` be the `T2` union over all 200 `D2`
+domains, shared by both arms. Within fold `f`, an arm's trigger-only pair lift is
+`sum(|F(d) - T2(d)|)` and its novel-name coverage is
+`|union(F(d)) - U_T2|` over the fold's selected trigger domains. The category
+arm wins the fold only when neither value regresses versus baseline and at
+least one is strictly larger. It must win at least four of five folds. This is
+a preregistered stability heuristic, not a statistical significance test.
+
+The decision is deliberately baseline-first. If baseline passes every global
+guardrail, baseline wins and the extra feature is rejected as unnecessary.
+Otherwise the category arm wins only if it passes every global guardrail and
+also wins at least four folds. Every other outcome is `NO-GO`; a failed arm is
+not ranked into a candidate and the thresholds, salts, folds, quota, or feature
+definition are not retuned on `D2`.
+
+Only a passing winner is trained on all `D2` snapshots and frozen as the single
+candidate. `H1` is then evaluated once, without training, feature changes,
+threshold changes, or retraining after inspection. If that one-shot check
+fails, `H1` becomes development evidence and a later claim requires a new
+sealed `H2`. Preregistration and manifests do not themselves authorize public
+traffic. Functional tier routing remains `HOLD` until the frozen winner passes
+the distinct holdout and a later implementation slice is explicitly approved.
 
 ## Implementation roadmap
 
@@ -2885,9 +2989,18 @@ Completion and evaluation gates:
 - [x] Run the offline development GO/NO-GO against the exact pinned v0.1.5
   sidecar and freeze a candidate only if all retention, quota, and real-cost
   guardrails pass. The result was `NO-GO`, so no candidate was frozen.
-- [ ] Evaluate a passing frozen candidate on a new representative 200-domain
-  cohort without retraining or changing its objective, features, thresholds,
-  salts, or cost ceiling.
+- [x] Preregister the paired `baseline-v2` versus direct-`T2` category-ID
+  ablation, its 4/5 fold rule, baseline-first decision, immutable artifact
+  chain, and sealed-holdout policy.
+- [ ] Freeze exact-200 `D2` and exact-200 sealed `H1` manifests simultaneously
+  from one named immutable source frame, with zero `D1`/`D2`/`H1` overlap and
+  no network prescreen or post-freeze replacement.
+- [ ] Run the two frozen arms once on `D2`; accept category IDs only after all
+  global guardrails and at least four fold wins, otherwise retain a passing
+  baseline or record `NO-GO`.
+- [ ] Freeze the eligible `D2` winner and evaluate it once on sealed `H1`
+  without training, retraining, or changing features, thresholds, salts,
+  folds, quota, or cost ceiling. A failure requires a future sealed `H2`.
 - [ ] Implement functional tiered orchestration only after a frozen deployable
   trigger passes a new representative cohort; this slice is on hold and has no
   reserved version.
@@ -2921,10 +3034,10 @@ infrastructure collector, pipeline orchestration, incremental output, resume,
 summary generation, runnable local CLI, exact correction ledger, bounded limit
 telemetry, raw-free shadow evaluator, bounded set-aware trigger, standalone
 candidate boundary, and no-training frozen-holdout evaluator are complete in
-version 0.1.7. The offline development verdict is `NO-GO`, so no candidate or
-new representative cohort follows from this build. The next bounded work is to
-improve training signal/data or separately approve one raw-free feature, then
-repeat development GO/NO-GO without changing the frozen thresholds after
-observing a holdout. Functional routing remains a later slice and has no
-reserved version. The v0.1.5 and v0.1.7 rejections are not authorization to
-lower the guardrails or ratify a same-cohort adjustment.
+version 0.1.7. The offline development verdict is `NO-GO`, so no candidate
+followed from that build. The v0.1.8 experiment now preregisters exactly one
+raw-free feature family and a new `D2`/sealed-`H1` sequence; the concrete source
+and cohort manifests still must be frozen before traffic. Functional routing
+remains a later slice and has no reserved version. The v0.1.5 and v0.1.7
+rejections are not authorization to lower the guardrails, ratify a same-cohort
+adjustment, or use documentation as crawl authorization.

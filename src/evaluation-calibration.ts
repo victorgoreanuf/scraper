@@ -13,9 +13,11 @@ import {
   type ShadowPreBrowserFeatures,
 } from "./evaluation.ts";
 import { computeDomainSetDigest } from "./domain-set.ts";
+import type { CompiledFingerprintCatalog } from "./detect/catalog.ts";
 import type { CatalogProvenance, Provenance } from "./model.ts";
 
 export const SHADOW_CALIBRATION_REVISION = "2026-08-20.2";
+export const SHADOW_PAIRED_EXPERIMENT_REVISION = "2026-08-20.3";
 export const SHADOW_CALIBRATION_SMOOTHING_PRIOR = 4;
 export const SHADOW_RECURRING_NAME_MINIMUM_SUPPORT = 2;
 export const SHADOW_REAL_BROWSER_COST_MAXIMUM = 0.3;
@@ -27,10 +29,23 @@ export const SHADOW_PROVISIONAL_GUARDRAILS = Object.freeze({
 });
 
 const SHADOW_MODEL_KIND = "bounded-multiobjective-trigger-v2" as const;
+const SHADOW_PAIRED_CANDIDATE_KIND = "paired-shadow-trigger-v1" as const;
+export const SHADOW_BASELINE_FEATURE_SET = "baseline-v2" as const;
+export const SHADOW_CATEGORY_FEATURE_SET =
+  "baseline-v2+t2-direct-category-id-v1" as const;
+export const SHADOW_CATEGORY_FOLD_WIN_MINIMUM = 4;
+export const SHADOW_PAIRED_COHORT_SALT =
+  "website-technologies-scraper/shadow/2026-08-20.3/cohort-sample/v1";
+export const SHADOW_CATEGORY_ID_MAXIMUM = 1_000_000;
+export const SHADOW_CATEGORY_IDS_PER_TECHNOLOGY_MAXIMUM = 32;
+export const SHADOW_CATEGORY_TECHNOLOGY_MAXIMUM = 10_000;
+export const SHADOW_CATEGORY_ASSOCIATION_MAXIMUM = 320_000;
+export const SHADOW_CATEGORY_UNIQUE_ID_MAXIMUM = 1_024;
 export const SHADOW_MODEL_TOKEN_CAP = 20_000;
 export const SHADOW_MODEL_RECURRING_NAME_CAP = 10_000;
 export const SHADOW_MODEL_RECURRING_TARGET_CAP = 50_000;
 const SHA256_DIGEST = /^sha256:[0-9a-f]{64}$/u;
+const GIT_COMMIT = /^[0-9a-f]{40}$/u;
 const RUN_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 
 export const SHADOW_CALIBRATION_SALTS = Object.freeze({
@@ -125,6 +140,157 @@ export interface ShadowFrozenCandidate {
   readonly tokens: readonly ShadowDeploymentToken[];
 }
 
+export type ShadowPairedFeatureSet =
+  | typeof SHADOW_BASELINE_FEATURE_SET
+  | typeof SHADOW_CATEGORY_FEATURE_SET;
+
+export interface ShadowT2CategoryTechnology {
+  readonly name: string;
+  readonly categoryIds: readonly number[];
+}
+
+/**
+ * Raw-free catalog projection used only to turn already-observed T2 direct
+ * names into bounded numeric category tokens.
+ */
+export interface ShadowT2CategoryProjection {
+  readonly catalog: CatalogProvenance;
+  readonly technologies: readonly ShadowT2CategoryTechnology[];
+}
+
+export interface ShadowPairedPreregistration {
+  readonly schemaVersion: 1;
+  readonly experimentRevision: typeof SHADOW_PAIRED_EXPERIMENT_REVISION;
+  readonly baselineImplementationCommit: string;
+  readonly discoveryArtifactDigest: string;
+  readonly discoveryDomainSetDigest: string;
+  readonly discoveryScannerVersion: "0.1.5";
+  readonly expectedDevelopmentScannerVersion: string;
+  readonly expectedDevelopmentConfigDigest: string;
+  readonly catalog: CatalogProvenance;
+  readonly protocolRevision: typeof SHADOW_EVALUATION_PROTOCOL_REVISION;
+  readonly categoryProjectionDigest: string;
+  readonly categoryFeature: {
+    readonly source: "t2.directNames";
+    readonly mapping: "effective-catalog-category-ids";
+    readonly token: "t2.directCategoryId=<decimal>";
+    readonly aggregation: "sorted-unique-union";
+    readonly missing: "reject";
+    readonly forbiddenInputs: readonly [
+      "t1",
+      "inferred",
+      "full",
+      "count",
+      "category-name",
+      "category-group",
+    ];
+  };
+  readonly cohortPolicy: {
+    readonly developmentDomains: typeof SHADOW_EVALUATION_DOMAIN_COUNT;
+    readonly holdoutDomains: typeof SHADOW_EVALUATION_DOMAIN_COUNT;
+    readonly sourceIdentity: "delegated-to-immutable-manifest";
+    readonly selection: "sha256-rank-without-replacement-v1";
+    readonly salt: typeof SHADOW_PAIRED_COHORT_SALT;
+    readonly developmentSelection: "first-200-after-d1-exclusion";
+    readonly holdoutSelection: "next-200-after-d1-exclusion";
+    readonly overlap: "zero-canonical-d1-d2-h1";
+    readonly preScreen: "none";
+    readonly replacement: "none-after-freeze";
+  };
+  readonly featureSets: readonly [
+    typeof SHADOW_BASELINE_FEATURE_SET,
+    typeof SHADOW_CATEGORY_FEATURE_SET,
+  ];
+  readonly foldCount: typeof SHADOW_EVALUATION_FOLD_COUNT;
+  readonly triggerDomainCount: typeof SHADOW_TRIGGER_DOMAIN_CAP;
+  readonly controlDomainCount: typeof SHADOW_CONTROL_DOMAIN_COUNT;
+  readonly smoothingPrior: typeof SHADOW_CALIBRATION_SMOOTHING_PRIOR;
+  readonly recurringNameMinimumSupport:
+    typeof SHADOW_RECURRING_NAME_MINIMUM_SUPPORT;
+  readonly salts: typeof SHADOW_CALIBRATION_SALTS;
+  readonly guardrails: {
+    readonly canonicalDirectNameRetentionMinimum: 0.95;
+    readonly domainTechnologyPairRetentionMinimum: 0.8;
+    readonly realBrowserCostMaximum: typeof SHADOW_REAL_BROWSER_COST_MAXIMUM;
+  };
+  readonly foldWin: {
+    readonly minimumCategoryWins: typeof SHADOW_CATEGORY_FOLD_WIN_MINIMUM;
+    readonly scope: "trigger-only";
+    readonly pairLift: "sum-full-minus-t2";
+    readonly novelNameCoverage:
+      "selected-full-union-minus-global-t2-union";
+    readonly rule: "componentwise-non-regression-with-one-strict";
+    readonly requirePositiveTriggerQuotaEachFold: true;
+    readonly globalT2Union: "same-cohort-union-shared-by-arms";
+    readonly interpretation: "stability-heuristic-not-statistical-test";
+  };
+  readonly controlsIncludedInGlobalGuardrails: true;
+  readonly decisionRule:
+    "baseline-first-else-category-if-eligible-else-no-go";
+}
+
+interface ShadowPairedCohortManifestBase {
+  readonly schemaVersion: 1;
+  readonly experimentRevision: typeof SHADOW_PAIRED_EXPERIMENT_REVISION;
+  readonly preregistrationDigest: string;
+  readonly input: {
+    readonly fileDigest: string;
+    readonly domainSetDigest: string;
+    readonly domains: typeof SHADOW_EVALUATION_DOMAIN_COUNT;
+  };
+  readonly expected: {
+    readonly scannerVersion: string;
+    readonly configDigest: string;
+    readonly catalog: CatalogProvenance;
+    readonly schemaVersion: 1;
+    readonly protocolRevision: typeof SHADOW_EVALUATION_PROTOCOL_REVISION;
+  };
+  readonly source: {
+    readonly name: string;
+    readonly revision: string;
+    readonly digest: string;
+  };
+  readonly sampling: {
+    readonly revision: string;
+    readonly salt: string;
+  };
+  readonly zeroOverlapWith: readonly {
+    readonly label: string;
+    readonly domainSetDigest: string;
+    readonly domains: readonly string[];
+  }[];
+}
+
+export interface ShadowPairedDevelopmentCohortManifest
+  extends ShadowPairedCohortManifestBase {
+  readonly role: "development";
+  readonly sealedHoldoutManifestDigest: string;
+}
+
+export interface ShadowPairedHoldoutCohortManifest
+  extends ShadowPairedCohortManifestBase {
+  readonly role: "holdout";
+}
+
+export type ShadowPairedCohortManifest =
+  | ShadowPairedDevelopmentCohortManifest
+  | ShadowPairedHoldoutCohortManifest;
+
+export interface ShadowPairedFrozenCandidate {
+  readonly kind: typeof SHADOW_PAIRED_CANDIDATE_KIND;
+  readonly experimentRevision: typeof SHADOW_PAIRED_EXPERIMENT_REVISION;
+  readonly featureSet: ShadowPairedFeatureSet;
+  readonly preregistrationDigest: string;
+  readonly trainingCohort: {
+    readonly manifestDigest: string;
+    readonly sealedHoldoutManifestDigest: string;
+    readonly source: ShadowPairedCohortManifest["source"];
+    readonly sampling: ShadowPairedCohortManifest["sampling"];
+  };
+  readonly categoryProjectionDigest: string;
+  readonly model: ShadowFrozenCandidate;
+}
+
 /** @deprecated Use ShadowFrozenCandidate. */
 export type ShadowDeploymentModel = ShadowFrozenCandidate;
 
@@ -132,6 +298,13 @@ export interface ShadowDevelopmentCalibrationOptions {
   readonly trainingArtifactDigest: string;
   readonly expectedEvaluationScannerVersion: string;
   readonly expectedEvaluationConfigDigest: string;
+}
+
+export interface ShadowPairedDevelopmentOptions
+  extends ShadowDevelopmentCalibrationOptions {
+  readonly preregistrationDigest: string;
+  readonly cohortManifestDigest: string;
+  readonly sealedHoldoutManifestDigest: string;
 }
 
 export interface ShadowRecurringNamePrediction {
@@ -321,6 +494,23 @@ export interface ShadowDevelopmentSourceReport
   readonly mode: "development-source";
 }
 
+export interface ShadowPairedDevelopmentSourceReport {
+  readonly mode: "paired-development-source";
+  readonly experimentRevision: typeof SHADOW_PAIRED_EXPERIMENT_REVISION;
+  readonly preregistrationDigest: string;
+  readonly cohortManifestDigest: string;
+  readonly sealedHoldoutManifestDigest: string;
+  readonly categoryProjectionDigest: string;
+  readonly source: ShadowDevelopmentSourceReport;
+}
+
+export interface ShadowPairedDevelopmentSourceOptions {
+  readonly preregistrationDigest: string;
+  readonly cohortManifestDigest: string;
+  readonly sealedHoldoutManifestDigest: string;
+  readonly categoryProjectionDigest: string;
+}
+
 export interface ShadowFrozenHoldoutReport {
   readonly mode: "frozen-holdout";
   readonly calibrationRevision: typeof SHADOW_CALIBRATION_REVISION;
@@ -335,9 +525,65 @@ export interface ShadowFrozenHoldoutReport {
   readonly deployable: ShadowDeployableEvaluation;
 }
 
+export interface ShadowFoldTriggerOutcome {
+  readonly fold: number;
+  readonly triggerDomainCount: number;
+  readonly pairLift: number;
+  readonly novelNameCoverage: number;
+}
+
+export interface ShadowPairedFoldComparison {
+  readonly fold: number;
+  readonly baseline: ShadowFoldTriggerOutcome;
+  readonly category: ShadowFoldTriggerOutcome;
+  readonly categoryWon: boolean;
+}
+
+export type ShadowPairedDecision =
+  | Readonly<{
+    selectedFeatureSet: typeof SHADOW_BASELINE_FEATURE_SET;
+    reason: "baseline-passed-all-official-gates";
+  }>
+  | Readonly<{
+    selectedFeatureSet: typeof SHADOW_CATEGORY_FEATURE_SET;
+    reason: "category-passed-all-official-gates-and-fold-win-minimum";
+  }>
+  | Readonly<{
+    selectedFeatureSet: null;
+    reason: "no-arm-eligible";
+  }>;
+
+export interface ShadowPairedDevelopmentReport {
+  readonly mode: "paired-development-oof";
+  readonly experimentRevision: typeof SHADOW_PAIRED_EXPERIMENT_REVISION;
+  readonly preregistrationDigest: string;
+  readonly cohortManifestDigest: string;
+  readonly sealedHoldoutManifestDigest: string;
+  readonly categoryProjectionDigest: string;
+  readonly trainingArtifactDigest: string;
+  readonly baseline: ShadowDevelopmentSourceReport;
+  readonly category: ShadowDevelopmentSourceReport;
+  readonly foldComparisons: readonly ShadowPairedFoldComparison[];
+  readonly categoryFoldWins: number;
+  readonly decision: ShadowPairedDecision;
+  readonly candidate: ShadowPairedFrozenCandidate | null;
+}
+
+export interface ShadowPairedFrozenHoldoutReport {
+  readonly mode: "paired-frozen-holdout";
+  readonly experimentRevision: typeof SHADOW_PAIRED_EXPERIMENT_REVISION;
+  readonly featureSet: ShadowPairedFeatureSet;
+  readonly preregistrationDigest: string;
+  readonly cohortManifestDigest: string;
+  readonly candidateDigest: string;
+  readonly categoryProjectionDigest: string;
+  readonly evaluation: ShadowFrozenHoldoutReport;
+}
+
 export type ShadowCalibrationReport =
   | ShadowDevelopmentSourceReport
-  | ShadowDevelopmentCalibrationReport;
+  | ShadowDevelopmentCalibrationReport
+  | ShadowPairedDevelopmentSourceReport;
 
 interface TokenAggregate {
   domains: number;
@@ -514,6 +760,166 @@ export function shadowTriggerFeatureTokens(
   return Object.freeze([...tokens].sort(compareString));
 }
 
+export function validateShadowT2CategoryProjection(
+  value: unknown,
+): ShadowT2CategoryProjection {
+  const projection = exactRecord(
+    value,
+    ["catalog", "technologies"],
+    "T2 category projection",
+  );
+  const catalogRecord = exactRecord(
+    projection.catalog,
+    ["source", "revision", "digest"],
+    "T2 category projection catalog",
+  );
+  const catalog = cloneCatalog({
+    source: boundedString(
+      catalogRecord.source,
+      "T2 category projection catalog source",
+      1_024,
+    ),
+    revision: boundedString(
+      catalogRecord.revision,
+      "T2 category projection catalog revision",
+      1_024,
+    ),
+    digest: normalizeSha256Digest(
+      boundedString(
+        catalogRecord.digest,
+        "T2 category projection catalog digest",
+        128,
+      ),
+      "T2 category projection catalog digest",
+    ),
+  });
+  if (
+    !Array.isArray(projection.technologies)
+    || projection.technologies.length === 0
+    || projection.technologies.length > SHADOW_CATEGORY_TECHNOLOGY_MAXIMUM
+  ) {
+    throw new TypeError("T2 category projection technologies exceed their bound");
+  }
+
+  const names = new Set<string>();
+  const uniqueCategoryIds = new Set<number>();
+  let associations = 0;
+  const technologies = projection.technologies.map((value, index) => {
+    const technology = exactRecord(
+      value,
+      ["name", "categoryIds"],
+      `T2 category projection technology ${index}`,
+    );
+    const name = boundedString(
+      technology.name,
+      `T2 category projection technology ${index} name`,
+      4_096,
+    );
+    if (names.has(name)) {
+      throw new TypeError("T2 category projection contains a duplicate technology");
+    }
+    names.add(name);
+    if (
+      !Array.isArray(technology.categoryIds)
+      || technology.categoryIds.length === 0
+      || technology.categoryIds.length
+        > SHADOW_CATEGORY_IDS_PER_TECHNOLOGY_MAXIMUM
+    ) {
+      throw new TypeError("T2 category projection category IDs exceed their bound");
+    }
+    const categoryIds = [...new Set(technology.categoryIds.map((rawId) => {
+      if (
+        typeof rawId !== "number"
+        || !Number.isSafeInteger(rawId)
+        || rawId < 1
+        || rawId > SHADOW_CATEGORY_ID_MAXIMUM
+      ) {
+        throw new TypeError("T2 category projection contains an invalid category ID");
+      }
+      return rawId;
+    }))].sort((left, right) => left - right);
+    associations += categoryIds.length;
+    if (
+      !Number.isSafeInteger(associations)
+      || associations > SHADOW_CATEGORY_ASSOCIATION_MAXIMUM
+    ) {
+      throw new TypeError("T2 category projection associations exceed their bound");
+    }
+    for (const categoryId of categoryIds) uniqueCategoryIds.add(categoryId);
+    if (uniqueCategoryIds.size > SHADOW_CATEGORY_UNIQUE_ID_MAXIMUM) {
+      throw new TypeError("T2 category projection unique category IDs exceed their bound");
+    }
+    return Object.freeze({ name, categoryIds: Object.freeze(categoryIds) });
+  }).sort((left, right) => compareString(left.name, right.name));
+
+  return Object.freeze({
+    catalog,
+    technologies: Object.freeze(technologies),
+  });
+}
+
+export function projectShadowT2Categories(
+  catalog: CompiledFingerprintCatalog,
+): ShadowT2CategoryProjection {
+  return validateShadowT2CategoryProjection({
+    catalog: {
+      source: catalog.source,
+      revision: catalog.revision,
+      digest: catalog.digest,
+    },
+    technologies: catalog.technologies.map((technology) => ({
+      name: technology.name,
+      categoryIds: technology.categories.map(({ id }) => id),
+    })),
+  });
+}
+
+type ShadowFeatureInput = Pick<
+  ShadowEvaluationSnapshot,
+  "t1" | "t2" | "preBrowser"
+>;
+type ShadowFeatureTokenFunction = (
+  snapshot: ShadowFeatureInput,
+) => readonly string[];
+
+function categoryProjectionIndex(
+  projection: ShadowT2CategoryProjection,
+): ReadonlyMap<string, readonly number[]> {
+  return new Map(
+    projection.technologies.map(({ name, categoryIds }) => [name, categoryIds]),
+  );
+}
+
+function categoryFeatureTokenFunction(
+  projection: ShadowT2CategoryProjection,
+): ShadowFeatureTokenFunction {
+  const categoryIdsByTechnology = categoryProjectionIndex(projection);
+  return (snapshot): readonly string[] => {
+    const tokens = new Set(shadowTriggerFeatureTokens(snapshot));
+    for (const name of directNames(snapshot.t2)) {
+      const categoryIds = categoryIdsByTechnology.get(name);
+      if (categoryIds === undefined || categoryIds.length === 0) {
+        throw new TypeError(
+          "T2 direct technology is missing from the category projection",
+        );
+      }
+      for (const categoryId of categoryIds) {
+        tokens.add(`t2.directCategoryId=${categoryId}`);
+      }
+    }
+    return Object.freeze([...tokens].sort(compareString));
+  };
+}
+
+export function shadowCategoryTriggerFeatureTokens(
+  snapshot: ShadowFeatureInput,
+  projectionValue: unknown,
+): readonly string[] {
+  return categoryFeatureTokenFunction(
+    validateShadowT2CategoryProjection(projectionValue),
+  )(snapshot);
+}
+
 function assertSafeCount(value: number, label: string): void {
   if (!Number.isSafeInteger(value) || value < 0) {
     throw new TypeError(`${label} must be a non-negative safe integer`);
@@ -661,6 +1067,21 @@ function cloneCatalog(catalog: CatalogProvenance): CatalogProvenance {
   });
 }
 
+function canonicalCatalogProvenance(
+  value: unknown,
+  label: string,
+): CatalogProvenance {
+  const catalog = exactRecord(value, ["source", "revision", "digest"], label);
+  return cloneCatalog({
+    source: boundedString(catalog.source, `${label}.source`, 1_024),
+    revision: boundedString(catalog.revision, `${label}.revision`, 1_024),
+    digest: normalizeSha256Digest(
+      boundedString(catalog.digest, `${label}.digest`, 128),
+      `${label}.digest`,
+    ),
+  });
+}
+
 function cloneProvenance(provenance: Provenance): Provenance {
   return Object.freeze({
     scannerVersion: provenance.scannerVersion,
@@ -772,6 +1193,465 @@ function canonicalProvenance(value: unknown, label: string): Provenance {
   });
 }
 
+export function validateShadowPairedPreregistration(
+  value: unknown,
+): ShadowPairedPreregistration {
+  const preregistration = exactRecord(value, [
+    "schemaVersion",
+    "experimentRevision",
+    "baselineImplementationCommit",
+    "discoveryArtifactDigest",
+    "discoveryDomainSetDigest",
+    "discoveryScannerVersion",
+    "expectedDevelopmentScannerVersion",
+    "expectedDevelopmentConfigDigest",
+    "catalog",
+    "protocolRevision",
+    "categoryProjectionDigest",
+    "categoryFeature",
+    "cohortPolicy",
+    "featureSets",
+    "foldCount",
+    "triggerDomainCount",
+    "controlDomainCount",
+    "smoothingPrior",
+    "recurringNameMinimumSupport",
+    "salts",
+    "guardrails",
+    "foldWin",
+    "controlsIncludedInGlobalGuardrails",
+    "decisionRule",
+  ], "Paired preregistration");
+  if (
+    preregistration.schemaVersion !== 1
+    || preregistration.experimentRevision !== SHADOW_PAIRED_EXPERIMENT_REVISION
+    || preregistration.discoveryScannerVersion !== "0.1.5"
+    || preregistration.protocolRevision !== SHADOW_EVALUATION_PROTOCOL_REVISION
+    || preregistration.foldCount !== SHADOW_EVALUATION_FOLD_COUNT
+    || preregistration.triggerDomainCount !== SHADOW_TRIGGER_DOMAIN_CAP
+    || preregistration.controlDomainCount !== SHADOW_CONTROL_DOMAIN_COUNT
+    || preregistration.smoothingPrior !== SHADOW_CALIBRATION_SMOOTHING_PRIOR
+    || preregistration.recurringNameMinimumSupport
+      !== SHADOW_RECURRING_NAME_MINIMUM_SUPPORT
+    || preregistration.controlsIncludedInGlobalGuardrails !== true
+    || preregistration.decisionRule
+      !== "baseline-first-else-category-if-eligible-else-no-go"
+  ) {
+    throw new TypeError("Paired preregistration constants do not match");
+  }
+  const baselineImplementationCommit = boundedString(
+    preregistration.baselineImplementationCommit,
+    "Paired preregistration baseline commit",
+    40,
+  );
+  if (!GIT_COMMIT.test(baselineImplementationCommit)) {
+    throw new TypeError("Paired preregistration baseline commit is invalid");
+  }
+  const discoveryArtifactDigest = normalizeSha256Digest(
+    boundedString(
+      preregistration.discoveryArtifactDigest,
+      "Paired preregistration discovery artifact digest",
+      128,
+    ),
+    "Paired preregistration discovery artifact digest",
+  );
+  const discoveryDomainSetDigest = normalizeSha256Digest(
+    boundedString(
+      preregistration.discoveryDomainSetDigest,
+      "Paired preregistration discovery domain-set digest",
+      128,
+    ),
+    "Paired preregistration discovery domain-set digest",
+  );
+  const expectedDevelopmentScannerVersion = boundedString(
+    preregistration.expectedDevelopmentScannerVersion,
+    "Paired preregistration development scanner version",
+    128,
+  );
+  const expectedDevelopmentConfigDigest = normalizeSha256Digest(
+    boundedString(
+      preregistration.expectedDevelopmentConfigDigest,
+      "Paired preregistration development config digest",
+      128,
+    ),
+    "Paired preregistration development config digest",
+  );
+  const catalog = canonicalCatalogProvenance(
+    preregistration.catalog,
+    "Paired preregistration catalog",
+  );
+  const categoryProjectionDigest = normalizeSha256Digest(
+    boundedString(
+      preregistration.categoryProjectionDigest,
+      "Paired preregistration category projection digest",
+      128,
+    ),
+    "Paired preregistration category projection digest",
+  );
+
+  const categoryFeature = exactRecord(preregistration.categoryFeature, [
+    "source",
+    "mapping",
+    "token",
+    "aggregation",
+    "missing",
+    "forbiddenInputs",
+  ], "Paired preregistration category feature");
+  const forbiddenInputs = [
+    "t1",
+    "inferred",
+    "full",
+    "count",
+    "category-name",
+    "category-group",
+  ] as const;
+  if (
+    categoryFeature.source !== "t2.directNames"
+    || categoryFeature.mapping !== "effective-catalog-category-ids"
+    || categoryFeature.token !== "t2.directCategoryId=<decimal>"
+    || categoryFeature.aggregation !== "sorted-unique-union"
+    || categoryFeature.missing !== "reject"
+    || canonicalJson(categoryFeature.forbiddenInputs)
+      !== canonicalJson(forbiddenInputs)
+  ) {
+    throw new TypeError("Paired preregistration category feature does not match");
+  }
+
+  const cohortPolicy = exactRecord(preregistration.cohortPolicy, [
+    "developmentDomains",
+    "holdoutDomains",
+    "sourceIdentity",
+    "selection",
+    "salt",
+    "developmentSelection",
+    "holdoutSelection",
+    "overlap",
+    "preScreen",
+    "replacement",
+  ], "Paired preregistration cohort policy");
+  if (
+    cohortPolicy.developmentDomains !== SHADOW_EVALUATION_DOMAIN_COUNT
+    || cohortPolicy.holdoutDomains !== SHADOW_EVALUATION_DOMAIN_COUNT
+    || cohortPolicy.sourceIdentity !== "delegated-to-immutable-manifest"
+    || cohortPolicy.selection !== "sha256-rank-without-replacement-v1"
+    || cohortPolicy.salt !== SHADOW_PAIRED_COHORT_SALT
+    || cohortPolicy.developmentSelection !== "first-200-after-d1-exclusion"
+    || cohortPolicy.holdoutSelection !== "next-200-after-d1-exclusion"
+    || cohortPolicy.overlap !== "zero-canonical-d1-d2-h1"
+    || cohortPolicy.preScreen !== "none"
+    || cohortPolicy.replacement !== "none-after-freeze"
+  ) {
+    throw new TypeError("Paired preregistration cohort policy does not match");
+  }
+  const featureSets = [
+    SHADOW_BASELINE_FEATURE_SET,
+    SHADOW_CATEGORY_FEATURE_SET,
+  ] as const;
+  if (canonicalJson(preregistration.featureSets) !== canonicalJson(featureSets)) {
+    throw new TypeError("Paired preregistration feature sets do not match");
+  }
+  const salts = exactRecord(
+    preregistration.salts,
+    Object.keys(SHADOW_CALIBRATION_SALTS),
+    "Paired preregistration salts",
+  );
+  if (canonicalJson(salts) !== canonicalJson(SHADOW_CALIBRATION_SALTS)) {
+    throw new TypeError("Paired preregistration salts do not match");
+  }
+  const guardrails = exactRecord(preregistration.guardrails, [
+    "canonicalDirectNameRetentionMinimum",
+    "domainTechnologyPairRetentionMinimum",
+    "realBrowserCostMaximum",
+  ], "Paired preregistration guardrails");
+  if (
+    guardrails.canonicalDirectNameRetentionMinimum !== 0.95
+    || guardrails.domainTechnologyPairRetentionMinimum !== 0.8
+    || guardrails.realBrowserCostMaximum !== SHADOW_REAL_BROWSER_COST_MAXIMUM
+  ) {
+    throw new TypeError("Paired preregistration guardrails do not match");
+  }
+  const foldWin = exactRecord(preregistration.foldWin, [
+    "minimumCategoryWins",
+    "scope",
+    "pairLift",
+    "novelNameCoverage",
+    "rule",
+    "requirePositiveTriggerQuotaEachFold",
+    "globalT2Union",
+    "interpretation",
+  ], "Paired preregistration fold-win rule");
+  if (
+    foldWin.minimumCategoryWins !== SHADOW_CATEGORY_FOLD_WIN_MINIMUM
+    || foldWin.scope !== "trigger-only"
+    || foldWin.pairLift !== "sum-full-minus-t2"
+    || foldWin.novelNameCoverage
+      !== "selected-full-union-minus-global-t2-union"
+    || foldWin.rule !== "componentwise-non-regression-with-one-strict"
+    || foldWin.requirePositiveTriggerQuotaEachFold !== true
+    || foldWin.globalT2Union !== "same-cohort-union-shared-by-arms"
+    || foldWin.interpretation !== "stability-heuristic-not-statistical-test"
+  ) {
+    throw new TypeError("Paired preregistration fold-win rule does not match");
+  }
+
+  return Object.freeze({
+    schemaVersion: 1 as const,
+    experimentRevision: SHADOW_PAIRED_EXPERIMENT_REVISION,
+    baselineImplementationCommit,
+    discoveryArtifactDigest,
+    discoveryDomainSetDigest,
+    discoveryScannerVersion: "0.1.5" as const,
+    expectedDevelopmentScannerVersion,
+    expectedDevelopmentConfigDigest,
+    catalog,
+    protocolRevision: SHADOW_EVALUATION_PROTOCOL_REVISION,
+    categoryProjectionDigest,
+    categoryFeature: Object.freeze({
+      source: "t2.directNames" as const,
+      mapping: "effective-catalog-category-ids" as const,
+      token: "t2.directCategoryId=<decimal>" as const,
+      aggregation: "sorted-unique-union" as const,
+      missing: "reject" as const,
+      forbiddenInputs: Object.freeze(forbiddenInputs),
+    }),
+    cohortPolicy: Object.freeze({
+      developmentDomains: SHADOW_EVALUATION_DOMAIN_COUNT,
+      holdoutDomains: SHADOW_EVALUATION_DOMAIN_COUNT,
+      sourceIdentity: "delegated-to-immutable-manifest" as const,
+      selection: "sha256-rank-without-replacement-v1" as const,
+      salt: SHADOW_PAIRED_COHORT_SALT,
+      developmentSelection: "first-200-after-d1-exclusion" as const,
+      holdoutSelection: "next-200-after-d1-exclusion" as const,
+      overlap: "zero-canonical-d1-d2-h1" as const,
+      preScreen: "none" as const,
+      replacement: "none-after-freeze" as const,
+    }),
+    featureSets: Object.freeze(featureSets),
+    foldCount: SHADOW_EVALUATION_FOLD_COUNT,
+    triggerDomainCount: SHADOW_TRIGGER_DOMAIN_CAP,
+    controlDomainCount: SHADOW_CONTROL_DOMAIN_COUNT,
+    smoothingPrior: SHADOW_CALIBRATION_SMOOTHING_PRIOR,
+    recurringNameMinimumSupport: SHADOW_RECURRING_NAME_MINIMUM_SUPPORT,
+    salts: SHADOW_CALIBRATION_SALTS,
+    guardrails: Object.freeze({
+      canonicalDirectNameRetentionMinimum: 0.95 as const,
+      domainTechnologyPairRetentionMinimum: 0.8 as const,
+      realBrowserCostMaximum: SHADOW_REAL_BROWSER_COST_MAXIMUM,
+    }),
+    foldWin: Object.freeze({
+      minimumCategoryWins: SHADOW_CATEGORY_FOLD_WIN_MINIMUM,
+      scope: "trigger-only" as const,
+      pairLift: "sum-full-minus-t2" as const,
+      novelNameCoverage:
+        "selected-full-union-minus-global-t2-union" as const,
+      rule: "componentwise-non-regression-with-one-strict" as const,
+      requirePositiveTriggerQuotaEachFold: true as const,
+      globalT2Union: "same-cohort-union-shared-by-arms" as const,
+      interpretation: "stability-heuristic-not-statistical-test" as const,
+    }),
+    controlsIncludedInGlobalGuardrails: true as const,
+    decisionRule:
+      "baseline-first-else-category-if-eligible-else-no-go" as const,
+  });
+}
+
+export function validateShadowPairedCohortManifest(
+  value: unknown,
+): ShadowPairedCohortManifest {
+  const rawRole = typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>).role
+    : undefined;
+  const manifest = exactRecord(value, [
+    "schemaVersion",
+    "experimentRevision",
+    "role",
+    "preregistrationDigest",
+    "input",
+    "expected",
+    "source",
+    "sampling",
+    "zeroOverlapWith",
+    ...(rawRole === "development" ? ["sealedHoldoutManifestDigest"] : []),
+  ], "Paired cohort manifest");
+  if (
+    manifest.schemaVersion !== 1
+    || manifest.experimentRevision !== SHADOW_PAIRED_EXPERIMENT_REVISION
+    || (manifest.role !== "development" && manifest.role !== "holdout")
+  ) {
+    throw new TypeError("Paired cohort manifest identity does not match");
+  }
+  const role = manifest.role;
+  const sealedHoldoutManifestDigest = role === "development"
+    ? normalizeSha256Digest(
+      boundedString(
+        manifest.sealedHoldoutManifestDigest,
+        "Paired development sealed holdout manifest digest",
+        128,
+      ),
+      "Paired development sealed holdout manifest digest",
+    )
+    : undefined;
+  const preregistrationDigest = normalizeSha256Digest(
+    boundedString(
+      manifest.preregistrationDigest,
+      "Paired cohort manifest preregistration digest",
+      128,
+    ),
+    "Paired cohort manifest preregistration digest",
+  );
+  const input = exactRecord(
+    manifest.input,
+    ["fileDigest", "domainSetDigest", "domains"],
+    "Paired cohort manifest input",
+  );
+  if (input.domains !== SHADOW_EVALUATION_DOMAIN_COUNT) {
+    throw new TypeError("Paired cohort manifest requires exactly 200 domains");
+  }
+  const canonicalInput = Object.freeze({
+    fileDigest: normalizeSha256Digest(
+      boundedString(input.fileDigest, "Paired cohort input file digest", 128),
+      "Paired cohort input file digest",
+    ),
+    domainSetDigest: normalizeSha256Digest(
+      boundedString(
+        input.domainSetDigest,
+        "Paired cohort input domain-set digest",
+        128,
+      ),
+      "Paired cohort input domain-set digest",
+    ),
+    domains: SHADOW_EVALUATION_DOMAIN_COUNT,
+  });
+  const expected = exactRecord(manifest.expected, [
+    "scannerVersion",
+    "configDigest",
+    "catalog",
+    "schemaVersion",
+    "protocolRevision",
+  ], "Paired cohort expected identity");
+  if (
+    expected.schemaVersion !== 1
+    || expected.protocolRevision !== SHADOW_EVALUATION_PROTOCOL_REVISION
+  ) {
+    throw new TypeError("Paired cohort expected protocol does not match");
+  }
+  const canonicalExpected = Object.freeze({
+    scannerVersion: boundedString(
+      expected.scannerVersion,
+      "Paired cohort expected scanner version",
+      128,
+    ),
+    configDigest: normalizeSha256Digest(
+      boundedString(
+        expected.configDigest,
+        "Paired cohort expected config digest",
+        128,
+      ),
+      "Paired cohort expected config digest",
+    ),
+    catalog: canonicalCatalogProvenance(
+      expected.catalog,
+      "Paired cohort expected catalog",
+    ),
+    schemaVersion: 1 as const,
+    protocolRevision: SHADOW_EVALUATION_PROTOCOL_REVISION,
+  });
+  const source = exactRecord(
+    manifest.source,
+    ["name", "revision", "digest"],
+    "Paired cohort source",
+  );
+  const canonicalSource = Object.freeze({
+    name: boundedString(source.name, "Paired cohort source name", 1_024),
+    revision: boundedString(source.revision, "Paired cohort source revision", 1_024),
+    digest: normalizeSha256Digest(
+      boundedString(source.digest, "Paired cohort source digest", 128),
+      "Paired cohort source digest",
+    ),
+  });
+  const sampling = exactRecord(
+    manifest.sampling,
+    ["revision", "salt"],
+    "Paired cohort sampling",
+  );
+  if (
+    sampling.revision !== "sha256-rank-without-replacement-v1"
+    || sampling.salt !== SHADOW_PAIRED_COHORT_SALT
+  ) {
+    throw new TypeError("Paired cohort sampling does not match preregistration");
+  }
+  const canonicalSampling = Object.freeze({
+    revision: "sha256-rank-without-replacement-v1" as const,
+    salt: SHADOW_PAIRED_COHORT_SALT,
+  });
+  if (!Array.isArray(manifest.zeroOverlapWith)) {
+    throw new TypeError("Paired cohort zero-overlap proof must be an array");
+  }
+  const requiredLabels = role === "development"
+    ? ["D1"] as const
+    : ["D1", "D2"] as const;
+  if (manifest.zeroOverlapWith.length !== requiredLabels.length) {
+    throw new TypeError("Paired cohort zero-overlap proof is incomplete");
+  }
+  const zeroOverlapWith = manifest.zeroOverlapWith.map((value, index) => {
+    const proof = exactRecord(
+      value,
+      ["label", "domainSetDigest", "domains"],
+      `Paired cohort zero-overlap proof ${index}`,
+    );
+    if (proof.label !== requiredLabels[index]) {
+      throw new TypeError("Paired cohort zero-overlap labels do not match role");
+    }
+    if (
+      !Array.isArray(proof.domains)
+      || proof.domains.length !== SHADOW_EVALUATION_DOMAIN_COUNT
+    ) {
+      throw new TypeError("Paired cohort zero-overlap proof requires 200 domains");
+    }
+    const domains = proof.domains.map((domain, domainIndex) => boundedString(
+      domain,
+      `Paired cohort zero-overlap domain ${domainIndex}`,
+      253,
+    )).sort(compareString);
+    const computedDigest = computeDomainSetDigest(domains);
+    const pinnedDigest = normalizeSha256Digest(
+      boundedString(
+        proof.domainSetDigest,
+        "Paired cohort zero-overlap domain-set digest",
+        128,
+      ),
+      "Paired cohort zero-overlap domain-set digest",
+    );
+    if (computedDigest !== pinnedDigest) {
+      throw new TypeError("Paired cohort zero-overlap digest does not match domains");
+    }
+    return Object.freeze({
+      label: proof.label as "D1" | "D2",
+      domainSetDigest: pinnedDigest,
+      domains: Object.freeze(domains),
+    });
+  });
+  const canonical = {
+    schemaVersion: 1 as const,
+    experimentRevision:
+      SHADOW_PAIRED_EXPERIMENT_REVISION as typeof SHADOW_PAIRED_EXPERIMENT_REVISION,
+    role,
+    preregistrationDigest,
+    input: canonicalInput,
+    expected: canonicalExpected,
+    source: canonicalSource,
+    sampling: canonicalSampling,
+    zeroOverlapWith: Object.freeze(zeroOverlapWith),
+  };
+  return role === "development"
+    ? Object.freeze({
+      ...canonical,
+      role: "development" as const,
+      sealedHoldoutManifestDigest: sealedHoldoutManifestDigest!,
+    })
+    : Object.freeze({ ...canonical, role: "holdout" as const });
+}
+
 function incrementalPairLift(snapshot: ShadowEvaluationSnapshot): number {
   const baseline = new Set(directNames(snapshot.t2));
   let lift = 0;
@@ -828,6 +1708,7 @@ function trainingObjectives(
 
 function trainMultiHeadModel(
   snapshots: readonly ShadowEvaluationSnapshot[],
+  featureTokens: ShadowFeatureTokenFunction = shadowTriggerFeatureTokens,
 ): TrainedMultiHeadModel {
   if (snapshots.length === 0) {
     throw new TypeError("A calibration model requires training domains");
@@ -870,7 +1751,7 @@ function trainMultiHeadModel(
       else positiveHeads.push(head);
     }
     rareTargetSum += rareTarget;
-    for (const token of shadowTriggerFeatureTokens(snapshot)) {
+    for (const token of featureTokens(snapshot)) {
       const aggregate = tokenAggregates.get(token) ?? {
         domains: 0,
         pairTargetSum: 0,
@@ -1325,6 +2206,121 @@ export function validateShadowFrozenCandidate(value: unknown): ShadowFrozenCandi
   return canonical;
 }
 
+export function validateShadowPairedFrozenCandidate(
+  value: unknown,
+): ShadowPairedFrozenCandidate {
+  const candidate = exactRecord(value, [
+    "kind",
+    "experimentRevision",
+    "featureSet",
+    "preregistrationDigest",
+    "trainingCohort",
+    "categoryProjectionDigest",
+    "model",
+  ], "Paired frozen candidate");
+  if (
+    candidate.kind !== SHADOW_PAIRED_CANDIDATE_KIND
+    || candidate.experimentRevision !== SHADOW_PAIRED_EXPERIMENT_REVISION
+    || (
+      candidate.featureSet !== SHADOW_BASELINE_FEATURE_SET
+      && candidate.featureSet !== SHADOW_CATEGORY_FEATURE_SET
+    )
+  ) {
+    throw new TypeError("Paired frozen candidate identity does not match");
+  }
+  const preregistrationDigest = normalizeSha256Digest(
+    boundedString(
+      candidate.preregistrationDigest,
+      "Paired frozen candidate preregistration digest",
+      128,
+    ),
+    "Paired frozen candidate preregistration digest",
+  );
+  const categoryProjectionDigest = normalizeSha256Digest(
+    boundedString(
+      candidate.categoryProjectionDigest,
+      "Paired frozen candidate category projection digest",
+      128,
+    ),
+    "Paired frozen candidate category projection digest",
+  );
+  const trainingCohort = exactRecord(candidate.trainingCohort, [
+    "manifestDigest",
+    "sealedHoldoutManifestDigest",
+    "source",
+    "sampling",
+  ], "Paired frozen candidate training cohort");
+  const manifestDigest = normalizeSha256Digest(
+    boundedString(
+      trainingCohort.manifestDigest,
+      "Paired frozen candidate training manifest digest",
+      128,
+    ),
+    "Paired frozen candidate training manifest digest",
+  );
+  const sealedHoldoutManifestDigest = normalizeSha256Digest(
+    boundedString(
+      trainingCohort.sealedHoldoutManifestDigest,
+      "Paired frozen candidate sealed holdout manifest digest",
+      128,
+    ),
+    "Paired frozen candidate sealed holdout manifest digest",
+  );
+  const source = exactRecord(
+    trainingCohort.source,
+    ["name", "revision", "digest"],
+    "Paired frozen candidate training source",
+  );
+  const canonicalSource = Object.freeze({
+    name: boundedString(
+      source.name,
+      "Paired frozen candidate training source name",
+      1_024,
+    ),
+    revision: boundedString(
+      source.revision,
+      "Paired frozen candidate training source revision",
+      1_024,
+    ),
+    digest: normalizeSha256Digest(
+      boundedString(
+        source.digest,
+        "Paired frozen candidate training source digest",
+        128,
+      ),
+      "Paired frozen candidate training source digest",
+    ),
+  });
+  const sampling = exactRecord(
+    trainingCohort.sampling,
+    ["revision", "salt"],
+    "Paired frozen candidate training sampling",
+  );
+  if (
+    sampling.revision !== "sha256-rank-without-replacement-v1"
+    || sampling.salt !== SHADOW_PAIRED_COHORT_SALT
+  ) {
+    throw new TypeError("Paired frozen candidate sampling does not match");
+  }
+  return Object.freeze({
+    kind: SHADOW_PAIRED_CANDIDATE_KIND,
+    experimentRevision: SHADOW_PAIRED_EXPERIMENT_REVISION,
+    featureSet: candidate.featureSet,
+    preregistrationDigest,
+    trainingCohort: Object.freeze({
+      manifestDigest,
+      sealedHoldoutManifestDigest,
+      source: canonicalSource,
+      sampling: Object.freeze({
+        revision: "sha256-rank-without-replacement-v1" as const,
+        salt: SHADOW_PAIRED_COHORT_SALT,
+      }),
+    }),
+    categoryProjectionDigest,
+    model: validateShadowFrozenCandidate(candidate.model),
+  });
+}
+
 function modelFromCandidate(candidate: ShadowFrozenCandidate): TrainedMultiHeadModel {
   return Object.freeze({
     trainingDomains: candidate.trainingDomains,
@@ -1356,6 +2352,36 @@ function canonicalJson(value: unknown): string {
     `${JSON.stringify(key)}:${canonicalJson(record[key])}`).join(",")}}`;
 }
 
+export function canonicalizeShadowT2CategoryProjection(value: unknown): string {
+  return canonicalJson(validateShadowT2CategoryProjection(value));
+}
+
+export function digestShadowT2CategoryProjection(value: unknown): string {
+  return `sha256:${createHash("sha256")
+    .update(canonicalizeShadowT2CategoryProjection(value), "utf8")
+    .digest("hex")}`;
+}
+
+export function canonicalizeShadowPairedPreregistration(value: unknown): string {
+  return `${canonicalJson(validateShadowPairedPreregistration(value))}\n`;
+}
+
+export function digestShadowPairedPreregistration(value: unknown): string {
+  return `sha256:${createHash("sha256")
+    .update(canonicalizeShadowPairedPreregistration(value), "utf8")
+    .digest("hex")}`;
+}
+
+export function canonicalizeShadowPairedCohortManifest(value: unknown): string {
+  return `${canonicalJson(validateShadowPairedCohortManifest(value))}\n`;
+}
+
+export function digestShadowPairedCohortManifest(value: unknown): string {
+  return `sha256:${createHash("sha256")
+    .update(canonicalizeShadowPairedCohortManifest(value), "utf8")
+    .digest("hex")}`;
+}
+
 export function canonicalizeShadowFrozenCandidate(value: unknown): string {
   return canonicalJson(validateShadowFrozenCandidate(value));
 }
@@ -1363,6 +2389,16 @@ export function canonicalizeShadowFrozenCandidate(value: unknown): string {
 export function digestShadowFrozenCandidate(value: unknown): string {
   return `sha256:${createHash("sha256")
     .update(canonicalizeShadowFrozenCandidate(value), "utf8")
+    .digest("hex")}`;
+}
+
+export function canonicalizeShadowPairedFrozenCandidate(value: unknown): string {
+  return `${canonicalJson(validateShadowPairedFrozenCandidate(value))}\n`;
+}
+
+export function digestShadowPairedFrozenCandidate(value: unknown): string {
+  return `sha256:${createHash("sha256")
+    .update(canonicalizeShadowPairedFrozenCandidate(value), "utf8")
     .digest("hex")}`;
 }
 
@@ -1376,6 +2412,12 @@ export interface ShadowFrozenCandidateCompatibilityInput {
 
 export interface ShadowFrozenHoldoutOptions {
   readonly candidateDigest: string;
+}
+
+export interface ShadowPairedFrozenHoldoutOptions
+  extends ShadowFrozenHoldoutOptions {
+  readonly preregistrationDigest: string;
+  readonly cohortManifestDigest: string;
 }
 
 export function assertShadowFrozenCandidateCompatibility(
@@ -1408,12 +2450,13 @@ export function predictShadowSnapshot(
 function trainFoldModel(
   snapshots: readonly ShadowEvaluationSnapshot[],
   heldOutFold: number,
+  featureTokens: ShadowFeatureTokenFunction = shadowTriggerFeatureTokens,
 ): FoldModel {
   const training = snapshots.filter(
     (snapshot) => shadowFoldForDomain(snapshot.domain) !== heldOutFold,
   );
   const heldOutDomains = snapshots.length - training.length;
-  const model = trainMultiHeadModel(training);
+  const model = trainMultiHeadModel(training, featureTokens);
   return Object.freeze({
     model,
     metadata: Object.freeze({
@@ -1446,9 +2489,10 @@ function deploymentTokenEstimate(
 
 function predictWithModel(
   model: TrainedMultiHeadModel,
-  snapshot: Pick<ShadowEvaluationSnapshot, "t1" | "t2" | "preBrowser">,
+  snapshot: ShadowFeatureInput,
+  featureTokensForSnapshot: ShadowFeatureTokenFunction = shadowTriggerFeatureTokens,
 ): ShadowTriggerPrediction {
-  const featureTokens = shadowTriggerFeatureTokens(snapshot);
+  const featureTokens = featureTokensForSnapshot(snapshot);
   const matched = featureTokens
     .map((token) => model.tokens.get(token))
     .filter((aggregate): aggregate is TokenAggregate => aggregate !== undefined);
@@ -1494,20 +2538,21 @@ function predictWithModel(
 
 function scoreSnapshots(
   snapshots: readonly ShadowEvaluationSnapshot[],
+  featureTokens: ShadowFeatureTokenFunction = shadowTriggerFeatureTokens,
 ): {
   readonly models: readonly FoldModel[];
   readonly scored: readonly ScoredSnapshot[];
 } {
   const models = Array.from(
     { length: SHADOW_EVALUATION_FOLD_COUNT },
-    (_, fold) => trainFoldModel(snapshots, fold),
+    (_, fold) => trainFoldModel(snapshots, fold, featureTokens),
   );
   const baselineNames = t2BaselineNames(snapshots);
   const scored = snapshots.map((snapshot): ScoredSnapshot => {
     const fold = shadowFoldForDomain(snapshot.domain);
     const foldModel = models[fold];
     if (foldModel === undefined) throw new TypeError("Missing calibration fold model");
-    const prediction = predictWithModel(foldModel.model, snapshot);
+    const prediction = predictWithModel(foldModel.model, snapshot, featureTokens);
     return Object.freeze({
       snapshot,
       prediction: Object.freeze({
@@ -2152,12 +3197,13 @@ function publishedPrediction(prediction: InternalShadowPrediction): ShadowOofPre
 
 function developmentCalibration(
   artifact: ShadowEvaluationArtifact,
+  featureTokens: ShadowFeatureTokenFunction = shadowTriggerFeatureTokens,
 ): {
   readonly report: ShadowDevelopmentSourceReport;
   readonly snapshots: readonly ShadowEvaluationSnapshot[];
 } {
   const snapshots = validateArtifact(artifact);
-  const { models, scored } = scoreSnapshots(snapshots);
+  const { models, scored } = scoreSnapshots(snapshots, featureTokens);
   const quotas = foldQuotas(scored);
   const baselineNames = t2BaselineNames(snapshots);
   const triggered: ScoredSnapshot[] = [];
@@ -2281,6 +3327,412 @@ function developmentCalibration(
   return Object.freeze({ report, snapshots });
 }
 
+export function validateShadowPairedDevelopmentSource(
+  value: unknown,
+  artifact: ShadowEvaluationArtifact,
+): ShadowPairedDevelopmentSourceReport {
+  const report = exactRecord(value, [
+    "mode",
+    "experimentRevision",
+    "preregistrationDigest",
+    "cohortManifestDigest",
+    "sealedHoldoutManifestDigest",
+    "categoryProjectionDigest",
+    "source",
+  ], "Paired development source");
+  if (
+    report.mode !== "paired-development-source"
+    || report.experimentRevision !== SHADOW_PAIRED_EXPERIMENT_REVISION
+  ) {
+    throw new TypeError("Paired development source identity does not match");
+  }
+  const canonical = Object.freeze({
+    mode: "paired-development-source" as const,
+    experimentRevision: SHADOW_PAIRED_EXPERIMENT_REVISION,
+    preregistrationDigest: normalizeSha256Digest(
+      boundedString(
+        report.preregistrationDigest,
+        "Paired development source preregistration digest",
+        128,
+      ),
+      "Paired development source preregistration digest",
+    ),
+    cohortManifestDigest: normalizeSha256Digest(
+      boundedString(
+        report.cohortManifestDigest,
+        "Paired development source cohort manifest digest",
+        128,
+      ),
+      "Paired development source cohort manifest digest",
+    ),
+    sealedHoldoutManifestDigest: normalizeSha256Digest(
+      boundedString(
+        report.sealedHoldoutManifestDigest,
+        "Paired development source sealed holdout manifest digest",
+        128,
+      ),
+      "Paired development source sealed holdout manifest digest",
+    ),
+    categoryProjectionDigest: normalizeSha256Digest(
+      boundedString(
+        report.categoryProjectionDigest,
+        "Paired development source category projection digest",
+        128,
+      ),
+      "Paired development source category projection digest",
+    ),
+    source: developmentCalibration(artifact).report,
+  });
+  if (canonicalJson(report.source) !== canonicalJson(canonical.source)) {
+    throw new TypeError("Paired development source does not match its artifact");
+  }
+  return canonical;
+}
+
+export function createShadowPairedDevelopmentSource(
+  artifact: ShadowEvaluationArtifact,
+  options: ShadowPairedDevelopmentSourceOptions,
+): ShadowPairedDevelopmentSourceReport {
+  return validateShadowPairedDevelopmentSource({
+    mode: "paired-development-source",
+    experimentRevision: SHADOW_PAIRED_EXPERIMENT_REVISION,
+    preregistrationDigest: options.preregistrationDigest,
+    cohortManifestDigest: options.cohortManifestDigest,
+    sealedHoldoutManifestDigest: options.sealedHoldoutManifestDigest,
+    categoryProjectionDigest: options.categoryProjectionDigest,
+    source: developmentCalibration(artifact).report,
+  }, artifact);
+}
+
+export function canonicalizeShadowPairedDevelopmentSource(
+  value: unknown,
+  artifact: ShadowEvaluationArtifact,
+): string {
+  return `${canonicalJson(validateShadowPairedDevelopmentSource(value, artifact))}\n`;
+}
+
+function foldTriggerOutcome(
+  report: ShadowDevelopmentSourceReport,
+  snapshots: readonly ShadowEvaluationSnapshot[],
+  fold: number,
+  globalT2Names: ReadonlySet<string>,
+): ShadowFoldTriggerOutcome {
+  const selectedDomains = new Set(report.deployable.selected
+    .filter((selected) => selected.source === "trigger" && selected.fold === fold)
+    .map(({ domain }) => domain));
+  if (selectedDomains.size === 0) {
+    throw new TypeError("Every paired fold must have a positive trigger quota");
+  }
+  let pairLift = 0;
+  const novelNames = new Set<string>();
+  for (const snapshot of snapshots) {
+    if (!selectedDomains.has(snapshot.domain)) continue;
+    pairLift += incrementalPairLift(snapshot);
+    for (const name of snapshot.full.directNames) {
+      if (!globalT2Names.has(name)) novelNames.add(name);
+    }
+  }
+  return Object.freeze({
+    fold,
+    triggerDomainCount: selectedDomains.size,
+    pairLift,
+    novelNameCoverage: novelNames.size,
+  });
+}
+
+export function decideShadowPairedExperiment(
+  baselinePassed: boolean,
+  categoryPassed: boolean,
+  categoryFoldWins: number,
+): ShadowPairedDecision {
+  if (
+    typeof baselinePassed !== "boolean"
+    || typeof categoryPassed !== "boolean"
+    || !Number.isSafeInteger(categoryFoldWins)
+    || categoryFoldWins < 0
+    || categoryFoldWins > SHADOW_EVALUATION_FOLD_COUNT
+  ) {
+    throw new TypeError("Paired experiment decision inputs are invalid");
+  }
+  if (baselinePassed) {
+    return Object.freeze({
+      selectedFeatureSet: SHADOW_BASELINE_FEATURE_SET,
+      reason: "baseline-passed-all-official-gates" as const,
+    });
+  }
+  if (
+    categoryPassed
+    && categoryFoldWins >= SHADOW_CATEGORY_FOLD_WIN_MINIMUM
+  ) {
+    return Object.freeze({
+      selectedFeatureSet: SHADOW_CATEGORY_FEATURE_SET,
+      reason:
+        "category-passed-all-official-gates-and-fold-win-minimum" as const,
+    });
+  }
+  return Object.freeze({
+    selectedFeatureSet: null,
+    reason: "no-arm-eligible" as const,
+  });
+}
+
+function sameCatalog(
+  left: CatalogProvenance,
+  right: CatalogProvenance,
+): boolean {
+  return left.source === right.source
+    && left.revision === right.revision
+    && left.digest === right.digest;
+}
+
+function assertPairedDevelopmentIdentity(
+  artifact: ShadowEvaluationArtifact,
+  snapshots: readonly ShadowEvaluationSnapshot[],
+  projection: ShadowT2CategoryProjection,
+  preregistration: ShadowPairedPreregistration,
+  manifest: ShadowPairedCohortManifest,
+  sealedHoldoutManifest: ShadowPairedCohortManifest,
+  preregistrationDigest: string,
+  manifestDigest: string,
+  sealedHoldoutManifestDigest: string,
+): void {
+  if (manifest.role !== "development") {
+    throw new TypeError("Paired development requires a development manifest");
+  }
+  if (
+    manifest.preregistrationDigest !== preregistrationDigest
+    || digestShadowPairedCohortManifest(manifest) !== manifestDigest
+    || computeDomainSetDigest(snapshots.map(({ domain }) => domain))
+      !== manifest.input.domainSetDigest
+    || artifact.schemaVersion !== manifest.expected.schemaVersion
+    || artifact.protocolRevision !== manifest.expected.protocolRevision
+    || artifact.provenance.scannerVersion !== manifest.expected.scannerVersion
+    || artifact.provenance.configDigest !== manifest.expected.configDigest
+    || !sameCatalog(artifact.provenance.catalog, manifest.expected.catalog)
+  ) {
+    throw new TypeError("Paired development artifact does not match its manifest");
+  }
+  if (
+    manifest.sealedHoldoutManifestDigest !== sealedHoldoutManifestDigest
+    || sealedHoldoutManifest.role !== "holdout"
+    || digestShadowPairedCohortManifest(sealedHoldoutManifest)
+      !== sealedHoldoutManifestDigest
+    || sealedHoldoutManifest.preregistrationDigest !== preregistrationDigest
+    || sealedHoldoutManifest.source.name !== manifest.source.name
+    || sealedHoldoutManifest.source.revision !== manifest.source.revision
+    || sealedHoldoutManifest.source.digest !== manifest.source.digest
+    || sealedHoldoutManifest.sampling.revision !== manifest.sampling.revision
+    || sealedHoldoutManifest.sampling.salt !== manifest.sampling.salt
+    || sealedHoldoutManifest.expected.scannerVersion
+      !== manifest.expected.scannerVersion
+    || sealedHoldoutManifest.expected.configDigest
+      !== manifest.expected.configDigest
+    || !sameCatalog(
+      sealedHoldoutManifest.expected.catalog,
+      manifest.expected.catalog,
+    )
+  ) {
+    throw new TypeError("Development manifest does not match its sealed holdout");
+  }
+  if (
+    preregistration.expectedDevelopmentScannerVersion
+      !== manifest.expected.scannerVersion
+    || preregistration.expectedDevelopmentConfigDigest
+      !== manifest.expected.configDigest
+    || !sameCatalog(preregistration.catalog, manifest.expected.catalog)
+    || !sameCatalog(projection.catalog, preregistration.catalog)
+    || digestShadowT2CategoryProjection(projection)
+      !== preregistration.categoryProjectionDigest
+  ) {
+    throw new TypeError("Paired development identities do not match preregistration");
+  }
+  const d1 = manifest.zeroOverlapWith[0];
+  const sealedD1 = sealedHoldoutManifest.zeroOverlapWith[0];
+  const sealedD2 = sealedHoldoutManifest.zeroOverlapWith[1];
+  const developmentDomainSetDigest = computeDomainSetDigest(
+    snapshots.map(({ domain }) => domain),
+  );
+  if (
+    d1?.label !== "D1"
+    || d1.domainSetDigest !== preregistration.discoveryDomainSetDigest
+    || sealedD1?.label !== "D1"
+    || sealedD1.domainSetDigest !== preregistration.discoveryDomainSetDigest
+    || sealedD2?.label !== "D2"
+    || sealedD2.domainSetDigest !== developmentDomainSetDigest
+    || sealedHoldoutManifest.input.domainSetDigest === developmentDomainSetDigest
+    || sealedHoldoutManifest.input.domainSetDigest
+      === preregistration.discoveryDomainSetDigest
+  ) {
+    throw new TypeError("Development manifests do not prove the frozen cohorts");
+  }
+  const currentDomains = new Set(snapshots.map(({ domain }) => domain));
+  if (d1.domains.some((domain) => currentDomains.has(domain))) {
+    throw new TypeError("Development cohort overlaps the discovery cohort");
+  }
+}
+
+export function calibrateShadowPairedDevelopment(
+  artifact: ShadowEvaluationArtifact,
+  developmentSourceValue: unknown,
+  projectionValue: unknown,
+  preregistrationValue: unknown,
+  manifestValue: unknown,
+  sealedHoldoutManifestValue: unknown,
+  options: ShadowPairedDevelopmentOptions,
+): ShadowPairedDevelopmentReport {
+  const snapshots = validateArtifact(artifact);
+  const developmentSource = validateShadowPairedDevelopmentSource(
+    developmentSourceValue,
+    artifact,
+  );
+  const projection = validateShadowT2CategoryProjection(projectionValue);
+  const preregistration = validateShadowPairedPreregistration(
+    preregistrationValue,
+  );
+  const manifest = validateShadowPairedCohortManifest(manifestValue);
+  const sealedHoldoutManifest = validateShadowPairedCohortManifest(
+    sealedHoldoutManifestValue,
+  );
+  const preregistrationDigest = normalizeSha256Digest(
+    options.preregistrationDigest,
+    "Pinned preregistration digest",
+  );
+  const cohortManifestDigest = normalizeSha256Digest(
+    options.cohortManifestDigest,
+    "Pinned cohort manifest digest",
+  );
+  const sealedHoldoutManifestDigest = normalizeSha256Digest(
+    options.sealedHoldoutManifestDigest,
+    "Pinned sealed holdout manifest digest",
+  );
+  const computedPreregistrationDigest = digestShadowPairedPreregistration(
+    preregistration,
+  );
+  if (preregistrationDigest !== computedPreregistrationDigest) {
+    throw new TypeError("Pinned preregistration digest does not match preregistration");
+  }
+  assertPairedDevelopmentIdentity(
+    artifact,
+    snapshots,
+    projection,
+    preregistration,
+    manifest,
+    sealedHoldoutManifest,
+    preregistrationDigest,
+    cohortManifestDigest,
+    sealedHoldoutManifestDigest,
+  );
+  const categoryProjectionDigest = digestShadowT2CategoryProjection(projection);
+  if (
+    developmentSource.preregistrationDigest !== preregistrationDigest
+    || developmentSource.cohortManifestDigest !== cohortManifestDigest
+    || developmentSource.sealedHoldoutManifestDigest
+      !== sealedHoldoutManifestDigest
+    || developmentSource.categoryProjectionDigest !== categoryProjectionDigest
+  ) {
+    throw new TypeError("Paired development source boundary does not match");
+  }
+  if (
+    options.expectedEvaluationScannerVersion
+      !== preregistration.expectedDevelopmentScannerVersion
+    || options.expectedEvaluationConfigDigest
+      !== preregistration.expectedDevelopmentConfigDigest
+  ) {
+    throw new TypeError(
+      "Paired candidate evaluation identity must match preregistration",
+    );
+  }
+
+  const categoryFeatureTokens = categoryFeatureTokenFunction(projection);
+  // ponytail: the bound baseline and direct category run keep arm state isolated.
+  const baseline = developmentSource.source;
+  const category = developmentCalibration(artifact, categoryFeatureTokens).report;
+  const globalT2Names = t2BaselineNames(snapshots);
+  const foldComparisons = Object.freeze(Array.from(
+    { length: SHADOW_EVALUATION_FOLD_COUNT },
+    (_, fold): ShadowPairedFoldComparison => {
+      const baselineOutcome = foldTriggerOutcome(
+        baseline,
+        snapshots,
+        fold,
+        globalT2Names,
+      );
+      const categoryOutcome = foldTriggerOutcome(
+        category,
+        snapshots,
+        fold,
+        globalT2Names,
+      );
+      const categoryWon = categoryOutcome.pairLift >= baselineOutcome.pairLift
+        && categoryOutcome.novelNameCoverage
+          >= baselineOutcome.novelNameCoverage
+        && (
+          categoryOutcome.pairLift > baselineOutcome.pairLift
+          || categoryOutcome.novelNameCoverage
+            > baselineOutcome.novelNameCoverage
+        );
+      return Object.freeze({
+        fold,
+        baseline: baselineOutcome,
+        category: categoryOutcome,
+        categoryWon,
+      });
+    },
+  ));
+  const categoryFoldWins = foldComparisons.filter(
+    ({ categoryWon }) => categoryWon,
+  ).length;
+  const decision = decideShadowPairedExperiment(
+    baseline.deployable.provisionalGuardrails.passed,
+    category.deployable.provisionalGuardrails.passed,
+    categoryFoldWins,
+  );
+  const trainingArtifactDigest = normalizeSha256Digest(
+    options.trainingArtifactDigest,
+    "Training artifact digest",
+  );
+  let candidate: ShadowPairedFrozenCandidate | null = null;
+  if (decision.selectedFeatureSet !== null) {
+    const selectedFeatureTokens = decision.selectedFeatureSet
+      === SHADOW_CATEGORY_FEATURE_SET
+      ? categoryFeatureTokens
+      : shadowTriggerFeatureTokens;
+    candidate = validateShadowPairedFrozenCandidate({
+      kind: SHADOW_PAIRED_CANDIDATE_KIND,
+      experimentRevision: SHADOW_PAIRED_EXPERIMENT_REVISION,
+      featureSet: decision.selectedFeatureSet,
+      preregistrationDigest,
+      trainingCohort: {
+        manifestDigest: cohortManifestDigest,
+        sealedHoldoutManifestDigest,
+        source: manifest.source,
+        sampling: manifest.sampling,
+      },
+      categoryProjectionDigest,
+      model: buildFrozenCandidate(
+        trainMultiHeadModel(snapshots, selectedFeatureTokens),
+        artifact,
+        { ...options, trainingArtifactDigest },
+      ),
+    });
+  }
+  return Object.freeze({
+    mode: "paired-development-oof" as const,
+    experimentRevision: SHADOW_PAIRED_EXPERIMENT_REVISION,
+    preregistrationDigest,
+    cohortManifestDigest,
+    sealedHoldoutManifestDigest,
+    categoryProjectionDigest,
+    trainingArtifactDigest,
+    baseline,
+    category,
+    foldComparisons,
+    categoryFoldWins,
+    decision,
+    candidate,
+  });
+}
+
 export function calibrateShadowDevelopmentSource(
   artifact: ShadowEvaluationArtifact,
 ): ShadowDevelopmentSourceReport {
@@ -2311,10 +3763,11 @@ export function calibrateShadowDevelopment(
   });
 }
 
-export function evaluateFrozenShadowCandidate(
+function evaluateFrozenShadowCandidateWithFeatures(
   artifact: ShadowEvaluationArtifact,
   candidateValue: unknown,
   options: ShadowFrozenHoldoutOptions,
+  featureTokens: ShadowFeatureTokenFunction,
 ): ShadowFrozenHoldoutReport {
   const snapshots = validateArtifact(artifact);
   const candidate = assertShadowFrozenCandidateCompatibility(candidateValue, {
@@ -2341,7 +3794,7 @@ export function evaluateFrozenShadowCandidate(
   }
   const baselineNames = t2BaselineNames(snapshots);
   const scored = snapshots.map((snapshot): ScoredSnapshot => {
-    const prediction = predictWithModel(model, snapshot);
+    const prediction = predictWithModel(model, snapshot, featureTokens);
     return Object.freeze({
       snapshot,
       prediction: Object.freeze({
@@ -2421,5 +3874,122 @@ export function evaluateFrozenShadowCandidate(
       metrics,
       provisionalGuardrails: provisionalGuardrailVerdict(metrics),
     }),
+  });
+}
+
+export function evaluateFrozenShadowCandidate(
+  artifact: ShadowEvaluationArtifact,
+  candidateValue: unknown,
+  options: ShadowFrozenHoldoutOptions,
+): ShadowFrozenHoldoutReport {
+  return evaluateFrozenShadowCandidateWithFeatures(
+    artifact,
+    candidateValue,
+    options,
+    shadowTriggerFeatureTokens,
+  );
+}
+
+export function evaluateFrozenShadowPairedCandidate(
+  artifact: ShadowEvaluationArtifact,
+  projectionValue: unknown,
+  preregistrationValue: unknown,
+  manifestValue: unknown,
+  candidateValue: unknown,
+  options: ShadowPairedFrozenHoldoutOptions,
+): ShadowPairedFrozenHoldoutReport {
+  const snapshots = validateArtifact(artifact);
+  const projection = validateShadowT2CategoryProjection(projectionValue);
+  const preregistration = validateShadowPairedPreregistration(
+    preregistrationValue,
+  );
+  const manifest = validateShadowPairedCohortManifest(manifestValue);
+  const candidate = validateShadowPairedFrozenCandidate(candidateValue);
+  const preregistrationDigest = normalizeSha256Digest(
+    options.preregistrationDigest,
+    "Pinned preregistration digest",
+  );
+  const cohortManifestDigest = normalizeSha256Digest(
+    options.cohortManifestDigest,
+    "Pinned cohort manifest digest",
+  );
+  const candidateDigest = normalizeSha256Digest(
+    options.candidateDigest,
+    "Pinned paired candidate digest",
+  );
+  if (
+    digestShadowPairedPreregistration(preregistration)
+      !== preregistrationDigest
+    || digestShadowPairedCohortManifest(manifest) !== cohortManifestDigest
+    || digestShadowPairedFrozenCandidate(candidate) !== candidateDigest
+    || candidate.preregistrationDigest !== preregistrationDigest
+    || manifest.preregistrationDigest !== preregistrationDigest
+    || candidate.trainingCohort.sealedHoldoutManifestDigest
+      !== cohortManifestDigest
+  ) {
+    throw new TypeError("Pinned paired evaluation digest does not match");
+  }
+  if (
+    manifest.role !== "holdout"
+    || computeDomainSetDigest(snapshots.map(({ domain }) => domain))
+      !== manifest.input.domainSetDigest
+    || artifact.schemaVersion !== manifest.expected.schemaVersion
+    || artifact.protocolRevision !== manifest.expected.protocolRevision
+    || artifact.provenance.scannerVersion !== manifest.expected.scannerVersion
+    || artifact.provenance.configDigest !== manifest.expected.configDigest
+    || !sameCatalog(artifact.provenance.catalog, manifest.expected.catalog)
+    || manifest.expected.scannerVersion
+      !== preregistration.expectedDevelopmentScannerVersion
+    || manifest.expected.configDigest
+      !== preregistration.expectedDevelopmentConfigDigest
+    || !sameCatalog(manifest.expected.catalog, preregistration.catalog)
+    || !sameCatalog(projection.catalog, artifact.provenance.catalog)
+    || candidate.categoryProjectionDigest
+      !== preregistration.categoryProjectionDigest
+    || digestShadowT2CategoryProjection(projection)
+      !== candidate.categoryProjectionDigest
+    || manifest.source.name !== candidate.trainingCohort.source.name
+    || manifest.source.revision !== candidate.trainingCohort.source.revision
+    || manifest.source.digest !== candidate.trainingCohort.source.digest
+    || manifest.sampling.revision !== candidate.trainingCohort.sampling.revision
+    || manifest.sampling.salt !== candidate.trainingCohort.sampling.salt
+  ) {
+    throw new TypeError("Paired holdout identities are incompatible");
+  }
+  const d1 = manifest.zeroOverlapWith[0];
+  const d2 = manifest.zeroOverlapWith[1];
+  if (
+    d1?.label !== "D1"
+    || d1.domainSetDigest !== preregistration.discoveryDomainSetDigest
+    || d2?.label !== "D2"
+    || d2.domainSetDigest !== candidate.model.trainingIdentity.domainSetDigest
+  ) {
+    throw new TypeError("Paired holdout zero-overlap proof does not match");
+  }
+  const currentDomains = new Set(snapshots.map(({ domain }) => domain));
+  if (
+    d1.domains.some((domain) => currentDomains.has(domain))
+    || d2.domains.some((domain) => currentDomains.has(domain))
+  ) {
+    throw new TypeError("Paired holdout overlaps a prior cohort");
+  }
+  const featureTokens = candidate.featureSet === SHADOW_CATEGORY_FEATURE_SET
+    ? categoryFeatureTokenFunction(projection)
+    : shadowTriggerFeatureTokens;
+  const evaluation = evaluateFrozenShadowCandidateWithFeatures(
+    artifact,
+    candidate.model,
+    { candidateDigest: digestShadowFrozenCandidate(candidate.model) },
+    featureTokens,
+  );
+  return Object.freeze({
+    mode: "paired-frozen-holdout" as const,
+    experimentRevision: SHADOW_PAIRED_EXPERIMENT_REVISION,
+    featureSet: candidate.featureSet,
+    preregistrationDigest,
+    cohortManifestDigest,
+    candidateDigest,
+    categoryProjectionDigest: candidate.categoryProjectionDigest,
+    evaluation,
   });
 }

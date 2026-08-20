@@ -88,10 +88,16 @@
   conține candidat, un candidat standalone poate fi publicat numai după PASS
   complet, iar holdoutul pin-uit prin digest nu antrenează. Candidatul leagă și
   digestul setului canonic exact de domenii folosit la training; același `runId`
-  sau exact același set este respins, fără a interzice overlapul parțial.
+  sau exact același set este respins de guardul generic.
   GO/NO-GO offline pe sidecarul v0.1.5 a eșuat retenția numelor, retenția
   perechilor și toate cele cinci costuri; `candidate=null`, fără cohort public
   nou.
+- Pentru experimentul paired v0.1.8, setul v0.1.5 devine `D1`, folosit numai la
+  generarea ipotezei. Comparăm exact baseline v2 cu baseline plus category IDs
+  directe din `T2` pe un `D2` nou de 200 de domenii; `D1`, `D2` și holdoutul
+  sigilat `H1` au overlap canonic zero. Regula baseline-first, pragurile,
+  foldurile, salts și cota 38+2 sunt preregistrate în
+  `shadow-category-ablation.v1.json`. Tieringul funcțional rămâne `HOLD`.
 
 ## Structura proiectului
 
@@ -1492,9 +1498,9 @@ Evaluatorul respinge același `runId` de training sau exact același set canonic
 de domenii. Egalitatea setului este detectată de CLI imediat după preflightul
 Parquet și citirea candidatului, înainte de catalog, pool-uri ori trafic; `runId`
 este reverificat de evaluator când identitatea artefactului complet există.
-Contractul v0.1.7 nu cere disjuncție totală: overlapul parțial nu este respins de
-acest guard KISS și rămâne o decizie explicită despre reprezentativitatea
-cohortului.
+Acesta este guardul generic v0.1.7, nu regula experimentului următor.
+Preregistrarea v0.1.8 cere disjuncție canonică totală între `D1`, `D2` și
+`H1`; un manifest cu orice overlap este invalid înainte de scanare.
 
 Versiunea 0.1.7 implementează acest model și boundary-ul development versus
 frozen holdout. Nu conține routing funcțional; acel slice rămâne `HOLD` până la
@@ -1556,6 +1562,95 @@ influențat corecțiile și metrica. Out-of-fold reduce leakage-ul calibrării, 
 nu transformă setul într-un holdout de producție. Un trigger schimbat se
 îngheață înainte să fie evaluat pe un cohort nou reprezentativ; nu ratificăm o
 ajustare folosind din nou acest set.
+
+### Preregistrarea ablației category-ID v0.1.8
+
+Am înghețat în `shadow-category-ablation.v1.json` experimentul paired cu
+revizia `2026-08-20.3`. Digestul serializării canonice a acestui protocol se
+calculează înaintea manifestelor de cohort și este
+`sha256:bf924836872efc40ee30b92ae51eb456d08ce3172b19de25b401be422107f849`.
+Setul public v0.1.5 este `D1` și are
+rol exclusiv `hypothesis-generation`: pin-uim sidecarul brut
+`sha256:1b53023cf747e7194adc3d0261f96f93a556cba041d8ee515e9b4a8dc37ef43e`
+și domain-set digestul
+`sha256:4bd010e4fae36d5f50d468e4e0e47e377040281fa38be0be9dd1d97c48c7c523`,
+dar nu folosim labelurile lui la training, comparația brațelor, alegerea
+câștigătorului, praguri sau ratificare.
+
+Brațele sunt exact:
+
+1. `baseline-v2`, implementarea KISS+ v0.1.7 pin-uită prin commit;
+2. `baseline-v2+t2-direct-category-id-v1`, aceeași implementare plus familia
+   exactă de tokens `t2.directCategoryId=<decimal>`.
+
+Al doilea braț proiectează numai `T2.directNames` în tehnologiile catalogului
+compilat pin-uit și ia reuniunea sortată/deduplicată a ID-urilor numerice de
+categorie. Orice nume fără mapping unic invalidează evaluarea. Digestul
+proiecției și digestul catalogului sunt parte din preregistrare. Nu folosim
+`T1`, inferred, `full`, browser, nume sau grupuri de categorii și nici token
+explicit de count. Nu adăugăm alt feature, alt semnal raw, ponderi, collector
+sau routing.
+
+`D2` este un development cohort nou de exact 200 de domenii, iar `H1` este un
+holdout sigilat distinct de exact 200. Le înghețăm simultan, înaintea primului
+scan `D2`, din același source frame numit și imuabil. `D1`, `D2` și `H1` au
+overlap canonic zero. Sursa exactă, revizia și digestul ei apar numai
+în manifestul concret; protocolul nu descrie un mirror drept bytes oficiali.
+Eligibilitatea folosește numai normalizarea statică și deduplicarea. Nu facem
+DNS/HTTP/browser prescreen, nu folosim tehnologiile observate și nu înlocuim
+domenii după freeze pentru timeout, block, failure sau label gol.
+
+Selecția este un singur sample ne-stratificat fără replacement, sortat după
+`SHA-256(sampleSalt + NUL + canonicalDomain)`, apoi domeniu canonic la o
+coliziune. După excluderea `D1`, primele 200 sunt `D2`, iar următoarele 200
+sunt `H1`. Saltul unic este
+`website-technologies-scraper/shadow/2026-08-20.3/cohort-sample/v1`. Samplingul
+nu este stratificat și nicio probă de website nu poate influența eligibilitatea.
+
+Fiecare instanță de cohort are un manifest canonic imuabil, iar ambele sunt
+înghețate înainte de primul scan `D2`. Fiecare manifest leagă
+`preregistrationDigest`, source name/revision/digest, metoda, saltul, countul
+ordonat, `domainSetDigest` și SHA-256 al bytes-ilor Parquet exacți. Manifestul
+`D2` pin-uiește suplimentar digestul manifestului `H1` deja sigilat. CLI-ul `D2`
+cere ambele manifeste înainte de catalog/pool-uri și publică un envelope
+`paired-development-source` care fixează preregistrarea, ambele manifeste și
+proiecția category. Candidatul păstrează pin-urile `D2` și `H1`, iar evaluatorul
+`H1` acceptă numai manifestul sigilat exact și pin-uiește separat digestul
+candidatului. Preregistrarea nu conține `cohortManifestDigest`, fiindcă
+manifestele sunt create ulterior și conțin digestul preregistrării. Orice
+mismatch, overlap, count greșit, replacement sau artefact nelegat invalidează
+experimentul.
+
+Păstrăm exact cinci folds, priorul patru, supportul recurent minimum doi,
+38 trigger plus două controls și pragurile globale 95% nume, 80% perechi și
+30% pentru fiecare dintre cele cinci costuri browser reale. Fiecare fold trebuie
+să primească o cotă trigger pozitivă; altfel experimentul este invalid.
+Comparația foldurilor exclude controls, dar toate guardrails globale includ
+integral cele două controls.
+
+Notăm cu `F(d)` setul numelor directe canonice `full`, cu `T2(d)` setul direct
+`T2` și cu `U_T2` reuniunea `T2` peste toate cele 200 de domenii `D2`, comună
+ambelor brațe. Într-un fold, pair lift-ul trigger-only este
+`sum(|F(d) - T2(d)|)`, iar novel-name coverage este
+`|union(F(d)) - U_T2|` peste triggerii selectați ai acelui fold. Feature-ul
+category câștigă foldul numai dacă ambele valori sunt cel puțin egale cu
+baseline și minimum una este strict mai mare. Cerem minimum patru victorii din
+cinci. Este o euristică de stabilitate preregistrată, nu un test de
+semnificație statistică.
+
+Decizia este baseline-first. Dacă baseline trece simultan toate guardrails
+globale, el este câștigătorul și feature-ul suplimentar nu este acceptat. Altfel
+acceptăm category numai dacă trece toate guardrails globale și câștigă minimum
+patru folds. Orice alt rezultat este `NO-GO`; nu publicăm candidat pentru un
+braț eșuat și nu reglăm pragurile, salts, foldurile, cota sau feature-ul după
+ce vedem `D2`.
+
+Numai câștigătorul eligibil se antrenează apoi pe toate snapshoturile `D2` și
+se îngheață. Îl evaluăm o singură dată pe `H1`, fără training, retraining,
+feature sau prag schimbat. Un eșec transformă `H1` în development evidence și
+o nouă afirmație cere `H2` sigilat. Documentul și manifestele nu autorizează
+singure trafic public. Tieringul funcțional rămâne `HOLD` până la PASS pe
+holdout și un slice de implementare autorizat separat.
 
 ## Probleme posibile
 
