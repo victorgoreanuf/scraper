@@ -7,8 +7,9 @@
 > orchestration are implemented and tested. Incremental output, resume, summary
 > generation, the runnable local CLI, the exact correction ledger, bounded
 > browser-limit telemetry, and the raw-free shadow evaluator/calibration
-> sidecar are also implemented and tested. The fresh v0.1.5 public run,
-> calibration verdict, KPI decision, and functional tier routing remain pending.
+> sidecar are also implemented and tested. The fresh v0.1.5 public run and its
+> calibration are complete: the provisional KPI was rejected, so functional
+> tier routing remains on hold pending a new trigger experiment and cohort.
 
 ## Goal
 
@@ -2376,8 +2377,8 @@ Wix asset, and Lightbox DOM rules; narrows Onsen UI and Lightbox script URLs to
 exact basenames; and replaces the timeout-prone Liveinternet HTML expression
 with the bounded `//counter\.yadro\.ru/hit` signal. Candidate-level positive and
 negative fixtures retain each stronger fallback and reject the reviewed false
-signals; the Liveinternet negative fixture is 4 MiB. These changes define the
-next fresh run and do not rewrite the historical v0.1.4 measurements above.
+signals; the Liveinternet negative fixture is 4 MiB. These changes defined the
+fresh v0.1.5 run and do not rewrite the historical v0.1.4 measurements above.
 
 The original occurrence-based tiering target is infeasible on this baseline
 under the optimistic evidence-based upper bound. Without browser evidence, at
@@ -2385,21 +2386,117 @@ most 1,317/2,061 direct occurrences remain; an oracle selecting the best 40/200
 domains reaches only 1,768/2,061 (85.78%), and 95% requires at least 68/200
 domains (34%). A deployable trigger may require more. A possible replacement
 objective is canonical direct technology names: a post-hoc greedy selection
-covers 342/360 (95%) with 25 domains and 357/360 (99.17%) with 40. That is not
-yet a deployable policy because it uses full-result knowledge; aliases/false
-positives must be corrected and a trigger based only on tier-1/tier-2 signals
-must be measured. Consequently, the scan-and-analysis gate is complete while
-the final-results and debate gate remains open.
+covers 342/360 (95%) with 25 domains and 357/360 (99.17%) with 40. That was not
+a deployable policy because it used full-result knowledge. The v0.1.5
+experiment below applied the targeted corrections and measured a trigger based
+only on tier-1/tier-2 signals; the historical v0.1.4 measurements remain
+unchanged.
+
+## 200-domain full + shadow benchmark (v0.1.5)
+
+The authorized fresh run built from clean commit
+`b290a340355a965ec100d1c980a3653137442758` completed all 200 input domains with
+scanner `0.1.5`, Node.js `24.19.0`, Playwright `1.62.1`, Chromium revision
+`1234`, effective catalog digest
+`sha256:614581009dc6ac2986763f8a324c656e629f63c5ecb7e46cf3ac10b121277724`,
+and configuration digest
+`sha256:1fdd836b195fab7f177196a6d87034dce651f845b795c7281cea967e30e6ecfb`.
+The operator-supplied public contact remained runtime configuration and is not
+reproduced here.
+
+Independent checks validated all result records semantically, matched the exact
+input/result domain set and run identity, rebuilt the summary byte-for-byte,
+and recomputed the base snapshot plus calibration byte-for-byte. The local,
+Git-ignored artifacts are:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `input/domains.parquet` | `65e77097c669c29b392f3279a93f04566ab934cf1e8acfaf1ae4046a01e97bb2` |
+| `output/work/results-200-v0.1.5.jsonl` | `8577b94c9dd4b777474a7bdcf963c4f718b286c1d5799f03181376e9e8c82b5e` |
+| `output/work/results-200-v0.1.5.summary.json` | `c7d630748042093a1dd71d40fac163993c3f48f16cde455c1e2622a8e213e5b0` |
+| `output/work/results-200-v0.1.5.evaluation.json` | `1b53023cf747e7194adc3d0261f96f93a556cba041d8ee515e9b4a8dc37ef43e` |
+
+The authoritative `full` result is:
+
+| Metric | v0.1.5 result |
+| --- | ---: |
+| Status | 2 success, 191 partial, 7 failed |
+| Detections | 2,031 direct + 165 inferred = 2,196 |
+| Unique technology names | 362 total; 348 direct |
+| Direct candidate accounting | 2,089 raw - 54 gated - 4 suppressed = 2,031 retained |
+| HTTP / browser requests | 1,021 / 14,038 |
+| Pages / probes / script bodies | 231 / 368 / 1,516 |
+| Static / browser transfer | 10,580,190 / 209,904,719 bytes |
+| Duration | 10,132 ms average; 10,264 ms p50; 23,635 ms p95; 34,662 ms p99 |
+| Hard-limit hits | 201 |
+
+The fold-local out-of-fold deployment simulation routed exactly 38 trigger
+domains plus two controls. Its provisional guardrails were:
+
+| Guardrail | Result | Verdict |
+| --- | ---: | --- |
+| Canonical direct-name retention, at least 95% | 292/348 = 83.91% | fail |
+| Canonical direct `(domain, technology)` retention, at least 80% | 1,609/2,031 = 79.22% | fail |
+| Routed domains, at most 40 | 40/40 | pass |
+
+The overall verdict is **REJECT**: the provisional KPI is not ratified and
+functional tiering remains on hold. The 40 routed domains were 20% of the
+cohort but accounted for 36.27% of attempted browser pages, 39.01% of admitted
+browser pages, 41.47% of browser requests, 36.97% of browser bytes, and 40.67%
+of browser milliseconds. Routed-domain share is therefore not an adequate cost
+guardrail by itself. At the same budget, the deterministic random comparator
+retained 276/348 names and 1,428/2,031 pairs; the post-hoc pair-first greedy
+comparator retained 330/348 names and 1,735/2,031 pairs. Greedy is descriptive,
+not an upper bound, so this result rejects the current deployable trigger rather
+than proving that 95% name retention is impossible.
+
+The correction ledger behaved in the intended direction on the fresh artifact.
+Onsen UI changed from 4 to 0 occurrences, WebsiteBuilder 9 to 0, Store Vantage
+3 to 0, Sirvoy 1 to 0, Wix eCommerce 1 to 0, and Lightbox 11 to 0. Duplicate
+aliases also disappeared while their canonical names remained: Litespeed Cache
+3 to 0 while LiteSpeed retained 3; All in One SEO Pack 2 to 0 while All in One
+SEO retained 2; MUI 1 to 0 while Material UI retained 1; and Typekit 4 to 0
+while Adobe Fonts retained 4. Detector rule timeouts fell from 15 to 2, with no
+Liveinternet timeout or detection in v0.1.5.
+
+The sidecar recorded 1,045 browser-limit hits across 106 domains and 178 pages:
+802 `inspection.domMatches`, 148 `inspection.returnedValue`, and 95
+`scripts.bodiesPerDomain`. There were no exists-only selector hits, confirming
+the false `exists` truncation fix. Remaining pressure is concentrated in broad
+property/value inspections over app/root/body descendants, `div` text/id,
+`script` and `style` text, and `link` href; this supports targeted catalog or
+collector work, not a global limit increase.
+
+One historical telemetry caveat is explicit: the JSONL contains 180
+`BROWSER_LIMIT_EXCEEDED` domain/page pairs, while the v0.1.5 sidecar contains
+limit hits for 178 page pairs. Two protected-proxy limit hits were lost on
+paths which failed before their page collection returned. The artifact must
+not be described as telemetry-exact. This does not change the calibration or
+KPI verdict because browser-limit telemetry is excluded from both trigger
+features and labels. The historical files and hashes above remain unchanged; a
+later collector fix cannot retroactively make this sidecar exact. The current
+collector preserves the active raw-free page and proxy limit hits before the
+pipeline classifies a thrown collection failure, so future sidecars retain this
+diagnostic without changing `DomainResult`.
+
+The next experimental slice is bounded trigger-quality work, including an
+explicit real-cost guardrail and the remaining canonical-name breadth misses.
+Any changed feature set, objective, or threshold must be frozen before a new
+representative cohort is evaluated. This 200-domain development cohort may be
+used for diagnosis and training, but not for same-cohort KPI re-ratification.
+Functional routing starts only after a deployable candidate passes the frozen
+guardrails on new evidence.
 
 ## Provisional tiering evaluation protocol
 
-Protocol revision `2026-08-20.1` and its shadow instrumentation are implemented;
-the fresh v0.1.5 public run and its verdict are not yet complete. This remains a
-shadow experiment, not functional routing, a final KPI, a production capacity
-claim, or permission to skip an existing safety check. All three detector views
-use the same validated effective catalog, correction revision, configuration,
-and deterministic matching semantics. A prefix is never approximated by
-filtering technologies or evidence from the final result.
+Protocol revision `2026-08-20.1` and its shadow instrumentation were exercised
+by the fresh v0.1.5 public run above. The deployable trigger failed two of three
+guardrails, so the KPI was rejected. This remains a shadow experiment, not
+functional routing, a final KPI, a production capacity claim, or permission to
+skip an existing safety check. All three detector views use the same validated
+effective catalog, correction revision, configuration, and deterministic
+matching semantics. A prefix is never approximated by filtering technologies
+or evidence from the final result.
 
 ### Observation views and the static internal page
 
@@ -2609,10 +2706,10 @@ The sidecar includes absolute/intersection retention, macro recall, extra
 shadow disagreements, actual browser-cost ratios, all selections and
 predictions, the full-cohort deployment model, and a machine-readable
 `provisional-shadow-challenge` guardrail verdict. That boolean is not a
-ratification by itself. The v0.1.5 fresh run must complete and its deployable
-out-of-fold selection must pass all three guardrails before the roadmap can
-ratify the provisional KPI; production generalization still requires a fresh
-representative cohort.
+ratification by itself. The v0.1.5 deployable out-of-fold selection did not pass
+all three guardrails, so the roadmap records a rejection. A future candidate
+must be frozen before evaluation on a fresh representative cohort; the current
+development cohort cannot be reused to ratify a post-hoc adjustment.
 
 The 95% and 80% values are provisional challenge guardrails. This cohort has
 already informed catalog fixes and metric design, so even out-of-fold results
@@ -2670,12 +2767,14 @@ Completion and evaluation gates:
   fixtures.
 - [x] Implement independent shadow `T1`/`T2` detector views without functional
   routing or raw-observation persistence.
-- [ ] Release v0.1.5 and run one fresh 200-domain `full` plus shadow evaluation.
-- [ ] Calibrate and evaluate the deployable trigger with a frozen deterministic
+- [x] Release v0.1.5 and run one fresh 200-domain `full` plus shadow evaluation.
+- [x] Calibrate and evaluate the deployable trigger with a frozen deterministic
   out-of-fold split and equal-budget random/label-aware comparators.
-- [ ] Ratify or reject the provisional KPI from the deployable trigger result.
-- [ ] Implement functional tiered orchestration only as a later slice, with
-  v0.1.6 as a candidate version rather than a promise.
+- [x] Reject the provisional KPI after the deployable trigger failed canonical
+  name and pair retention guardrails.
+- [ ] Implement functional tiered orchestration only after a frozen deployable
+  trigger passes a new representative cohort; this slice is on hold and has no
+  reserved version.
 - [ ] Produce final results and complete the debate topics.
 
 ## Readiness gate for the coding stage
@@ -2705,5 +2804,7 @@ compiler, isolated detector, bounded Chromium pool, catalog probes, DNS/TLS
 infrastructure collector, pipeline orchestration, incremental output, resume,
 summary generation, runnable local CLI, exact correction ledger, bounded limit
 telemetry, and raw-free shadow evaluator are complete. The remaining gates are
-the fresh v0.1.5 run, its calibration/KPI decision, and only afterward the
-separate functional tiering slice.
+bounded trigger-quality research, evaluation on a new representative cohort,
+and only after a passing result the separate functional tiering slice. The
+v0.1.5 KPI decision is `REJECT`, not an authorization to lower the guardrails
+or ratify a same-cohort adjustment.

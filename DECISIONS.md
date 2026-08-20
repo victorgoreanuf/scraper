@@ -80,6 +80,10 @@
 - Numai acest mod pornește trei pool-uri detector distincte peste același catalog:
   `full`, `T1` și `T2`. Nu împart slots, workeri sau failure state; orice
   indisponibilitate shadow invalidează calibrarea și sidecarul fail-closed.
+- Runul fresh v0.1.5 a respins KPI-ul provizoriu: triggerul deployabil a păstrat
+  292/348 nume directe canonice și 1.609/2.031 perechi pe 40/40 domenii rutate.
+  Routingul tiered funcțional rămâne `HOLD`; nu coborâm pragurile și nu ratificăm
+  o ajustare pe același cohort de dezvoltare.
 
 ## Structura proiectului
 
@@ -203,11 +207,11 @@ pathul.
 - Dacă Veridion permite republicarea fișierului `input/domains.parquet`; până
   confirmăm, acesta rămâne local și ignorat de Git.
 
-Aceste puncte nu blochează scheletul de cod. Benchmarkul v0.1.4 permite doar
-protocolul shadow provizoriu de mai jos; triggerul și KPI-ul final se ratifică
-numai după evaluarea v0.1.5 out-of-fold și apoi pe un cohort reprezentativ nou.
-Contractele de siguranță, rezultat și redacție nu se relaxează pentru a crește
-numărul de detecții.
+Aceste puncte nu blochează scheletul de cod. Evaluarea v0.1.5 a respins
+triggerul shadow curent. Un candidat schimbat se îngheață înaintea unui cohort
+reprezentativ nou; cohortul curent rămâne descriptiv/de dezvoltare și nu poate
+ratifica o ajustare post-hoc. Contractele de siguranță, rezultat și redacție nu
+se relaxează pentru a crește numărul de detecții.
 
 ## Decizia contractului Parquet v1
 
@@ -1135,7 +1139,7 @@ aplică fixed point-ul relațiilor și excluderile deterministe deja decise.
 - cele mai frecvente erori;
 - reguli care par să producă false positives.
 
-## Rezultatul benchmarkului full v0.1.4 și decizia rămasă deschisă
+## Rezultatul benchmarkului full v0.1.4
 
 Runul public autorizat v0.1.4 a terminat 200/200 domenii, iar resume nu a
 modificat artefactele. Validarea independentă a confirmat setul exact de input,
@@ -1167,8 +1171,8 @@ la basename-uri exacte; iar regula Liveinternet care a produs 13 timeouturi este
 înlocuită cu semnalul bounded `//counter\.yadro\.ru/hit`. Fixtures la nivel de
 candidat au câte un negativ pentru fiecare regulă eliminată și un pozitiv pentru
 fallbackul puternic păstrat, plus negativele `consent`, `dmm-consent`,
-Breakdance și un HTML Liveinternet negativ de 4 MiB. Această decizie se aplică
-următorului run fresh; nu rescrie statisticile istorice v0.1.4.
+Breakdance și un HTML Liveinternet negativ de 4 MiB. Această decizie s-a aplicat
+runului fresh v0.1.5; nu rescrie statisticile istorice v0.1.4.
 
 Ținta inițială pe occurrence-uri, 95% din detecțiile directe cu browser pe
 maximum 20% dintre domenii, este infirmată de date: fără browser rămân cel mult
@@ -1176,25 +1180,99 @@ maximum 20% dintre domenii, este infirmată de date: fără browser rămân cel 
 numai la 1.768/2.061 (85,78%), iar 95% cere minimum 68/200 domenii (34%). Nu mai
 folosim această țintă drept criteriu de acceptare implicit.
 
-Pentru următorul experiment acceptăm varianta KISS+ numai ca protocol
-provizoriu: breadth-ul numelor directe canonicalizate este guardrail, iar
+Pentru experimentul v0.1.5 am acceptat varianta KISS+ numai ca protocol
+provizoriu: breadth-ul numelor directe canonicalizate a fost guardrail, iar
 retenția perechilor canonicalizate `(domain, technology)` este obiectivul
 principal. Retenția occurrence-urilor raw rămâne diagnostic secundar. Acest
-lucru nu ratifică încă un KPI de produs: fezabilitatea cunoscută este numai
-post-hoc și triggerul deployabil trebuie să folosească exclusiv semnale `T1`/`T2`.
-Nu adăugăm acum un framework generic de override, nu schimbăm capul browser și
-nu declarăm gate-ul final închis înaintea corecțiilor, shadow runului v0.1.5 și
-evaluării out-of-fold.
+lucru nu a ratificat un KPI de produs: triggerul deployabil bazat exclusiv pe
+semnale `T1`/`T2` a fost evaluat și respins. Nu adăugăm un framework generic de
+override, nu schimbăm capul browser și nu coborâm pragurile după rezultat.
+
+## Rezultatul benchmarkului full + shadow v0.1.5
+
+Runul public fresh autorizat, construit din commitul curat
+`b290a340355a965ec100d1c980a3653137442758`, a terminat 200/200 domenii cu
+scanner `0.1.5`, Node.js `24.19.0`, Playwright `1.62.1` și Chromium revision
+`1234`. Contactul real al operatorului a rămas exclusiv configurație runtime și
+nu este reprodus în documentație. Provenance folosește digestul catalogului
+`sha256:614581009dc6ac2986763f8a324c656e629f63c5ecb7e46cf3ac10b121277724`
+și config digestul
+`sha256:1fdd836b195fab7f177196a6d87034dce651f845b795c7281cea967e30e6ecfb`.
+
+Artefactele locale Git-ignored și hashurile lor sunt:
+
+- `input/domains.parquet`:
+  `sha256:65e77097c669c29b392f3279a93f04566ab934cf1e8acfaf1ae4046a01e97bb2`;
+- `output/work/results-200-v0.1.5.jsonl`:
+  `sha256:8577b94c9dd4b777474a7bdcf963c4f718b286c1d5799f03181376e9e8c82b5e`;
+- `output/work/results-200-v0.1.5.summary.json`:
+  `sha256:c7d630748042093a1dd71d40fac163993c3f48f16cde455c1e2622a8e213e5b0`;
+- `output/work/results-200-v0.1.5.evaluation.json`:
+  `sha256:1b53023cf747e7194adc3d0261f96f93a556cba041d8ee515e9b4a8dc37ef43e`.
+
+Validarea independentă a confirmat toate cele 200 de rezultate, setul exact de
+domenii și run identity, contractele semantice, summary-ul reconstruit
+byte-identic și recalcularea byte-identică a snapshotului de bază și calibrării.
+Rezultatul `full` are 2 success, 191 partial și 7 failed; 2.031 detecții directe,
+165 deduse, 2.196 total și 362 nume unice total. Accountingul direct este
+2.089 raw - 54 gated - 4 suppressed = 2.031 retained.
+
+Selecția OOF fold-local a rutat exact 38 trigger + 2 control. Verdictul
+`provisional-shadow-challenge` este **REJECT**:
+
+- nume directe canonice: 292/348 = 83,91%, sub guardrailul de 95%;
+- perechi canonice `(domain, technology)`: 1.609/2.031 = 79,22%, sub
+  guardrailul de 80%;
+- domenii rutate: 40/40, guardrail trecut.
+
+Cele 40 de domenii au reprezentat 20% din cohort, dar 36,27% din paginile
+browser încercate, 39,01% din paginile admise, 41,47% din requesturile browser,
+36,97% din bytes browser și 40,67% din `browserMs`. Costul real cere deci un
+guardrail explicit, nu numai cota de domenii. Comparatorul random la același
+buget a păstrat 276/348 nume și 1.428/2.031 perechi; greedy-ul post-hoc pair-first
+a păstrat 330/348 și 1.735/2.031. Greedy-ul nu este upper bound, deci respingem
+triggerul curent fără să declarăm imposibil pragul de 95%.
+
+Ledgerul exact a avut rezultatul urmărit în cohortul fresh: Onsen UI 4→0,
+WebsiteBuilder 9→0, Store Vantage 3→0, Sirvoy 1→0, Wix eCommerce 1→0 și
+Lightbox 11→0. Aliasurile duplicate au dispărut, iar numele canonice au rămas:
+Litespeed Cache 3→0 / LiteSpeed 3, All in One SEO Pack 2→0 / All in One SEO 2,
+MUI 1→0 / Material UI 1 și Typekit 4→0 / Adobe Fonts 4. Timeouturile de regulă
+au scăzut de la 15 la 2; Liveinternet nu a produs timeout sau detecție.
+
+Sidecarul istoric conține 1.045 limit hits pe 106 domenii și 178 pagini: 802
+`inspection.domMatches`, 148 `inspection.returnedValue` și 95
+`scripts.bodiesPerDomain`. Nu există hit pentru selectori exclusiv `exists`,
+deci corecția trunchării false funcționează. Presiunea rămasă provine din
+inspecții property/value largi pe app/root/body descendants, `div` text/id,
+`script`/`style` text și `link` href; nu mărim global limitele.
+
+Acest sidecar nu este telemetry-exact: JSONL are 180 perechi domeniu/pagină cu
+`BROWSER_LIMIT_EXCEEDED`, dar sidecarul are hits pentru 178. Două limit hits de
+proxy protejat s-au pierdut pe căi care au eșuat înainte să returneze colecția
+paginii. Gap-ul nu afectează features, labels, selecția sau verdictul KPI,
+deoarece telemetry browser este exclusă explicit din calibrare. Fișierele și
+hashurile istorice rămân neschimbate; o corecție ulterioară a collectorului nu
+face retroactiv sidecarul exact. Collectorul curent păstrează hit-urile raw-free
+active ale paginii și proxy-ului înainte ca pipeline-ul să clasifice un failure
+aruncat de colecție, astfel încât sidecarurile viitoare rețin diagnosticul fără
+să schimbe `DomainResult`.
+
+Decizia este să păstrăm routingul funcțional pe `HOLD`. Următorul experiment
+este bounded: diagnosticăm breadth-ul lipsă și costul real, înghețăm înainte de
+evaluare orice schimbare de features/obiectiv/prag și folosim apoi un cohort
+reprezentativ nou. Cele 200 de domenii actuale pot servi la diagnostic și
+training, nu la re-ratificarea aceluiași candidat ajustat post-hoc.
 
 ## Protocolul provizoriu de evaluare tiered
 
-Protocolul `2026-08-20.1` și instrumentația lui shadow sunt implementate pentru
-măsurarea următoare; runul public fresh v0.1.5 și verdictul nu sunt încă
-finalizate. Nu este routing funcțional, KPI final sau afirmație de capacitate la
-scară de producție. Toate views folosesc același catalog efectiv validat,
-aceeași revizie de corecții, configurație și semantică deterministă a
-detectorului. Nu obținem un view intermediar filtrând dovezile din rezultatul
-final; detectorul rulează separat pe fiecare prefix.
+Protocolul `2026-08-20.1` și instrumentația lui shadow au fost exercitate în
+runul public fresh v0.1.5. Triggerul deployabil a eșuat două dintre cele trei
+guardrails, iar KPI-ul provizoriu a fost respins. Nu este routing funcțional,
+KPI final sau afirmație de capacitate la scară de producție. Toate views folosesc
+același catalog efectiv validat, aceeași revizie de corecții, configurație și
+semantică deterministă a detectorului. Nu obținem un view intermediar filtrând
+dovezile din rezultatul final; detectorul rulează separat pe fiecare prefix.
 
 Views sunt exacte:
 
@@ -1375,14 +1453,14 @@ exit non-zero, iar sidecarul nu are resume sau force.
 Sidecarul include selecțiile/predicțiile, retențiile prin intersecție, macro
 recall, disagreements extra, costurile reale, comparatoarele, deployment model
 și verdictul machine-readable `provisional-shadow-challenge`. Câmpul `passed`
-nu ratifică singur nimic: gate-ul rămâne deschis până când runul fresh v0.1.5
-termină și selecția deployabilă OOF trece simultan 95% nume, 80% perechi și
-maximum 40 domenii.
+nu ratifică singur nimic. În v0.1.5 selecția deployabilă OOF nu a trecut
+simultan 95% nume, 80% perechi și maximum 40 domenii, deci KPI-ul este respins.
 
 Cele 200 de domenii sunt set descriptiv/de dezvoltare, deoarece v0.1.4 a
 influențat corecțiile și metrica. Out-of-fold reduce leakage-ul calibrării, dar
-nu transformă setul într-un holdout de producție. Ratificarea KPI-ului cere mai
-întâi trecerea triggerului deployabil și apoi un cohort nou reprezentativ.
+nu transformă setul într-un holdout de producție. Un trigger schimbat se
+îngheață înainte să fie evaluat pe un cohort nou reprezentativ; nu ratificăm o
+ajustare folosind din nou acest set.
 
 ## Probleme posibile
 
@@ -1419,10 +1497,11 @@ nu transformă setul într-un holdout de producție. Ratificarea KPI-ului cere m
 - Vom monitoriza durata, erorile, throughput-ul și dimensiunea cozilor.
 - Numărul de workeri va fi calculat după ce măsurăm costul scanării HTTP și al scanării cu browserul.
 - Ținta inițială de 95% din occurrence-urile directe cu browser pe maximum 20%
-  a fost infirmată de benchmarkul v0.1.4. Protocolul următor folosește provizoriu
+  a fost infirmată de benchmarkul v0.1.4. Protocolul v0.1.5 a folosit provizoriu
   breadth canonicalizat >=95%, retenția perechilor canonicalizate >=80% și
-  maximum 40/200 domenii browser, dar acestea nu devin KPI final înaintea unui
-  trigger out-of-fold deployabil și a unui cohort reprezentativ nou.
+  maximum 40/200 domenii browser. Triggerul v0.1.5 a eșuat; routingul funcțional
+  rămâne `HOLD`, iar un KPI final cere un candidat înghețat și un cohort
+  reprezentativ nou.
 
 ## Descoperirea tehnologiilor noi
 
