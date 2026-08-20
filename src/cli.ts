@@ -33,11 +33,23 @@ import {
   type DetectorPool,
 } from "./detect/pool.ts";
 import {
+  createShadowEvaluationAccumulator,
+  SHADOW_EVALUATION_DOMAIN_COUNT,
+  type ShadowEvaluationArtifact,
+  type ShadowEvaluationSnapshot,
+} from "./evaluation.ts";
+import {
   openParquetDomainsFromFile,
   ParquetInputError,
   type PreparedParquetDomains,
 } from "./input/parquet.ts";
 import type { Provenance, DomainResult } from "./model.ts";
+import {
+  EvaluationWriterError,
+  preflightShadowEvaluationOutput,
+  writeShadowEvaluationArtifact,
+  type PreparedShadowEvaluationOutput,
+} from "./output/evaluation-writer.ts";
 import {
   openResultWriter,
   OutputWriterError,
@@ -46,7 +58,11 @@ import {
   type ResultWriter,
   type ResultWriterMode,
 } from "./output/writer.ts";
-import { scanDomain, type ScanDomainContext } from "./pipeline.ts";
+import {
+  scanDomain,
+  type ScanDomainContext,
+  type ShadowDetectorPools,
+} from "./pipeline.ts";
 
 const DEFAULT_INPUT_PATH = "input/domains.parquet";
 const DEFAULT_OUTPUT_PATH = "results.jsonl";
@@ -76,6 +92,7 @@ export type CliOptions =
       readonly contact: string | null;
       readonly mode: ResultWriterMode;
       readonly quiet: boolean;
+      readonly shadowEvaluation: boolean;
     };
 
 export interface CliDependencies {
@@ -87,6 +104,8 @@ export interface CliDependencies {
   readonly createRobotsPolicyService: typeof createRobotsPolicyService;
   readonly openResultWriter: typeof openResultWriter;
   readonly resolveResultOutputPaths: typeof resolveResultOutputPaths;
+  readonly preflightShadowEvaluationOutput: typeof preflightShadowEvaluationOutput;
+  readonly writeShadowEvaluationArtifact: typeof writeShadowEvaluationArtifact;
   readonly scanDomain: typeof scanDomain;
 }
 
@@ -133,6 +152,8 @@ const productionDependencies: CliDependencies = Object.freeze({
   createRobotsPolicyService,
   openResultWriter,
   resolveResultOutputPaths,
+  preflightShadowEvaluationOutput,
+  writeShadowEvaluationArtifact,
   scanDomain,
 });
 
@@ -182,6 +203,7 @@ function usage(): string {
     "  --config <path>      Complete ScanConfig v1 JSON (instead of --contact)",
     "  --resume             Continue a compatible result file",
     "  --force              Replace a validated result file",
+    "  --shadow-evaluation  Persist the fixed 200-domain shadow artifact",
     "  --quiet              Suppress per-domain progress on stderr",
     "  --help                Show this help",
     "  --version             Show the scanner version",
@@ -304,6 +326,7 @@ export function parseCliArgs(argv: readonly string[]): CliOptions {
         config: { type: "string" },
         resume: { type: "boolean" },
         force: { type: "boolean" },
+        "shadow-evaluation": { type: "boolean" },
         quiet: { type: "boolean" },
         help: { type: "boolean", short: "h" },
         version: { type: "boolean", short: "V" },
@@ -335,6 +358,12 @@ export function parseCliArgs(argv: readonly string[]): CliOptions {
   const force = parsed.values.force === true;
   if (resume && force) {
     throw new CliUsageError("--resume and --force are mutually exclusive.");
+  }
+  const shadowEvaluation = parsed.values["shadow-evaluation"] === true;
+  if (shadowEvaluation && (resume || force)) {
+    throw new CliUsageError(
+      "--shadow-evaluation is available only for a fresh create run.",
+    );
   }
 
   const inputValue = typeof parsed.values.input === "string"
@@ -369,6 +398,7 @@ export function parseCliArgs(argv: readonly string[]): CliOptions {
     contact: contactValue === undefined ? null : canonicalContact(contactValue),
     mode: resume ? "resume" : force ? "force" : "create",
     quiet: parsed.values.quiet === true,
+    shadowEvaluation,
   });
 }
 
@@ -539,6 +569,10 @@ async function scheduleDomains(input: {
   readonly quiet: boolean;
   readonly stderr: (text: string) => void;
   readonly scan: typeof scanDomain;
+  readonly onShadowSnapshot?: (
+    snapshot: ShadowEvaluationSnapshot,
+  ) => void | Promise<void>;
+  readonly shadowDetectorPools?: ShadowDetectorPools;
 }): Promise<void> {
   const active = new Set<Promise<void>>();
   const fatal = new AbortController();
@@ -549,7 +583,15 @@ async function scheduleDomains(input: {
   const start = (domain: string): void => {
     let task: Promise<void>;
     task = (async () => {
-      const result = await input.scan(domain, input.context, { signal });
+      const result = await input.scan(domain, input.context, {
+        signal,
+        ...(input.shadowDetectorPools === undefined
+          ? {}
+          : { shadowDetectorPools: input.shadowDetectorPools }),
+        ...(input.onShadowSnapshot === undefined
+          ? {}
+          : { onShadowSnapshot: input.onShadowSnapshot }),
+      });
       await input.writer.append(result);
       completed += 1;
       if (!input.quiet) input.stderr(progressLine(completed, result));
@@ -604,9 +646,13 @@ async function executeRun(
 
   let prepared: PreparedParquetDomains | undefined;
   let detectorPool: DetectorPool | undefined;
+  let shadowDetectorPoolT1: DetectorPool | undefined;
+  let shadowDetectorPoolT2: DetectorPool | undefined;
   let browserPool: BrowserPool | undefined;
   let robots: RobotsPolicyService | undefined;
   let writer: ResultWriter | undefined;
+  let preparedEvaluation: PreparedShadowEvaluationOutput | undefined;
+  let pendingEvaluationArtifact: ShadowEvaluationArtifact | undefined;
   let finalized = false;
   let runFailure: unknown;
   let exitCode = 0;
@@ -621,11 +667,39 @@ async function executeRun(
     signal.throwIfAborted();
     const outputPaths = await dependencies.resolveResultOutputPaths(options.outputPath);
     await assertDistinctSources(prepared, loaded.sourcePath, outputPaths);
+    if (options.shadowEvaluation) {
+      if (prepared.domainCount !== SHADOW_EVALUATION_DOMAIN_COUNT) {
+        throw new CliStartupError(
+          "CLI_EVALUATION_INPUT_INVALID",
+          `--shadow-evaluation requires exactly ${SHADOW_EVALUATION_DOMAIN_COUNT} input domains.`,
+        );
+      }
+      preparedEvaluation = await dependencies.preflightShadowEvaluationOutput({
+        resultPath: outputPaths.resultPath,
+        reservedPaths: [outputPaths.resultPath, outputPaths.summaryPath],
+        sourcePaths: [
+          prepared.sourcePath,
+          ...(loaded.sourcePath === null ? [] : [loaded.sourcePath]),
+        ],
+      });
+    }
 
     const catalog = dependencies.loadFingerprintCatalog(loaded.config);
     signal.throwIfAborted();
     detectorPool = await dependencies.createDetectorPool(catalog, loaded.config);
     signal.throwIfAborted();
+    if (options.shadowEvaluation) {
+      shadowDetectorPoolT1 = await dependencies.createDetectorPool(
+        catalog,
+        loaded.config,
+      );
+      signal.throwIfAborted();
+      shadowDetectorPoolT2 = await dependencies.createDetectorPool(
+        catalog,
+        loaded.config,
+      );
+      signal.throwIfAborted();
+    }
     const transport: ProtectedHttpTransport =
       dependencies.createProtectedHttpTransport(loaded.config);
     browserPool = await dependencies.createBrowserPool(
@@ -656,6 +730,9 @@ async function executeRun(
       detectorPool,
       catalog,
     });
+    const shadowAccumulator = options.shadowEvaluation
+      ? createShadowEvaluationAccumulator({ runId: writer.runId, provenance })
+      : undefined;
     await scheduleDomains({
       prepared,
       writer,
@@ -665,11 +742,40 @@ async function executeRun(
       quiet: options.quiet,
       stderr,
       scan: dependencies.scanDomain,
+      ...(shadowDetectorPoolT1 === undefined || shadowDetectorPoolT2 === undefined
+        ? {}
+        : {
+            shadowDetectorPools: Object.freeze({
+              t1: shadowDetectorPoolT1,
+              t2: shadowDetectorPoolT2,
+            }),
+          }),
+      ...(shadowAccumulator === undefined
+        ? {}
+        : {
+            onShadowSnapshot: (snapshot: ShadowEvaluationSnapshot): void => {
+              shadowAccumulator.add(snapshot);
+            },
+          }),
     });
     signal.throwIfAborted();
+    if (
+      shadowDetectorPoolT1 !== undefined
+      && shadowDetectorPoolT2 !== undefined
+      && (!shadowDetectorPoolT1.isAvailable()
+        || !shadowDetectorPoolT2.isAvailable())
+    ) {
+      throw new CliStartupError(
+        "CLI_EVALUATION_INVALID",
+        "The isolated shadow detector pools became unavailable.",
+      );
+    }
     const summary = await writer.finalize(prepared.domainCount);
     finalized = true;
     signal.throwIfAborted();
+    if (shadowAccumulator !== undefined) {
+      pendingEvaluationArtifact = shadowAccumulator.build(prepared.domainCount);
+    }
     if (!options.quiet) {
       completionLine = `[COMPLETE] processed=${summary.processedDomains} success=${summary.statusCounts.success} partial=${summary.statusCounts.partial} failed=${summary.statusCounts.failed}\n`;
     }
@@ -697,6 +803,8 @@ async function executeRun(
     const closed = await Promise.allSettled([
       browserPool?.close() ?? Promise.resolve(),
       detectorPool?.close() ?? Promise.resolve(),
+      shadowDetectorPoolT1?.close() ?? Promise.resolve(),
+      shadowDetectorPoolT2?.close() ?? Promise.resolve(),
     ]);
     for (const result of closed) {
       if (result.status === "rejected") runFailure ??= result.reason;
@@ -705,6 +813,19 @@ async function executeRun(
 
   if (runFailure !== undefined) throw runFailure;
   signal.throwIfAborted();
+  if (pendingEvaluationArtifact !== undefined) {
+    if (preparedEvaluation === undefined) {
+      throw new CliStartupError(
+        "CLI_EVALUATION_INVALID",
+        "The shadow evaluation output was not prepared.",
+      );
+    }
+    await dependencies.writeShadowEvaluationArtifact(
+      preparedEvaluation,
+      pendingEvaluationArtifact,
+    );
+    signal.throwIfAborted();
+  }
   if (completionLine !== undefined) stderr(completionLine);
   if (degradedPools.length > 0) {
     stderr(`[CLI_DEGRADED] unavailable=${degradedPools.join(",")}\n`);
@@ -718,6 +839,7 @@ function knownDiagnostic(error: unknown): { readonly code: string; readonly mess
     || error instanceof ParquetInputError
     || error instanceof FingerprintCatalogError
     || error instanceof OutputWriterError
+    || error instanceof EvaluationWriterError
     || error instanceof BrowserLifecycleFailure
   ) {
     return { code: error.code, message: error.message };

@@ -160,6 +160,18 @@ export interface ProtectedBrowserProxyUsage {
   readonly browserTransferredBytes: number;
 }
 
+export const BROWSER_PROXY_LIMIT_CATEGORIES = Object.freeze([
+  "proxy.headerFields",
+  "proxy.headerBytes",
+  "proxy.requestsPerPage",
+  "proxy.requestsPerDomain",
+  "proxy.transferBytesPerPage",
+  "proxy.transferBytesPerDomain",
+] as const);
+
+export type BrowserProxyLimitCategory =
+  (typeof BROWSER_PROXY_LIMIT_CATEGORIES)[number];
+
 export interface BrowserProxyRequestAttempt {
   readonly pageId: PageId;
   readonly url: string;
@@ -181,6 +193,7 @@ export interface ProtectedBrowserProxy {
   finishPage(pageId: PageId): Promise<void>;
   finishDomain(): Promise<void>;
   getUsage(): ProtectedBrowserProxyUsage;
+  getLimitHits(): readonly BrowserProxyLimitCategory[];
   getFailure(): ProtectedTransportError | null;
   getFailureSignal(): AbortSignal;
   prepareCanary(): Promise<ProtectedBrowserProxyCanary>;
@@ -247,13 +260,22 @@ export class ProtectedTransportError extends Error {
   readonly code: TransportErrorCode;
   readonly stage: ErrorStage;
   readonly retryable: boolean;
+  readonly browserLimitCategories: readonly BrowserProxyLimitCategory[];
 
-  constructor(code: TransportErrorCode, stage: ErrorStage, retryable: boolean) {
+  constructor(
+    code: TransportErrorCode,
+    stage: ErrorStage,
+    retryable: boolean,
+    browserLimitCategories: readonly BrowserProxyLimitCategory[] = [],
+  ) {
     super(TRANSPORT_MESSAGES[code]);
     this.name = "ProtectedTransportError";
     this.code = code;
     this.stage = stage;
     this.retryable = retryable;
+    this.browserLimitCategories = Object.freeze(
+      [...new Set(browserLimitCategories)].sort(),
+    );
   }
 }
 
@@ -1190,8 +1212,15 @@ function proxyError(retryable = false): ProtectedTransportError {
   return transportError("BROWSER_PROXY_FAILED", "browser", retryable);
 }
 
-function proxyLimitError(): ProtectedTransportError {
-  return transportError("BROWSER_LIMIT_EXCEEDED", "browser", false);
+function proxyLimitError(
+  categories: readonly BrowserProxyLimitCategory[],
+): ProtectedTransportError {
+  return new ProtectedTransportError(
+    "BROWSER_LIMIT_EXCEEDED",
+    "browser",
+    false,
+    categories,
+  );
 }
 
 function assertProxyHeaderBudget(
@@ -1204,7 +1233,16 @@ function assertProxyHeaderBudget(
     || metrics.fields > config.limits.http.headerFields
     || metrics.bytes > config.limits.http.headerBytes
   ) {
-    throw proxyLimitError();
+    const categories: BrowserProxyLimitCategory[] = [];
+    if (metrics.fields > config.limits.http.headerFields) {
+      categories.push("proxy.headerFields");
+    }
+    if (metrics.bytes > config.limits.http.headerBytes) {
+      categories.push("proxy.headerBytes");
+    }
+    throw categories.length === 0
+      ? proxyError()
+      : proxyLimitError(categories);
   }
 }
 
@@ -1462,6 +1500,7 @@ class ProtectedBrowserProxyImpl implements ProtectedBrowserProxy {
   private pageTransferredBytes = 0;
   private browserRequests = 0;
   private browserTransferredBytes = 0;
+  private browserLimitCategories = new Set<BrowserProxyLimitCategory>();
   private canary: BrowserProxyCanaryState | null = null;
   private finishing = false;
   private closed = false;
@@ -1527,7 +1566,11 @@ class ProtectedBrowserProxyImpl implements ProtectedBrowserProxy {
         && !this.finishing
         && !isProxyClientCancellation(error)
       ) {
-        this.latchFailure(proxyError());
+        this.latchFailure(
+          errorCode(error) === "HPE_HEADER_OVERFLOW"
+            ? proxyLimitError(["proxy.headerBytes"])
+            : proxyError(),
+        );
       }
       socket.destroy();
     });
@@ -1619,6 +1662,7 @@ class ProtectedBrowserProxyImpl implements ProtectedBrowserProxy {
     this.pageTransferredBytes = 0;
     this.browserRequests = 0;
     this.browserTransferredBytes = 0;
+    this.browserLimitCategories.clear();
   }
 
   startPage(pageId: PageId): void {
@@ -1649,7 +1693,14 @@ class ProtectedBrowserProxyImpl implements ProtectedBrowserProxy {
       this.pageRequests >= this.config.limits.browser.requestsPerPage
       || this.browserRequests >= this.config.limits.browser.requestsPerDomain
     ) {
-      const error = proxyLimitError();
+      const categories: BrowserProxyLimitCategory[] = [];
+      if (this.pageRequests >= this.config.limits.browser.requestsPerPage) {
+        categories.push("proxy.requestsPerPage");
+      }
+      if (this.browserRequests >= this.config.limits.browser.requestsPerDomain) {
+        categories.push("proxy.requestsPerDomain");
+      }
+      const error = proxyLimitError(categories);
       this.latchFailure(error);
       throw error;
     }
@@ -1742,6 +1793,10 @@ class ProtectedBrowserProxyImpl implements ProtectedBrowserProxy {
       browserRequests: this.browserRequests,
       browserTransferredBytes: this.browserTransferredBytes,
     });
+  }
+
+  getLimitHits(): readonly BrowserProxyLimitCategory[] {
+    return Object.freeze([...this.browserLimitCategories].sort());
   }
 
   getFailure(): ProtectedTransportError | null {
@@ -1877,6 +1932,9 @@ class ProtectedBrowserProxyImpl implements ProtectedBrowserProxy {
     if (this.failure !== null || this.finishing || this.domainSignal === null) {
       return;
     }
+    for (const category of error.browserLimitCategories) {
+      this.browserLimitCategories.add(category);
+    }
     this.failure = error;
     this.pageCloseController?.abort(error);
     this.failureController.abort(error);
@@ -1896,6 +1954,10 @@ class ProtectedBrowserProxyImpl implements ProtectedBrowserProxy {
       this.latchFailure(error);
       return;
     }
+    if (errorCode(error) === "HPE_HEADER_OVERFLOW") {
+      this.latchFailure(proxyLimitError(["proxy.headerBytes"]));
+      return;
+    }
     this.latchFailure(proxyError(isTransientNetworkError(error)));
   }
 
@@ -1913,7 +1975,20 @@ class ProtectedBrowserProxyImpl implements ProtectedBrowserProxy {
       || this.browserTransferredBytes + byteLength
         > this.config.limits.browser.transferBytesPerDomain
     ) {
-      const error = proxyLimitError();
+      const categories: BrowserProxyLimitCategory[] = [];
+      if (
+        this.pageTransferredBytes + byteLength
+        > this.config.limits.browser.transferBytesPerPage
+      ) {
+        categories.push("proxy.transferBytesPerPage");
+      }
+      if (
+        this.browserTransferredBytes + byteLength
+        > this.config.limits.browser.transferBytesPerDomain
+      ) {
+        categories.push("proxy.transferBytesPerDomain");
+      }
+      const error = proxyLimitError(categories);
       this.latchFailure(error);
       throw error;
     }

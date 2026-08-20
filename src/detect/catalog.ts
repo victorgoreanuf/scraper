@@ -40,6 +40,9 @@ export const CATALOG_REVISION =
 export const UPSTREAM_RULE_NAMESPACE = "enthec/webappanalyzer:rule-v1";
 export const CUSTOM_RULE_NAMESPACE =
   "website-technologies-scraper/custom:rule-v1";
+export const CATALOG_CORRECTIONS_SCHEMA =
+  "website-technologies-scraper/catalog-corrections-v1";
+export const CATALOG_CORRECTIONS_REVISION = "2026-08-20.1";
 export const PINNED_UPSTREAM_DIGEST =
   "sha256:cdcccc905a14bbc7ad35a7ea6de636a2e6e51280c6ebbe5ba14f5e55aac18c8f";
 
@@ -116,7 +119,11 @@ export class FingerprintCatalogError extends Error {
   }
 }
 
-export type CatalogFileKind = "schema" | "categories" | "technologies";
+export type CatalogFileKind =
+  | "schema"
+  | "categories"
+  | "technologies"
+  | "corrections";
 
 export interface CatalogInputFile {
   readonly kind: CatalogFileKind;
@@ -202,6 +209,20 @@ interface DraftTechnology {
 
 interface ParsedCatalogInputFile extends CatalogInputFile {
   readonly value: unknown;
+}
+
+interface CatalogRuleReplacement {
+  readonly targetRuleId: string;
+  readonly technology: string;
+  readonly source: EvidenceSource;
+  readonly locator: string | null;
+  readonly original: string;
+}
+
+interface CatalogCorrections {
+  readonly dropTechnologies: ReadonlySet<string>;
+  readonly dropRules: ReadonlySet<string>;
+  readonly replaceRules: ReadonlyMap<string, CatalogRuleReplacement>;
 }
 
 interface MutableFactDemand {
@@ -766,6 +787,212 @@ function normalizeLocator(source: EvidenceSource, locator: string): string {
   return locator;
 }
 
+function assertExactKeys(
+  value: Record<string, unknown>,
+  expected: readonly string[],
+  label: string,
+): void {
+  const actual = Object.keys(value).sort(compareString);
+  const wanted = [...expected].sort(compareString);
+  if (JSON.stringify(actual) !== JSON.stringify(wanted)) {
+    throw new FingerprintCatalogError(
+      "CATALOG_INVALID",
+      `${label} does not have the exact supported shape`,
+    );
+  }
+}
+
+function assertRuleId(value: unknown, label: string): asserts value is string {
+  if (typeof value !== "string" || !/^sha256:[0-9a-f]{64}$/u.test(value)) {
+    throw new FingerprintCatalogError(
+      "CATALOG_INVALID",
+      `${label} is not a complete lowercase SHA-256 rule id`,
+    );
+  }
+}
+
+function parseCatalogCorrections(
+  file: ParsedCatalogInputFile | undefined,
+  config: ScanConfig,
+): CatalogCorrections {
+  if (file === undefined) {
+    return {
+      dropTechnologies: new Set<string>(),
+      dropRules: new Set<string>(),
+      replaceRules: new Map<string, CatalogRuleReplacement>(),
+    };
+  }
+
+  assertRecord(file.value, "Catalog correction ledger");
+  assertExactKeys(
+    file.value,
+    [
+      "schema",
+      "revision",
+      "appliesTo",
+      "dropTechnologies",
+      "dropRules",
+      "replaceRules",
+    ],
+    "Catalog correction ledger",
+  );
+  if (
+    file.value.schema !== CATALOG_CORRECTIONS_SCHEMA
+    || file.value.revision !== CATALOG_CORRECTIONS_REVISION
+  ) {
+    throw new FingerprintCatalogError(
+      "CATALOG_INVALID",
+      "Catalog correction ledger schema does not match the fixed revision",
+    );
+  }
+
+  const appliesTo = file.value.appliesTo;
+  assertRecord(appliesTo, "Catalog correction ledger appliesTo");
+  assertExactKeys(
+    appliesTo,
+    ["source", "revision", "digest"],
+    "Catalog correction ledger appliesTo",
+  );
+  if (
+    appliesTo.source !== CATALOG_SOURCE
+    || appliesTo.revision !== CATALOG_REVISION
+    || appliesTo.digest !== PINNED_UPSTREAM_DIGEST
+  ) {
+    throw new FingerprintCatalogError(
+      "CATALOG_INVALID",
+      "Catalog correction ledger does not target the pinned upstream revision",
+    );
+  }
+
+  const rawDropTechnologies = file.value.dropTechnologies;
+  const rawDropRules = file.value.dropRules;
+  const rawReplaceRules = file.value.replaceRules;
+  if (
+    !Array.isArray(rawDropTechnologies)
+    || !Array.isArray(rawDropRules)
+    || !Array.isArray(rawReplaceRules)
+  ) {
+    throw new FingerprintCatalogError(
+      "CATALOG_INVALID",
+      "Catalog correction operations must be arrays",
+    );
+  }
+  if (
+    rawDropTechnologies.length > config.limits.detector.technologiesPerCatalog
+    || rawDropRules.length + rawReplaceRules.length
+      > config.limits.detector.patternsPerCatalog
+  ) {
+    throw new FingerprintCatalogError(
+      "CATALOG_LIMIT_EXCEEDED",
+      "Catalog correction ledger exceeds the effective catalog limits",
+    );
+  }
+
+  const dropTechnologies = new Set<string>();
+  for (const name of rawDropTechnologies) {
+    assertBoundedString(
+      name,
+      "Catalog correction technology",
+      config.limits.detector.technologyNameCodePoints * 2,
+    );
+    assertNoAsciiControl(name, "Catalog correction technology");
+    if (dropTechnologies.has(name)) {
+      throw new FingerprintCatalogError(
+        "CATALOG_INVALID",
+        `Catalog correction ledger drops ${name} more than once`,
+      );
+    }
+    dropTechnologies.add(name);
+  }
+
+  const correctedRuleIds = new Set<string>();
+  const dropRules = new Set<string>();
+  for (const targetRuleId of rawDropRules) {
+    assertRuleId(targetRuleId, "Catalog correction dropRules target");
+    if (correctedRuleIds.has(targetRuleId)) {
+      throw new FingerprintCatalogError(
+        "CATALOG_INVALID",
+        `Catalog correction ledger targets ${targetRuleId} more than once`,
+      );
+    }
+    correctedRuleIds.add(targetRuleId);
+    dropRules.add(targetRuleId);
+  }
+
+  const replacementIds = new Set<string>();
+  const replaceRules = new Map<string, CatalogRuleReplacement>();
+  for (const [index, rawReplacement] of rawReplaceRules.entries()) {
+    assertRecord(rawReplacement, `Catalog correction replacement ${index}`);
+    assertExactKeys(
+      rawReplacement,
+      ["targetRuleId", "technology", "source", "locator", "original"],
+      `Catalog correction replacement ${index}`,
+    );
+    const { targetRuleId, technology, source, locator, original } = rawReplacement;
+    assertRuleId(targetRuleId, `Catalog correction replacement ${index} target`);
+    assertBoundedString(
+      technology,
+      `Catalog correction replacement ${index} technology`,
+      config.limits.detector.technologyNameCodePoints * 2,
+    );
+    if (typeof source !== "string" || !ruleSignals.includes(source as EvidenceSource)) {
+      throw new FingerprintCatalogError(
+        "CATALOG_INVALID",
+        `Catalog correction replacement ${index} has an unsupported signal`,
+      );
+    }
+    if (locator !== null) {
+      assertBoundedString(
+        locator,
+        `Catalog correction replacement ${index} locator`,
+        config.limits.detector.patternSourceCodeUnits,
+      );
+      if (normalizeLocator(source as EvidenceSource, locator) !== locator) {
+        throw new FingerprintCatalogError(
+          "CATALOG_INVALID",
+          `Catalog correction replacement ${index} locator is not normalized`,
+        );
+      }
+    }
+    assertBoundedString(
+      original,
+      `Catalog correction replacement ${index} original`,
+      2_304,
+      true,
+    );
+    if (correctedRuleIds.has(targetRuleId)) {
+      throw new FingerprintCatalogError(
+        "CATALOG_INVALID",
+        `Catalog correction ledger targets ${targetRuleId} more than once`,
+      );
+    }
+    correctedRuleIds.add(targetRuleId);
+    const replacementId = sha256Tuple([
+      CUSTOM_RULE_NAMESPACE,
+      technology,
+      source,
+      locator,
+      original,
+    ]);
+    if (replacementIds.has(replacementId)) {
+      throw new FingerprintCatalogError(
+        "CATALOG_INVALID",
+        "Catalog correction ledger contains duplicate replacement rules",
+      );
+    }
+    replacementIds.add(replacementId);
+    replaceRules.set(targetRuleId, {
+      targetRuleId,
+      technology,
+      source: source as EvidenceSource,
+      locator,
+      original,
+    });
+  }
+
+  return { dropTechnologies, dropRules, replaceRules };
+}
+
 function deepFreeze(value: unknown): void {
   if (typeof value !== "object" || value === null || Object.isFrozen(value)) {
     return;
@@ -1049,30 +1276,64 @@ export function loadFingerprintCatalog(
 
   const customRoot = new URL("custom/", rootUrl);
   if (hasCustom) {
-    assertExactDirectoryEntries(customRoot, ["technologies"], "Custom catalog directory");
-    const customTechnologies = new URL("technologies/", customRoot);
-    const entries = readDirectoryEntriesWithTypes(
-      customTechnologies,
-      "Custom technology directory",
-      config.limits.detector.catalogFiles - files.length,
+    const customEntries = readDirectoryEntriesWithTypes(
+      customRoot,
+      "Custom catalog directory",
+      3,
     );
-    for (const entry of entries) {
-      if (
-        !entry.isFile()
-        || entry.isSymbolicLink()
-        || !/^[A-Za-z0-9][A-Za-z0-9._-]*\.json$/u.test(entry.name)
-      ) {
-        throw new FingerprintCatalogError(
-          "CATALOG_INVALID",
-          "Custom catalog contains an entry that is not an allowed JSON file",
+    const correctionEntry = customEntries.find(
+      (entry) => entry.name === "corrections.v1.json",
+    );
+    const technologyEntry = customEntries.find(
+      (entry) => entry.name === "technologies",
+    );
+    if (
+      customEntries.length === 0
+      || customEntries.some((entry) =>
+        entry.name !== "corrections.v1.json" && entry.name !== "technologies")
+      || (correctionEntry !== undefined
+        && (!correctionEntry.isFile() || correctionEntry.isSymbolicLink()))
+      || (technologyEntry !== undefined
+        && (!technologyEntry.isDirectory() || technologyEntry.isSymbolicLink()))
+    ) {
+      throw new FingerprintCatalogError(
+        "CATALOG_INVALID",
+        "Custom catalog directory has an unsupported entry",
+      );
+    }
+    if (correctionEntry !== undefined) {
+      append(
+        "corrections",
+        CUSTOM_RULE_NAMESPACE,
+        "custom/corrections.v1.json",
+        new URL("corrections.v1.json", customRoot),
+      );
+    }
+    if (technologyEntry !== undefined) {
+      const customTechnologies = new URL("technologies/", customRoot);
+      const technologyFiles = readDirectoryEntriesWithTypes(
+        customTechnologies,
+        "Custom technology directory",
+        config.limits.detector.catalogFiles - files.length,
+      );
+      for (const entry of technologyFiles) {
+        if (
+          !entry.isFile()
+          || entry.isSymbolicLink()
+          || !/^[A-Za-z0-9][A-Za-z0-9._-]*\.json$/u.test(entry.name)
+        ) {
+          throw new FingerprintCatalogError(
+            "CATALOG_INVALID",
+            "Custom catalog contains an entry that is not an allowed JSON file",
+          );
+        }
+        append(
+          "technologies",
+          CUSTOM_RULE_NAMESPACE,
+          `custom/technologies/${entry.name}`,
+          new URL(entry.name, customTechnologies),
         );
       }
-      append(
-        "technologies",
-        CUSTOM_RULE_NAMESPACE,
-        `custom/technologies/${entry.name}`,
-        new URL(entry.name, customTechnologies),
-      );
     }
   }
 
@@ -1136,6 +1397,7 @@ export function compileFingerprintCatalog(
       file.kind !== "schema"
       && file.kind !== "categories"
       && file.kind !== "technologies"
+      && file.kind !== "corrections"
     ) {
       throw new FingerprintCatalogError(
         "CATALOG_INVALID",
@@ -1185,6 +1447,11 @@ export function compileFingerprintCatalog(
               file.relativePath,
             ))
         ))
+      || (file.kind === "corrections"
+        && (
+          file.namespace !== CUSTOM_RULE_NAMESPACE
+          || file.relativePath !== "custom/corrections.v1.json"
+        ))
     ) {
       throw new FingerprintCatalogError(
         "CATALOG_INVALID",
@@ -1227,10 +1494,17 @@ export function compileFingerprintCatalog(
   const categoryFiles = parsedFiles.filter((file) => file.kind === "categories");
   const schemaFiles = parsedFiles.filter((file) => file.kind === "schema");
   const technologyFiles = parsedFiles.filter((file) => file.kind === "technologies");
+  const correctionFiles = parsedFiles.filter((file) => file.kind === "corrections");
   if (categoryFiles.length !== 1 || schemaFiles.length !== 1 || technologyFiles.length === 0) {
     throw new FingerprintCatalogError(
       "CATALOG_INVALID",
       "Catalog requires one schema, one category file, and technology files",
+    );
+  }
+  if (correctionFiles.length > 1) {
+    throw new FingerprintCatalogError(
+      "CATALOG_INVALID",
+      "Catalog accepts at most one fixed correction ledger",
     );
   }
   if (!Buffer.from(schemaFiles[0]?.bytes ?? []).equals(fixedSchemaBytes)) {
@@ -1239,6 +1513,18 @@ export function compileFingerprintCatalog(
       "Catalog schema bytes do not match the fixed reviewed schema",
     );
   }
+  if (
+    correctionFiles.length === 1
+    && computeCatalogDigest(
+      parsedFiles.filter((file) => file.namespace === UPSTREAM_RULE_NAMESPACE),
+    ) !== PINNED_UPSTREAM_DIGEST
+  ) {
+    throw new FingerprintCatalogError(
+      "CATALOG_INVALID",
+      "Catalog corrections require the exact pinned upstream bytes",
+    );
+  }
+  const corrections = parseCatalogCorrections(correctionFiles[0], config);
 
   const categoryValue = categoryFiles[0]?.value;
   assertRecord(categoryValue, "Category catalog");
@@ -1320,8 +1606,8 @@ export function compileFingerprintCatalog(
   }
   categories.sort((left, right) => left.id - right.id || compareString(left.name, right.name));
 
-  const drafts: DraftTechnology[] = [];
-  const seenTechnologyNames = new Set<string>();
+  const allDrafts: DraftTechnology[] = [];
+  const declaredTechnologyNames = new Set<string>();
   for (const file of technologyFiles) {
     if (!validateTechnologyDocument(file.value)) {
       const issue = validateTechnologyDocument.errors?.[0];
@@ -1344,34 +1630,48 @@ export function compileFingerprintCatalog(
           `Technology ${name} exceeds the name limit`,
         );
       }
-      if (seenTechnologyNames.has(name)) {
+      if (declaredTechnologyNames.has(name)) {
         throw new FingerprintCatalogError(
           "CATALOG_INVALID",
           `Technology ${name} is declared more than once`,
         );
       }
-      seenTechnologyNames.add(name);
+      declaredTechnologyNames.add(name);
       assertRecord(value, `Technology ${name}`);
-      drafts.push({ namespace: file.namespace, name, value });
+      allDrafts.push({ namespace: file.namespace, name, value });
     }
   }
+  for (const name of corrections.dropTechnologies) {
+    const target = allDrafts.find((draft) => draft.name === name);
+    if (target === undefined || target.namespace !== UPSTREAM_RULE_NAMESPACE) {
+      throw new FingerprintCatalogError(
+        "CATALOG_INVALID",
+        `Catalog correction technology target ${name} is missing or is not upstream`,
+      );
+    }
+  }
+  const drafts = allDrafts.filter(
+    (draft) => !corrections.dropTechnologies.has(draft.name),
+  );
   if (drafts.length > config.limits.detector.technologiesPerCatalog) {
     throw new FingerprintCatalogError(
       "CATALOG_LIMIT_EXCEEDED",
-      "Catalog exceeds the technology-count limit",
+      "Effective catalog exceeds the technology-count limit",
     );
   }
+  const seenTechnologyNames = new Set(drafts.map((draft) => draft.name));
   drafts.sort((left, right) => compareString(left.name, right.name));
 
   const rulesById = new Map<string, CompiledFingerprintRule>();
   const technologyDefinitions: CompiledTechnologyDefinition[] = [];
-  const domSelectors = new Set<string>();
-  const javascriptPaths = new Set<string>();
-  const probePaths = new Set<string>();
   let declarationCount = 0;
   let relationshipCount = 0;
   let regexSourceCount = 0;
   let regexSourceCodeUnits = 0;
+  const correctedTargetCounts = new Map<string, number>([
+    ...[...corrections.dropRules].map((ruleId) => [ruleId, 0] as const),
+    ...[...corrections.replaceRules.keys()].map((ruleId) => [ruleId, 0] as const),
+  ]);
 
   const accountRegex = (source: string, label: string): void => {
     if (source === "") {
@@ -1404,13 +1704,6 @@ export function compileFingerprintCatalog(
     parsedOverride?: TaggedRule,
     literal = false,
   ): void => {
-    declarationCount += 1;
-    if (declarationCount > config.limits.detector.patternsPerCatalog) {
-      throw new FingerprintCatalogError(
-        "CATALOG_LIMIT_EXCEEDED",
-        "Catalog exceeds the direct-rule declaration limit",
-      );
-    }
     assertBoundedString(original, `${draft.name} ${source} rule`, 2_304, true);
     const parsed = parsedOverride
       ?? parseTaggedRule(original, `${draft.name} ${source} rule`);
@@ -1430,47 +1723,97 @@ export function compileFingerprintCatalog(
         config.limits.detector.patternSourceCodeUnits,
       );
     }
-    const locatorPattern = source === "cookie" && locator !== null
-      ? normalizeCookieLocator(locator)
-      : null;
+    const createRule = (
+      namespace: string,
+      effectiveOriginal: string,
+      effectiveParsed: TaggedRule,
+    ): CompiledFingerprintRule => ({
+      ruleId: sha256Tuple([
+        namespace,
+        draft.name,
+        source,
+        locator,
+        effectiveOriginal,
+      ]),
+      namespace,
+      technology: draft.name,
+      source,
+      locator,
+      locatorPattern: source === "cookie" && locator !== null
+        ? normalizeCookieLocator(locator)
+        : null,
+      original: effectiveOriginal,
+      pattern: effectiveParsed.pattern === "" ? null : effectiveParsed.pattern,
+      matchMode: effectiveParsed.pattern === ""
+        ? "presence"
+        : literal
+          ? "literal"
+          : "regex",
+      confidence: effectiveParsed.confidence,
+      versionTemplate: effectiveParsed.versionTemplate,
+    });
+    const upstreamRule = createRule(draft.namespace, original, parsed);
+    let rule = upstreamRule;
+    const targetCount = correctedTargetCounts.get(upstreamRule.ruleId);
+    if (targetCount !== undefined) {
+      correctedTargetCounts.set(upstreamRule.ruleId, targetCount + 1);
+      if (upstreamRule.namespace !== UPSTREAM_RULE_NAMESPACE) {
+        throw new FingerprintCatalogError(
+          "CATALOG_INVALID",
+          `Catalog correction target ${upstreamRule.ruleId} is not upstream`,
+        );
+      }
+      if (corrections.dropRules.has(upstreamRule.ruleId)) {
+        return;
+      }
+      const replacement = corrections.replaceRules.get(upstreamRule.ruleId);
+      if (
+        replacement === undefined
+        || replacement.technology !== upstreamRule.technology
+        || replacement.source !== upstreamRule.source
+        || replacement.locator !== upstreamRule.locator
+      ) {
+        throw new FingerprintCatalogError(
+          "CATALOG_INVALID",
+          `Catalog correction replacement ${upstreamRule.ruleId} changes rule identity`,
+        );
+      }
+      const replacementParsed = parseTaggedRule(
+        replacement.original,
+        `${draft.name} ${source} replacement rule`,
+      );
+      rule = createRule(
+        CUSTOM_RULE_NAMESPACE,
+        replacement.original,
+        replacementParsed,
+      );
+    }
+
     if (
-      parsed.pattern !== ""
-      && parsed.pattern.length > config.limits.detector.patternSourceCodeUnits
+      rule.pattern !== null
+      && rule.pattern.length > config.limits.detector.patternSourceCodeUnits
     ) {
       throw new FingerprintCatalogError(
         "CATALOG_LIMIT_EXCEEDED",
         `${draft.name} ${source} rule exceeds the pattern-source limit`,
       );
     }
-    if (!literal) {
-      accountRegex(parsed.pattern, `${draft.name} ${source} rule`);
+    declarationCount += 1;
+    if (declarationCount > config.limits.detector.patternsPerCatalog) {
+      throw new FingerprintCatalogError(
+        "CATALOG_LIMIT_EXCEEDED",
+        "Catalog exceeds the direct-rule declaration limit",
+      );
     }
-    if (locatorPattern !== null) {
-      accountRegex(locatorPattern, `${draft.name} cookie locator`);
+    if (rule.matchMode === "regex") {
+      accountRegex(rule.pattern ?? "", `${draft.name} ${source} rule`);
     }
-    const ruleId = sha256Tuple([
-      draft.namespace,
-      draft.name,
-      source,
-      locator,
-      original,
-    ]);
-    const rule: CompiledFingerprintRule = {
-      ruleId,
-      namespace: draft.namespace,
-      technology: draft.name,
-      source,
-      locator,
-      locatorPattern,
-      original,
-      pattern: parsed.pattern === "" ? null : parsed.pattern,
-      matchMode: parsed.pattern === "" ? "presence" : literal ? "literal" : "regex",
-      confidence: parsed.confidence,
-      versionTemplate: parsed.versionTemplate,
-    };
-    const previous = rulesById.get(ruleId);
+    if (rule.locatorPattern !== null) {
+      accountRegex(rule.locatorPattern, `${draft.name} cookie locator`);
+    }
+    const previous = rulesById.get(rule.ruleId);
     if (previous === undefined) {
-      rulesById.set(ruleId, rule);
+      rulesById.set(rule.ruleId, rule);
     } else if (JSON.stringify(previous) !== JSON.stringify(rule)) {
       throw new FingerprintCatalogError(
         "CATALOG_INVALID",
@@ -1518,7 +1861,6 @@ export function compileFingerprintCatalog(
             `${draft.name} JavaScript path exceeds the limit`,
           );
         }
-        javascriptPaths.add(locator);
       }
       if (source === "probe") {
         let resolved: URL;
@@ -1549,7 +1891,6 @@ export function compileFingerprintCatalog(
             `${draft.name} probe path is not a safe same-origin path`,
           );
         }
-        probePaths.add(locator);
       }
     }
   };
@@ -1634,7 +1975,6 @@ export function compileFingerprintCatalog(
         for (const original of dom) {
           const parsed = parseSelectorRule(original, `${draft.name}.dom selector`);
           validateSelector(parsed.pattern, `${draft.name}.dom selector`, config);
-          domSelectors.add(parsed.pattern);
           addRule(
             draft,
             "dom",
@@ -1647,7 +1987,6 @@ export function compileFingerprintCatalog(
         assertRecord(dom, `${draft.name}.dom`);
         for (const [selector, matcher] of Object.entries(dom)) {
           validateSelector(selector, `${draft.name}.dom selector`, config);
-          domSelectors.add(selector);
           assertRecord(matcher, `${draft.name}.dom.${selector}`);
           const allowedFields = new Set(["attributes", "exists", "properties", "text"]);
           if (Object.keys(matcher).some((field) => !allowedFields.has(field))) {
@@ -1861,13 +2200,36 @@ export function compileFingerprintCatalog(
     });
   }
 
-  if (domSelectors.size > config.limits.inspection.domSelectors) {
+  for (const [targetRuleId, count] of correctedTargetCounts) {
+    if (count !== 1) {
+      throw new FingerprintCatalogError(
+        "CATALOG_INVALID",
+        `Catalog correction target ${targetRuleId} is missing or duplicated`,
+      );
+    }
+  }
+
+  const rules = [...rulesById.values()].sort((left, right) =>
+    (signalRank.get(left.source) ?? 99) - (signalRank.get(right.source) ?? 99)
+    || compareString(left.technology, right.technology)
+    || compareString(left.locator ?? "", right.locator ?? "")
+    || compareString(left.ruleId, right.ruleId));
+  const probePaths = new Set(
+    rules
+      .filter((rule) => rule.source === "probe" && rule.locator !== null)
+      .map((rule) => rule.locator as string),
+  );
+  const inspectionPlan = createInspectionPlan(rules, probePaths);
+  if (inspectionPlan.dom.length > config.limits.inspection.domSelectors) {
     throw new FingerprintCatalogError(
       "CATALOG_LIMIT_EXCEEDED",
       "Catalog exceeds the DOM inspection-plan limit",
     );
   }
-  if (javascriptPaths.size > config.limits.inspection.javascriptPaths) {
+  if (
+    inspectionPlan.javascript.length
+    > config.limits.inspection.javascriptPaths
+  ) {
     throw new FingerprintCatalogError(
       "CATALOG_LIMIT_EXCEEDED",
       "Catalog exceeds the JavaScript inspection-plan limit",
@@ -1879,12 +2241,6 @@ export function compileFingerprintCatalog(
       "Catalog exceeds the probe inspection-plan limit",
     );
   }
-
-  const rules = [...rulesById.values()].sort((left, right) =>
-    (signalRank.get(left.source) ?? 99) - (signalRank.get(right.source) ?? 99)
-    || compareString(left.technology, right.technology)
-    || compareString(left.locator ?? "", right.locator ?? "")
-    || compareString(left.ruleId, right.ruleId));
   const indexes: CatalogSignalIndex[] = ruleSignals.map((source) => {
     const unkeyedRuleOrdinals: number[] = [];
     const patternLocatorRuleOrdinals: number[] = [];
@@ -1921,7 +2277,7 @@ export function compileFingerprintCatalog(
     technologies: technologyDefinitions,
     rules,
     indexes,
-    inspectionPlan: createInspectionPlan(rules, probePaths),
+    inspectionPlan,
     declarationCount,
     relationshipCount,
     regexSourceCount,

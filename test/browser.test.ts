@@ -27,6 +27,7 @@ import {
 } from "../src/config.ts";
 import type { CatalogInspectionPlan, PageId } from "../src/model.ts";
 import type {
+  BrowserProxyLimitCategory,
   BrowserProxyRequestAttempt,
   ProtectedBrowserProxy,
   ProtectedBrowserProxyCanary,
@@ -141,6 +142,7 @@ class FakeBrowserProxy implements ProtectedBrowserProxy {
   #activePage: PageId | null = null;
   #activeDomain = false;
   #domainRequests = 0;
+  #limitHits = new Set<BrowserProxyLimitCategory>();
 
   constructor(rejectCanary = false) {
     this.#rejectCanary = rejectCanary;
@@ -153,6 +155,7 @@ class FakeBrowserProxy implements ProtectedBrowserProxy {
     this.#failure = null;
     this.#activeDomain = true;
     this.#domainRequests = 0;
+    this.#limitHits.clear();
     this.domains += 1;
     this.lifecycle.push(`activateDomain:${this.domains}`);
   }
@@ -198,6 +201,10 @@ class FakeBrowserProxy implements ProtectedBrowserProxy {
     });
   }
 
+  getLimitHits(): readonly BrowserProxyLimitCategory[] {
+    return Object.freeze([...this.#limitHits].sort());
+  }
+
   getFailure(): ProtectedTransportError | null {
     return this.#failure;
   }
@@ -207,6 +214,9 @@ class FakeBrowserProxy implements ProtectedBrowserProxy {
   }
 
   fail(error: ProtectedTransportError): void {
+    for (const category of error.browserLimitCategories) {
+      this.#limitHits.add(category);
+    }
     this.#failure = error;
     this.#failureController.abort(error);
   }
@@ -607,6 +617,7 @@ class FakePage {
         "tel:+37300000000",
         "javascript:void(0)",
       ],
+      limitHits: [],
       truncated: false,
     };
   }
@@ -905,6 +916,9 @@ test("preflights a safe reusable slot and collects bounded browser facts", async
     "https://merchant-site.org/next",
   ]);
   assert.equal(Object.isFrozen(collection.navigationLinks), true);
+  assert.deepEqual(collection.limitTelemetry, { hits: [] });
+  assert.equal(Object.isFrozen(collection.limitTelemetry), true);
+  assert.equal(Object.isFrozen(collection.limitTelemetry.hits), true);
   const result = await session.finish();
 
   assert.equal(result.completed, true);
@@ -1519,6 +1533,10 @@ test("never requests more than twenty ranked script bodies", async (t) => {
     allowTopLevelUrl: () => true,
   });
   assert.equal(collection.completed, true);
+  assert.deepEqual(collection.limitTelemetry.hits, [{
+    category: "scripts.bodiesPerDomain",
+    domSelectorOrdinal: null,
+  }]);
   const result = await session.finish();
   assert.equal(result.pages[0]?.scriptUrls.length, 25);
   assert.equal(result.pages[0]?.scriptBodies.length, 20);
@@ -1529,6 +1547,39 @@ test("never requests more than twenty ranked script bodies", async (t) => {
   assert.equal(session.getUsage().scriptBodiesInspected, 20);
 });
 
+test("reports simultaneous silent script byte caps without changing status", async (t) => {
+  const runtime = fakeRuntime();
+  const pool = await createBrowserPool(
+    runtime.transport,
+    browserConfig([
+      [["limits", "scripts", "bodyBytes"], 1],
+      [["limits", "scripts", "totalBodyBytesPerDomain"], 1],
+    ]),
+    runtime.launcher,
+  );
+  t.after(() => pool.close());
+  const session = await pool.openDomain();
+  const collection = await session.collectPage({
+    pageId: "p1",
+    url: "https://merchant-site.org/",
+    inspectionPlan,
+    allowTopLevelUrl: () => true,
+  });
+
+  assert.equal(collection.completed, true);
+  assert.deepEqual(collection.limitTelemetry.hits, [{
+    category: "scripts.bodyBytes",
+    domSelectorOrdinal: null,
+  }, {
+    category: "scripts.totalBodyBytesPerDomain",
+    domSelectorOrdinal: null,
+  }]);
+  const result = await session.finish();
+  assert.equal(result.completed, true);
+  assert.equal(result.pages[0]?.truncated, false);
+  assert.deepEqual(result.pages[0]?.scriptBodies, []);
+});
+
 test("keeps browser safety-limit details out of persisted error context", async (t) => {
   const cases = [
     {
@@ -1536,24 +1587,39 @@ test("keeps browser safety-limit details out of persisted error context", async 
         ["limits", "scripts", "totalBodyBytesPerDomain"],
         1,
       ]] as const,
+      expectedLimitHits: ["scripts.totalBodyBytesPerDomain"],
     },
     {
       replacements: [[
         ["limits", "cookies", "nameCodeUnits"],
         1,
       ]] as const,
+      expectedLimitHits: ["cookies.name"],
     },
     {
       replacements: [[
         ["limits", "cookies", "valueBytes"],
         1,
       ]] as const,
+      expectedLimitHits: ["cookies.value"],
     },
     {
       replacements: [[
         ["limits", "cookies", "totalBytesPerDomain"],
         1,
       ]] as const,
+      expectedLimitHits: ["cookies.totalBytesPerDomain"],
+    },
+    {
+      replacements: [
+        [["limits", "browser", "networkHostnamesPerDomain"], 1],
+        [["limits", "browser", "requestsPerPage"], 1],
+        [["limits", "browser", "requestsPerDomain"], 1],
+      ] as const,
+      expectedLimitHits: [
+        "browser.networkHostnamesPerDomain",
+        "browser.networkUrlsPerDomain",
+      ],
     },
   ];
 
@@ -1579,6 +1645,13 @@ test("keeps browser safety-limit details out of persisted error context", async 
       ({ code }) => code === "BROWSER_LIMIT_EXCEEDED",
     ), true);
     assert.equal(collection.errors.every(({ limit }) => limit === null), true);
+    assert.deepEqual(
+      collection.limitTelemetry.hits,
+      testCase.expectedLimitHits.map((category) => ({
+        category,
+        domSelectorOrdinal: null,
+      })),
+    );
     const result = await session.finish();
     assert.equal(result.completed, false);
     assert.equal(result.pages.length, 1);
@@ -2029,6 +2102,80 @@ test("collects a controlled page through the real protected Chromium path", asyn
   assert.deepEqual(noAttributeResult.pages[0]?.dom, []);
   assert.equal(noAttributeResult.pages[0]?.truncated, false);
 
+  const existsOnlyPlan: CatalogInspectionPlan = Object.freeze({
+    ...wildcardPlan,
+    dom: Object.freeze([Object.freeze({
+      selector: "div",
+      facts: Object.freeze([
+        Object.freeze({
+          kind: "exists" as const,
+          name: null,
+          locator: "div:first-exists-rule",
+          demand: Object.freeze({ presence: true, value: false }),
+        }),
+        Object.freeze({
+          kind: "exists" as const,
+          name: null,
+          locator: "div:second-exists-rule",
+          demand: Object.freeze({ presence: true, value: false }),
+        }),
+      ]),
+    })]),
+  });
+  const expectedExistsFacts = [
+    {
+      pageId: "p1",
+      locator: "div:first-exists-rule",
+      fact: { kind: "presence" },
+    },
+    {
+      pageId: "p1",
+      locator: "div:second-exists-rule",
+      fact: { kind: "presence" },
+    },
+  ];
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const existsOnlySession = await pool.openDomain();
+    const existsOnlyCollection = await existsOnlySession.collectPage({
+      pageId: "p1",
+      url: "http://browser-target.org/attribute-none",
+      inspectionPlan: existsOnlyPlan,
+      allowTopLevelUrl: () => true,
+    });
+    assert.equal(existsOnlyCollection.completed, true);
+    assert.equal(existsOnlyCollection.observationsAdmitted, true);
+    assert.equal(
+      existsOnlyCollection.errors.some(
+        ({ code }) => code === "BROWSER_LIMIT_EXCEEDED",
+      ),
+      false,
+    );
+    assert.deepEqual(existsOnlyCollection.limitTelemetry.hits, []);
+    const existsOnlyResult = await existsOnlySession.finish();
+    assert.deepEqual(existsOnlyResult.pages[0]?.dom, expectedExistsFacts);
+    assert.equal(existsOnlyResult.pages[0]?.truncated, false);
+  }
+
+  const missingExistsPlan: CatalogInspectionPlan = Object.freeze({
+    ...wildcardPlan,
+    dom: Object.freeze([Object.freeze({
+      selector: ".missing-exists-only-selector",
+      facts: existsOnlyPlan.dom[0]?.facts ?? Object.freeze([]),
+    })]),
+  });
+  const missingExistsSession = await pool.openDomain();
+  const missingExistsCollection = await missingExistsSession.collectPage({
+    pageId: "p1",
+    url: "http://browser-target.org/attribute-none",
+    inspectionPlan: missingExistsPlan,
+    allowTopLevelUrl: () => true,
+  });
+  assert.equal(missingExistsCollection.completed, true);
+  assert.equal(missingExistsCollection.observationsAdmitted, true);
+  const missingExistsResult = await missingExistsSession.finish();
+  assert.deepEqual(missingExistsResult.pages[0]?.dom, []);
+  assert.equal(missingExistsResult.pages[0]?.truncated, false);
+
   const attributeUnionPlan: CatalogInspectionPlan = Object.freeze({
     ...wildcardPlan,
     dom: Object.freeze([Object.freeze({
@@ -2074,13 +2221,18 @@ test("collects a controlled page through the real protected Chromium path", asyn
   const mixedPlan: CatalogInspectionPlan = Object.freeze({
     ...wildcardPlan,
     dom: Object.freeze([Object.freeze({
-      selector: "*",
+      selector: "div",
       facts: Object.freeze([
-        ...(wildcardPlan.dom[0]?.facts ?? []),
+        Object.freeze({
+          kind: "exists" as const,
+          name: null,
+          locator: "div",
+          demand: Object.freeze({ presence: true, value: false }),
+        }),
         Object.freeze({
           kind: "text" as const,
           name: null,
-          locator: "*:text",
+          locator: "div:text",
           demand: Object.freeze({ presence: false, value: true }),
         }),
       ]),
@@ -2101,8 +2253,23 @@ test("collects a controlled page through the real protected Chromium path", asyn
     ),
     true,
   );
+  assert.deepEqual(mixedCollection.limitTelemetry.hits, [{
+    category: "inspection.domMatches",
+    domSelectorOrdinal: 0,
+  }]);
   const mixedResult = await mixedSession.finish();
   assert.equal(mixedResult.pages[0]?.truncated, true);
+  assert.deepEqual(mixedResult.pages[0]?.dom[0], {
+    pageId: "p1",
+    locator: "div",
+    fact: { kind: "presence" },
+  });
+  assert.equal(
+    mixedResult.pages[0]?.dom.filter(
+      ({ locator, fact }) => locator === "div:text" && fact.kind === "value",
+    ).length,
+    20,
+  );
 
   const exactLimitSession = await pool.openDomain();
   const exactLimitCollection = await exactLimitSession.collectPage({
@@ -2140,6 +2307,10 @@ test("collects a controlled page through the real protected Chromium path", asyn
     ),
     true,
   );
+  assert.deepEqual(truncatedCollection.limitTelemetry.hits, [{
+    category: "inspection.domMatches",
+    domSelectorOrdinal: 0,
+  }]);
   const nextCollection = await truncatedSession.collectPage({
     pageId: "p2",
     url: "http://browser-target.org/attribute-next",
@@ -2149,6 +2320,7 @@ test("collects a controlled page through the real protected Chromium path", asyn
   assert.equal(nextCollection.completed, true);
   assert.equal(nextCollection.observationsAdmitted, true);
   assert.equal(nextCollection.continuationAllowed, true);
+  assert.deepEqual(nextCollection.limitTelemetry.hits, []);
   const truncatedResult = await truncatedSession.finish();
   assert.equal(truncatedResult.completed, false);
   assert.equal(truncatedResult.pages.length, 2);

@@ -26,6 +26,19 @@ import type { CompiledFingerprintCatalog } from "./detect/catalog.ts";
 import { detectHttp, type DetectHttpResult } from "./detect/engine.ts";
 import type { DetectorPool } from "./detect/pool.ts";
 import {
+  createShadowEvaluationSnapshot,
+  SHADOW_EVALUATION_PROTOCOL_REVISION,
+  shadowDetectorView,
+  shadowFullLabel,
+  unavailableShadowDetectorView,
+  type ShadowBrowserLimitHit,
+  type ShadowDetectorView,
+  type ShadowEvaluationSnapshot,
+  type ShadowInternalOutcome,
+  type ShadowPreBrowserFeatures,
+  type ShadowStatusClass,
+} from "./evaluation.ts";
+import {
   ERROR_STAGES,
   sanitizeUrl,
   validateDomainResult,
@@ -116,6 +129,15 @@ export interface ScanDomainOptions {
   readonly signal?: AbortSignal;
   readonly wallClock?: () => Date;
   readonly monotonicClock?: () => number;
+  readonly shadowDetectorPools?: ShadowDetectorPools;
+  readonly onShadowSnapshot?: (
+    snapshot: ShadowEvaluationSnapshot,
+  ) => void | Promise<void>;
+}
+
+export interface ShadowDetectorPools {
+  readonly t1: DetectorPool;
+  readonly t2: DetectorPool;
 }
 
 export interface SelectedInternalPage {
@@ -126,6 +148,32 @@ export interface SelectedInternalPage {
 interface RankedPage extends SelectedInternalPage {
   readonly tokenRank: number;
   readonly pathnameLength: number;
+}
+
+interface PlannedInternalPage extends SelectedInternalPage {
+  readonly reservedForTier2: boolean;
+}
+
+interface CollectedInternalPage {
+  readonly candidate: PlannedInternalPage;
+  readonly publicUrl: string | null;
+  readonly result: HttpPageResult | null;
+  readonly outcome: Exclude<ShadowInternalOutcome, "not-selected">;
+  readonly completed: boolean;
+}
+
+interface TierObservationView {
+  readonly httpPages: readonly HttpPageResult[];
+  readonly probes: HttpProbeResult["observations"];
+  readonly robots: readonly HttpRobotsObservation[];
+  readonly browserPages: BrowserDomainResult["pages"];
+  readonly infrastructure: InfrastructureResult["observations"];
+}
+
+interface TierObservationViews {
+  readonly t1: TierObservationView;
+  readonly t2: TierObservationView;
+  readonly full: TierObservationView;
 }
 
 interface MeasuredRobots {
@@ -353,6 +401,147 @@ export function selectInternalPages(
   );
 }
 
+export function selectTier2InternalPage(
+  entryUrl: string,
+  staticLinks: readonly string[],
+  config: ScanConfig,
+): SelectedInternalPage | null {
+  return selectInternalPages(entryUrl, staticLinks, [], config)[0] ?? null;
+}
+
+function planFullInternalPages(
+  entryUrl: string,
+  staticLinks: readonly string[],
+  renderedLinks: readonly string[],
+  reservedForTier2: SelectedInternalPage | null,
+  config: ScanConfig,
+): readonly PlannedInternalPage[] {
+  const cap = Math.max(0, config.limits.pages.topLevelPerDomain - 1);
+  if (cap === 0) return Object.freeze([]);
+
+  const fullCandidates = selectInternalPages(
+    entryUrl,
+    staticLinks,
+    renderedLinks,
+    config,
+  );
+  if (reservedForTier2 === null) {
+    return Object.freeze(fullCandidates.slice(0, cap).map((candidate) =>
+      Object.freeze({
+        ...candidate,
+        reservedForTier2: false,
+      })));
+  }
+
+  const reservedUsesDetailSlot = reservedForTier2.role === "detail";
+  const additional = fullCandidates.find((candidate) =>
+    candidate.url !== reservedForTier2.url
+    && (candidate.role === "detail") !== reservedUsesDetailSlot);
+  return Object.freeze([
+    Object.freeze({
+      ...reservedForTier2,
+      reservedForTier2: true,
+    }),
+    ...(additional === undefined
+      ? []
+      : [Object.freeze({
+        ...additional,
+        reservedForTier2: false,
+      })]),
+  ].slice(0, cap));
+}
+
+function robotsObservation(check: RobotsCheck): HttpRobotsObservation | null {
+  return check.robotsText === null
+    ? null
+    : Object.freeze({
+      ownerOrigin: check.ownerOrigin,
+      fetchedUrl: check.fetchedUrl,
+      text: check.robotsText,
+    });
+}
+
+function robotsServiceWithInitialCheck(
+  source: RobotsPolicyService,
+  initialUrl: string,
+  initialCheck: RobotsCheck,
+): RobotsPolicyService {
+  return Object.freeze({
+    check(
+      session: ProtectedTransportSession,
+      url: string,
+    ): Promise<RobotsCheck> {
+      return url === initialUrl
+        ? Promise.resolve(initialCheck)
+        : source.check(session, url);
+    },
+    allowsCached(url: string): boolean {
+      return source.allowsCached(url);
+    },
+    clear(): void {
+      source.clear();
+    },
+  });
+}
+
+function remapErrorPageId(
+  error: ScanError,
+  from: PageId,
+  to: PageId,
+): ScanError {
+  return error.pageId !== from
+    ? error
+    : Object.freeze({ ...error, pageId: to });
+}
+
+export function remapHttpPageResultPageId(
+  result: HttpPageResult,
+  pageId: PageId,
+): HttpPageResult {
+  const currentPageId = result.kind === "html"
+    ? result.page.pageId
+    : result.pageId;
+  if (currentPageId === pageId) return result;
+  const remapErrors = (): readonly ScanError[] => Object.freeze(
+    result.errors.map((error) => remapErrorPageId(error, currentPageId, pageId)),
+  );
+
+  if (result.kind === "html") {
+    return Object.freeze({
+      ...result,
+      page: Object.freeze({ ...result.page, pageId }),
+      errors: remapErrors(),
+    });
+  }
+  if (result.kind === "non-html") {
+    return Object.freeze({
+      ...result,
+      pageId,
+      errors: remapErrors(),
+    });
+  }
+  if (result.kind === "failed") {
+    return Object.freeze({
+      ...result,
+      pageId,
+      errors: remapErrors() as readonly [ScanError],
+    });
+  }
+  return Object.freeze({ ...result, pageId });
+}
+
+function tierObservationView(
+  values: TierObservationView,
+): TierObservationView {
+  return Object.freeze({
+    httpPages: Object.freeze([...values.httpPages]),
+    probes: Object.freeze([...values.probes]),
+    robots: Object.freeze([...values.robots]),
+    browserPages: Object.freeze([...values.browserPages]),
+    infrastructure: values.infrastructure,
+  });
+}
+
 function elapsed(
   now: () => number,
   started: number,
@@ -570,12 +759,136 @@ function clampTiming(value: number | null, total: number): number | null {
   return value === null ? null : Math.min(total, Math.max(0, value));
 }
 
+function statusClass(statusCode: number | null): ShadowStatusClass {
+  if (statusCode === null) return null;
+  const group = Math.floor(statusCode / 100);
+  return group >= 2 && group <= 5
+    ? `${group}xx` as ShadowStatusClass
+    : null;
+}
+
+function codePointCount(value: string): number {
+  let count = 0;
+  for (const _codePoint of value) count += 1;
+  return count;
+}
+
+function entryPrefixCompleted(entry: HttpEntryResult): boolean {
+  return entry.kind === "html"
+    ? entry.page.collectionState === "complete" && entry.errors.length === 0
+    : entry.kind === "non-html" && entry.errors.length === 0;
+}
+
+function pagePrefixCompleted(result: HttpPageResult): boolean {
+  if (result.kind === "html") {
+    return result.page.collectionState === "complete"
+      && result.errors.length === 0;
+  }
+  return result.kind === "non-html"
+    ? result.errors.length === 0
+    : result.kind === "skipped";
+}
+
+function compareShadowBrowserLimitHit(
+  left: ShadowBrowserLimitHit,
+  right: ShadowBrowserLimitHit,
+): number {
+  return compareString(left.pageId, right.pageId)
+    || compareString(left.category, right.category)
+    || (left.domSelectorOrdinal ?? -1) - (right.domSelectorOrdinal ?? -1);
+}
+
+function shadowFullCost(
+  result: DomainResult,
+  browserPagesAttempted: number,
+  browserPagesAdmitted: number,
+): ShadowEvaluationSnapshot["fullCost"] {
+  return Object.freeze({
+    browserPagesAttempted,
+    browserPagesAdmitted,
+    browserRequests: result.usage.browserRequests,
+    browserTransferredBytes: result.usage.browserTransferredBytes,
+    browserMs: result.timings.browserMs ?? 0,
+  });
+}
+
+async function emitUnavailableShadowSnapshot(
+  result: DomainResult,
+  options: ScanDomainOptions,
+  reason: "prefix-unavailable" | "detector-unavailable",
+): Promise<DomainResult> {
+  if (options.onShadowSnapshot === undefined) return result;
+  options.signal?.throwIfAborted();
+  const unavailable = unavailableShadowDetectorView(reason);
+  await options.onShadowSnapshot(createShadowEvaluationSnapshot({
+    protocolRevision: SHADOW_EVALUATION_PROTOCOL_REVISION,
+    runId: result.runId,
+    domain: result.domain,
+    t1: unavailable,
+    t2: unavailable,
+    preBrowser: null,
+    full: shadowFullLabel(result),
+    fullCost: shadowFullCost(result, 0, 0),
+    browserLimitHits: Object.freeze([]),
+  }));
+  return result;
+}
+
+async function detectShadowTier(
+  entry: HttpEntryResult,
+  view: TierObservationView,
+  context: ScanDomainContext,
+  pool: DetectorPool,
+  callerSignal: AbortSignal | undefined,
+  prefixErrors: readonly ScanError[],
+  prefixCompleted: boolean,
+): Promise<ShadowDetectorView> {
+  try {
+    const detected = await detectHttp(entry, {
+      catalog: context.catalog,
+      pool,
+      config: context.config,
+      ...view,
+      ...(callerSignal === undefined ? {} : { signal: callerSignal }),
+    });
+    return shadowDetectorView(detected, {
+      errors: prefixErrors,
+      completed: prefixCompleted && detected.completed,
+    });
+  } catch {
+    callerSignal?.throwIfAborted();
+    return unavailableShadowDetectorView("detector-unavailable");
+  }
+}
+
 export async function scanDomain(
   inputDomain: string,
   context: ScanDomainContext,
   options: ScanDomainOptions = {},
 ): Promise<DomainResult> {
   preflight(context);
+  if (
+    (options.onShadowSnapshot === undefined)
+      !== (options.shadowDetectorPools === undefined)
+  ) {
+    throw new TypeError(
+      "Shadow evaluation requires both a snapshot sink and isolated detector pools",
+    );
+  }
+  if (
+    options.shadowDetectorPools !== undefined
+    && (
+      options.shadowDetectorPools.t1.catalog !== context.catalog
+      || options.shadowDetectorPools.t2.catalog !== context.catalog
+      || options.shadowDetectorPools.t1 === context.detectorPool
+      || options.shadowDetectorPools.t2 === context.detectorPool
+      || options.shadowDetectorPools.t1 === options.shadowDetectorPools.t2
+    )
+  ) {
+    throw new TypeError(
+      "Shadow detector pools must be distinct and share the compiled catalog",
+    );
+  }
   const domain = normalizeHostname(
     inputDomain,
     context.config.limits.hostname.inputCodeUnits,
@@ -585,20 +898,20 @@ export async function scanDomain(
   const preflightScannedAt = wallClock().toISOString();
   options.signal?.throwIfAborted();
   if (!context.detectorPool.isAvailable()) {
-    return earlyFailure(
+    return emitUnavailableShadowSnapshot(earlyFailure(
       domain,
       context,
       scanError("detect", "DETECTOR_UNAVAILABLE", true),
       preflightScannedAt,
-    );
+    ), options, "detector-unavailable");
   }
   if (!context.browserPool.isAvailable()) {
-    return earlyFailure(
+    return emitUnavailableShadowSnapshot(earlyFailure(
       domain,
       context,
       scanError("browser", "BROWSER_UNAVAILABLE", true),
       preflightScannedAt,
-    );
+    ), options, "prefix-unavailable");
   }
 
   const deadline = new AbortController();
@@ -633,7 +946,7 @@ export async function scanDomain(
     const activeMs = scanStarted === null ? 0 : elapsed(now, scanStarted);
     const failureTimestamp = scanTimestamp ?? wallClock().toISOString();
     if (deadlineFired) {
-      return earlyFailure(
+      return emitUnavailableShadowSnapshot(earlyFailure(
         domain,
         context,
         scanError(
@@ -643,20 +956,20 @@ export async function scanDomain(
         ),
         failureTimestamp,
         activeMs,
-      );
+      ), options, "prefix-unavailable");
     }
     const observed = error instanceof ProtectedTransportError
       ? observedError(error)
       : error instanceof BrowserLifecycleFailure
       ? scanError("browser", error.code, true)
       : scanError("browser", "BROWSER_UNAVAILABLE", true);
-    return earlyFailure(
+    return emitUnavailableShadowSnapshot(earlyFailure(
       domain,
       context,
       observed,
       failureTimestamp,
       activeMs,
-    );
+    ), options, "prefix-unavailable");
   }
 
   if (scanTimestamp === null || scanStarted === null) {
@@ -677,8 +990,19 @@ export async function scanDomain(
   const errors: ScanError[] = [];
   const httpPages: HttpPageResult[] = [];
   const precheckRobots: HttpRobotsObservation[] = [];
+  const tier2Robots: HttpRobotsObservation[] = [];
+  const tier1PrefixErrors: ScanError[] = [];
+  const tier2PrefixErrors: ScanError[] = [];
+  const browserLimitHits: ShadowBrowserLimitHit[] = [];
   const pages: PageRecord[] = [];
   let entry: HttpEntryResult | null = null;
+  let tier2HttpPage: HttpPageResult | null = null;
+  let tierViews: TierObservationViews | null = null;
+  let preBrowserFeatures: ShadowPreBrowserFeatures | null = null;
+  let tier1PrefixCompleted = false;
+  let tier2PrefixCompleted = false;
+  let browserPagesAttempted = 0;
+  let browserPagesAdmitted = 0;
   let browserResult: BrowserDomainResult = Object.freeze({
     pages: Object.freeze([]),
     errors: Object.freeze([]),
@@ -745,6 +1069,7 @@ export async function scanDomain(
     url: string,
   ): Promise<BrowserPageCollection | null> => {
     const started = now();
+    browserPagesAttempted += 1;
     try {
       const collected = await browserSession.collectPage({
         pageId,
@@ -753,6 +1078,10 @@ export async function scanDomain(
         allowTopLevelUrl: (candidate) =>
           measuredRobots.service.allowsCached(candidate) === true,
       });
+      if (collected.observationsAdmitted) browserPagesAdmitted += 1;
+      for (const hit of collected.limitTelemetry.hits) {
+        browserLimitHits.push(Object.freeze({ ...hit, pageId }));
+      }
       recordNetworkErrorTimings(collected.errors, elapsed(now, started));
       return collected;
     } catch {
@@ -781,6 +1110,97 @@ export async function scanDomain(
     }
   };
 
+  const collectPlannedPage = async (
+    candidate: PlannedInternalPage,
+    pageId: PageId,
+    usedPublicUrls: Set<string>,
+    robotsTargets: readonly HttpRobotsObservation[][],
+  ): Promise<CollectedInternalPage> => {
+    const robotsStarted = now();
+    let check: RobotsCheck;
+    try {
+      check = await measuredRobots.service.check(session, candidate.url);
+    } catch (error) {
+      if (
+        error instanceof ProtectedTransportError
+        || error instanceof RobotsPolicyError
+      ) {
+        errors.push(observedError(error));
+        if (error.stage === "dns") {
+          dnsErrorMs ??= elapsed(now, robotsStarted);
+        } else if (error.stage === "tls") {
+          tlsErrorMs ??= elapsed(now, robotsStarted);
+        }
+      } else {
+        errors.push(scanError("robots", "ROBOTS_UNAVAILABLE", false));
+      }
+      return Object.freeze({
+        candidate,
+        publicUrl: null,
+        result: null,
+        outcome: "skipped" as const,
+        completed: false,
+      });
+    }
+
+    const observation = robotsObservation(check);
+    if (observation !== null) {
+      for (const target of robotsTargets) target.push(observation);
+    }
+    if (!check.allowed) {
+      return Object.freeze({
+        candidate,
+        publicUrl: null,
+        result: Object.freeze({
+          kind: "skipped" as const,
+          pageId,
+          requestedUrl: candidate.url,
+          robots: observation === null
+            ? Object.freeze([])
+            : Object.freeze([observation]),
+          errors: Object.freeze([]) as readonly [],
+        }),
+        outcome: "denied" as const,
+        completed: true,
+      });
+    }
+
+    const publicUrl = sanitizeNetworkUrl(candidate.url, context.config);
+    if (usedPublicUrls.has(publicUrl)) {
+      return Object.freeze({
+        candidate,
+        publicUrl: null,
+        result: null,
+        outcome: "skipped" as const,
+        completed: true,
+      });
+    }
+    usedPublicUrls.add(publicUrl);
+
+    const pageStarted = now();
+    const result = await collectMeasured(() => collectHttpPage(
+      candidate.url,
+      pageId,
+      {
+        config: context.config,
+        session,
+        robots: robotsServiceWithInitialCheck(
+          measuredRobots.service,
+          candidate.url,
+          check,
+        ),
+      },
+    ));
+    recordNetworkErrorTimings(result.errors, elapsed(now, pageStarted));
+    return Object.freeze({
+      candidate,
+      publicUrl,
+      result,
+      outcome: result.kind,
+      completed: pagePrefixCompleted(result),
+    });
+  };
+
   try {
     const targetStarted = now();
     try {
@@ -793,6 +1213,8 @@ export async function scanDomain(
       targetMs = elapsed(now, targetStarted);
     }
     errors.push(...entry.errors);
+    tier1PrefixErrors.push(...entry.errors);
+    tier2PrefixErrors.push(...entry.errors);
     recordNetworkErrorTimings(entry.errors, targetMs ?? 0);
 
     const entryResponse = entry.kind === "html"
@@ -805,8 +1227,27 @@ export async function scanDomain(
       );
     }
 
+    infrastructure = await collectInfrastructure(domain, {
+      config: context.config,
+      session,
+      inspectionPlan: context.catalog.inspectionPlan,
+      httpResult: entry,
+    });
+    errors.push(...infrastructure.errors);
+    tier1PrefixErrors.push(...infrastructure.errors);
+    tier2PrefixErrors.push(...infrastructure.errors);
+    tier1PrefixCompleted = entryPrefixCompleted(entry)
+      && infrastructure.completed;
+
     let renderedLinks: readonly string[] = Object.freeze([]);
+    let reservedForTier2: SelectedInternalPage | null = null;
+    let tier2Outcome: ShadowInternalOutcome = "not-selected";
+    let tier2CollectionCompleted = true;
+    const collectedInternalPages: CollectedInternalPage[] = [];
+    const usedPublicUrls = new Set<string>();
+
     if (entry.kind === "html") {
+      const entryNetworkUrl = entry.page.response.finalNetworkUrl;
       const entryCollectors: PageCollectors = entry.page.collectionState === "failed"
         ? Object.freeze([])
         : Object.freeze(["http"] as const);
@@ -820,6 +1261,90 @@ export async function scanDomain(
         entry.page.response.statusCode,
         entryCollectors,
       ));
+      usedPublicUrls.add((pages[0] as PageRecord).url);
+
+      reservedForTier2 = selectTier2InternalPage(
+        entryNetworkUrl,
+        entry.page.navigationLinks,
+        context.config,
+      );
+      if (reservedForTier2 !== null) {
+        const errorCountBeforeCollection = errors.length;
+        const collected = await collectPlannedPage(
+          Object.freeze({ ...reservedForTier2, reservedForTier2: true }),
+          "p2",
+          usedPublicUrls,
+          [tier2Robots, precheckRobots],
+        );
+        collectedInternalPages.push(collected);
+        tier2Outcome = collected.outcome;
+        tier2CollectionCompleted = collected.completed;
+        tier2PrefixErrors.push(
+          ...errors.slice(errorCountBeforeCollection),
+          ...(collected.result?.errors ?? []),
+        );
+        if (
+          collected.publicUrl !== null
+          && collected.result !== null
+        ) {
+          tier2HttpPage = collected.result;
+        }
+      }
+
+      if (context.catalog.inspectionPlan.probePaths.length > 0) {
+        const probeStarted = now();
+        probeResult = await collectMeasured(() => collectCatalogProbes(
+          entryNetworkUrl,
+          {
+            config: context.config,
+            session,
+            robots: measuredRobots.service,
+            probePaths: context.catalog.inspectionPlan.probePaths,
+            ...(options.signal === undefined
+              ? {}
+              : { callerSignal: options.signal }),
+          },
+        ));
+        errors.push(...probeResult.errors);
+        tier2PrefixErrors.push(...probeResult.errors);
+        tier2Robots.push(...probeResult.robots);
+        precheckRobots.push(...probeResult.robots);
+        recordNetworkErrorTimings(
+          probeResult.errors,
+          elapsed(now, probeStarted),
+        );
+      }
+    }
+
+    tier2PrefixCompleted = tier1PrefixCompleted
+      && tier2CollectionCompleted
+      && probeResult.completed;
+    const preBrowserUsage = session.getUsage();
+    preBrowserFeatures = Object.freeze({
+      entryOutcome: entry.kind,
+      entryStatusClass: statusClass(entryResponse?.statusCode ?? null),
+      entryHtmlBytes: entry.kind === "html"
+        ? Buffer.byteLength(entry.page.html, "utf8")
+        : 0,
+      entryTextCodePoints: entry.kind === "html"
+        ? codePointCount(entry.page.text)
+        : 0,
+      staticNavigationLinks: entry.kind === "html"
+        ? entry.page.navigationLinks.length
+        : 0,
+      metadataEntries: entry.kind === "html" ? entry.page.metadata.length : 0,
+      resourceEntries: entry.kind === "html" ? entry.page.resources.length : 0,
+      dnsRecords: infrastructure.observations.dnsRecords.length,
+      tlsIssuerPresent: infrastructure.observations.tlsIssuer !== null,
+      t2Selected: reservedForTier2 !== null,
+      t2Role: reservedForTier2?.role ?? null,
+      t2Outcome: tier2Outcome,
+      probesObserved: probeResult.observations.length,
+      httpRequests: preBrowserUsage.httpRequests,
+      staticTransferredBytes: preBrowserUsage.staticTransferredBytes,
+    });
+
+    if (entry.kind === "html") {
       if (entry.page.collectionState !== "failed") {
         const collected = await collectBrowser(
           "p1",
@@ -839,78 +1364,44 @@ export async function scanDomain(
         browserPrefixOpen = false;
       }
 
-      const structurallySelected = selectInternalPages(
+      const structurallySelected = planFullInternalPages(
         entry.page.response.finalNetworkUrl,
         entry.page.navigationLinks,
         renderedLinks,
+        reservedForTier2,
         context.config,
       );
-      const selected: Array<SelectedInternalPage & {
-        readonly publicUrl: string;
-      }> = [];
-      const sanitized = new Set(pages.map((page) => page.url));
-      for (const candidate of structurallySelected.slice(0, 2)) {
-        const robotsStarted = now();
-        try {
-          const check = await measuredRobots.service.check(session, candidate.url);
-          if (check.robotsText !== null) {
-            precheckRobots.push(Object.freeze({
-              ownerOrigin: check.ownerOrigin,
-              fetchedUrl: check.fetchedUrl,
-              text: check.robotsText,
-            }));
-          }
-          if (!check.allowed) continue;
-          const publicUrl = sanitizeNetworkUrl(candidate.url, context.config);
-          if (sanitized.has(publicUrl)) continue;
-          sanitized.add(publicUrl);
-          selected.push(Object.freeze({ ...candidate, publicUrl }));
-        } catch (error) {
-          if (
-            error instanceof ProtectedTransportError
-            || error instanceof RobotsPolicyError
-          ) {
-            errors.push(observedError(error));
-            if (error.stage === "dns") {
-              dnsErrorMs ??= elapsed(now, robotsStarted);
-            } else if (error.stage === "tls") {
-              tlsErrorMs ??= elapsed(now, robotsStarted);
-            }
-          } else {
-            errors.push(scanError("robots", "ROBOTS_UNAVAILABLE", false));
-          }
-        }
-      }
-      selected.sort((left, right) => compareString(left.publicUrl, right.publicUrl));
-
-      let nextPageRank = 2;
-      for (const candidate of selected) {
-        const pageId = `p${nextPageRank}` as PageId;
-        const pageStarted = now();
-        const pageResult = await collectMeasured(() => collectHttpPage(
-          candidate.url,
-          pageId,
-          {
-            config: context.config,
-            session,
-            robots: measuredRobots.service,
-          },
+      for (let index = 0; index < structurallySelected.length; index += 1) {
+        const candidate = structurallySelected[index] as PlannedInternalPage;
+        if (candidate.reservedForTier2) continue;
+        collectedInternalPages.push(await collectPlannedPage(
+          candidate,
+          `p${index + 2}` as PageId,
+          usedPublicUrls,
+          [precheckRobots],
         ));
+      }
+
+      const admitted = collectedInternalPages
+        .filter((collected): collected is CollectedInternalPage & {
+          readonly publicUrl: string;
+          readonly result: Exclude<HttpPageResult, { readonly kind: "skipped" }>;
+        } => collected.publicUrl !== null
+          && collected.result !== null
+          && collected.result.kind !== "skipped")
+        .sort((left, right) => compareString(left.publicUrl, right.publicUrl));
+
+      for (let index = 0; index < admitted.length; index += 1) {
+        const collected = admitted[index]!;
+        const pageId = `p${index + 2}` as PageId;
+        const pageResult = remapHttpPageResultPageId(collected.result, pageId);
         httpPages.push(pageResult);
         errors.push(...pageResult.errors);
-        recordNetworkErrorTimings(
-          pageResult.errors,
-          elapsed(now, pageStarted),
-        );
-        if (pageResult.kind === "skipped") {
-          continue;
-        }
-        nextPageRank += 1;
         const response = responseFor(pageResult);
         let page = freezePage(
           pageId,
-          candidate.role,
-          candidate.publicUrl,
+          collected.candidate.role,
+          collected.publicUrl,
           response?.statusCode ?? null,
           collectorsForHttp(pageResult),
         );
@@ -920,20 +1411,20 @@ export async function scanDomain(
           && pageResult.kind === "html"
           && pageResult.page.collectionState !== "failed"
         ) {
-          const collected = await collectBrowser(
+          const browserPage = await collectBrowser(
             pageId,
             pageResult.page.response.finalNetworkUrl,
           );
-          if (collected === null) {
+          if (browserPage === null) {
             browserPrefixOpen = false;
-          } else if (collected.observationsAdmitted) {
+          } else if (browserPage.observationsAdmitted) {
             page = withBrowser(page);
             pages[pages.length - 1] = page;
           }
-          if (collected !== null && !collected.continuationAllowed) {
+          if (browserPage !== null && !browserPage.continuationAllowed) {
             browserPrefixOpen = false;
           }
-          if (collected !== null) errors.push(...collected.errors);
+          if (browserPage !== null) errors.push(...browserPage.errors);
         } else {
           browserPrefixOpen = false;
         }
@@ -941,42 +1432,6 @@ export async function scanDomain(
     } else {
       browserPrefixOpen = false;
     }
-
-    const probeFinalUrl = entry.kind === "html"
-      ? entry.page.response.finalNetworkUrl
-      : null;
-    if (
-      probeFinalUrl !== null
-      && context.catalog.inspectionPlan.probePaths.length > 0
-    ) {
-      const probeStarted = now();
-      probeResult = await collectMeasured(() => collectCatalogProbes(
-        probeFinalUrl,
-        {
-          config: context.config,
-          session,
-          robots: measuredRobots.service,
-          probePaths: context.catalog.inspectionPlan.probePaths,
-          ...(options.signal === undefined
-            ? {}
-            : { callerSignal: options.signal }),
-        },
-      ));
-      errors.push(...probeResult.errors);
-      precheckRobots.push(...probeResult.robots);
-      recordNetworkErrorTimings(
-        probeResult.errors,
-        elapsed(now, probeStarted),
-      );
-    }
-
-    infrastructure = await collectInfrastructure(domain, {
-      config: context.config,
-      session,
-      inspectionPlan: context.catalog.inspectionPlan,
-      httpResult: entry,
-    });
-    errors.push(...infrastructure.errors);
 
     const finishStarted = now();
     try {
@@ -1000,17 +1455,39 @@ export async function scanDomain(
       browserMs = (browserMs ?? 0) + elapsed(now, finishStarted);
     }
 
+    tierViews = Object.freeze({
+      t1: tierObservationView({
+        httpPages: Object.freeze([]),
+        probes: Object.freeze([]),
+        robots: Object.freeze([]),
+        browserPages: Object.freeze([]),
+        infrastructure: infrastructure.observations,
+      }),
+      t2: tierObservationView({
+        httpPages: tier2HttpPage === null
+          ? Object.freeze([])
+          : Object.freeze([tier2HttpPage]),
+        probes: probeResult.observations,
+        robots: tier2Robots,
+        browserPages: Object.freeze([]),
+        infrastructure: infrastructure.observations,
+      }),
+      full: tierObservationView({
+        httpPages,
+        probes: probeResult.observations,
+        robots: precheckRobots,
+        browserPages: browserResult.pages,
+        infrastructure: infrastructure.observations,
+      }),
+    });
+
     const detectStarted = now();
     try {
       detection = await detectHttp(entry, {
         catalog: context.catalog,
         pool: context.detectorPool,
         config: context.config,
-        httpPages,
-        probes: probeResult.observations,
-        robots: Object.freeze([...precheckRobots]),
-        browserPages: browserResult.pages,
-        infrastructure: infrastructure.observations,
+        ...tierViews.full,
         signal,
       });
       errors.push(...detection.errors);
@@ -1234,6 +1711,65 @@ export async function scanDomain(
       expectedConfigDigest: context.provenance.configDigest,
       signalAdmitted,
     });
+  }
+  if (deadlineTimer !== null) {
+    clearTimeout(deadlineTimer);
+    deadlineTimer = null;
+  }
+  if (options.onShadowSnapshot !== undefined) {
+    options.signal?.throwIfAborted();
+    let t1: ShadowDetectorView;
+    let t2: ShadowDetectorView;
+    if (entry === null || tierViews === null) {
+      t1 = unavailableShadowDetectorView("prefix-unavailable");
+      t2 = unavailableShadowDetectorView("prefix-unavailable");
+    } else {
+      [t1, t2] = await Promise.all([
+        detectShadowTier(
+          entry,
+          tierViews.t1,
+          context,
+          options.shadowDetectorPools!.t1,
+          options.signal,
+          tier1PrefixErrors,
+          tier1PrefixCompleted,
+        ),
+        detectShadowTier(
+          entry,
+          tierViews.t2,
+          context,
+          options.shadowDetectorPools!.t2,
+          options.signal,
+          tier2PrefixErrors,
+          tier2PrefixCompleted,
+        ),
+      ]);
+    }
+    const uniqueLimitHits = new Map<string, ShadowBrowserLimitHit>();
+    for (const hit of browserLimitHits) {
+      uniqueLimitHits.set(JSON.stringify([
+        hit.pageId,
+        hit.category,
+        hit.domSelectorOrdinal,
+      ]), hit);
+    }
+    const snapshot = createShadowEvaluationSnapshot({
+      protocolRevision: SHADOW_EVALUATION_PROTOCOL_REVISION,
+      runId: context.runId,
+      domain,
+      t1,
+      t2,
+      preBrowser: preBrowserFeatures,
+      full: shadowFullLabel(validated),
+      fullCost: shadowFullCost(
+        validated,
+        browserPagesAttempted,
+        browserPagesAdmitted,
+      ),
+      browserLimitHits: Object.freeze([...uniqueLimitHits.values()]
+        .sort(compareShadowBrowserLimitHit)),
+    });
+    await options.onShadowSnapshot(snapshot);
   }
   return validated;
   } finally {

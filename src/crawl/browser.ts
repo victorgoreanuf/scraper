@@ -31,12 +31,14 @@ import type {
   ScanError,
 } from "../model.ts";
 import { isPublicIpAddress, normalizeHostname } from "../network-policy.ts";
-import type {
-  ProtectedBrowserProxy,
-  ProtectedBrowserProxyCanary,
-  ProtectedBrowserProxyUsage,
-  ProtectedHttpTransport,
-  ProtectedTransportError,
+import {
+  BROWSER_PROXY_LIMIT_CATEGORIES,
+  type BrowserProxyLimitCategory,
+  type ProtectedBrowserProxy,
+  type ProtectedBrowserProxyCanary,
+  type ProtectedBrowserProxyUsage,
+  type ProtectedHttpTransport,
+  type ProtectedTransportError,
 } from "./transport.ts";
 
 const SAFE_CHROMIUM_ARGS = Object.freeze([
@@ -82,6 +84,68 @@ export interface BrowserPageCollection {
   readonly continuationAllowed: boolean;
   readonly errors: readonly ScanError[];
   readonly navigationLinks: readonly string[];
+  readonly limitTelemetry: BrowserLimitTelemetry;
+}
+
+export type BrowserObservationLimitCategory =
+  | "inspection.domMatches"
+  | "inspection.domAccess"
+  | "inspection.returnedValue"
+  | "inspection.returnedValuesPerPage"
+  | "inspection.navigationLinksCount"
+  | "inspection.navigationLinkInvalid"
+  | "cookies.name"
+  | "cookies.value"
+  | "cookies.perDomain"
+  | "cookies.totalBytesPerDomain"
+  | "browser.networkHostnamesPerDomain"
+  | "browser.networkUrlsPerDomain"
+  | "scripts.bodyBytes"
+  | "scripts.bodiesPerDomain"
+  | "scripts.totalBodyBytesPerDomain";
+
+const BROWSER_EVALUATION_LIMIT_CATEGORIES = Object.freeze([
+  "inspection.domMatches",
+  "inspection.domAccess",
+  "inspection.returnedValue",
+  "inspection.returnedValuesPerPage",
+  "inspection.navigationLinksCount",
+  "inspection.navigationLinkInvalid",
+] as const satisfies readonly BrowserObservationLimitCategory[]);
+
+export const BROWSER_OBSERVATION_LIMIT_CATEGORIES = Object.freeze([
+  ...BROWSER_EVALUATION_LIMIT_CATEGORIES,
+  "cookies.name",
+  "cookies.value",
+  "cookies.perDomain",
+  "cookies.totalBytesPerDomain",
+  "browser.networkHostnamesPerDomain",
+  "browser.networkUrlsPerDomain",
+  "scripts.bodyBytes",
+  "scripts.bodiesPerDomain",
+  "scripts.totalBodyBytesPerDomain",
+] as const satisfies readonly BrowserObservationLimitCategory[]);
+
+const browserEvaluationLimitCategorySet = new Set<string>([
+  ...BROWSER_EVALUATION_LIMIT_CATEGORIES,
+]);
+
+export type BrowserLimitCategory =
+  | BrowserObservationLimitCategory
+  | BrowserProxyLimitCategory;
+
+export const BROWSER_LIMIT_CATEGORIES = Object.freeze([
+  ...BROWSER_OBSERVATION_LIMIT_CATEGORIES,
+  ...BROWSER_PROXY_LIMIT_CATEGORIES,
+] as const satisfies readonly BrowserLimitCategory[]);
+
+export interface BrowserLimitTelemetry {
+  readonly hits: readonly BrowserLimitHit[];
+}
+
+export interface BrowserLimitHit {
+  readonly category: BrowserLimitCategory;
+  readonly domSelectorOrdinal: number | null;
 }
 
 export interface BrowserDomainResult {
@@ -157,6 +221,7 @@ interface ActivePageState {
   readonly networkHostnames: Set<string>;
   readonly networkUrls: Set<string>;
   readonly errors: ScanError[];
+  readonly limitHits: Map<string, BrowserLimitHit>;
   navigationLocked: boolean;
   policyDenied: boolean;
   truncated: boolean;
@@ -199,6 +264,7 @@ interface EvaluationDomFact {
 }
 
 interface EvaluationDomInspection {
+  readonly ordinal: number;
   readonly selector: string;
   readonly facts: readonly EvaluationDomFact[];
 }
@@ -230,6 +296,10 @@ interface EvaluationFact {
 interface EvaluationOutput {
   readonly facts: readonly EvaluationFact[];
   readonly links: readonly string[];
+  readonly limitHits: readonly {
+    readonly category: BrowserObservationLimitCategory;
+    readonly domSelectorOrdinal: number | null;
+  }[];
   readonly truncated: boolean;
 }
 
@@ -327,6 +397,41 @@ function proxyError(error: ProtectedTransportError, pageId: PageId | null): Scan
     signal: null,
     limit: null,
     catalogRevision: null,
+  });
+}
+
+function emptyBrowserLimitTelemetry(): BrowserLimitTelemetry {
+  return Object.freeze({
+    hits: Object.freeze([]),
+  });
+}
+
+function limitHitIdentity(
+  category: BrowserLimitCategory,
+  domSelectorOrdinal: number | null,
+): string {
+  return `${category}\0${domSelectorOrdinal ?? ""}`;
+}
+
+function addLimitHit(
+  target: Map<string, BrowserLimitHit>,
+  category: BrowserLimitCategory,
+  domSelectorOrdinal: number | null = null,
+): void {
+  target.set(
+    limitHitIdentity(category, domSelectorOrdinal),
+    Object.freeze({ category, domSelectorOrdinal }),
+  );
+}
+
+function compareLimitHit(left: BrowserLimitHit, right: BrowserLimitHit): number {
+  return compareString(left.category, right.category)
+    || (left.domSelectorOrdinal ?? -1) - (right.domSelectorOrdinal ?? -1);
+}
+
+function browserLimitTelemetry(state: ActivePageState): BrowserLimitTelemetry {
+  return Object.freeze({
+    hits: Object.freeze([...state.limitHits.values()].sort(compareLimitHit)),
   });
 }
 
@@ -557,10 +662,38 @@ function inspectRenderedPage(input: EvaluationInput): EvaluationOutput {
   let totalBytes = 0;
   let valueBudgetExhausted = false;
   let truncated = false;
+  const limitHits = new Map<string, {
+    readonly category: BrowserObservationLimitCategory;
+    readonly domSelectorOrdinal: number | null;
+  }>();
+  const addEvaluationLimitHit = (
+    category: BrowserObservationLimitCategory,
+    domSelectorOrdinal: number | null = null,
+  ): void => {
+    const identity = `${category}\0${domSelectorOrdinal ?? ""}`;
+    limitHits.set(identity, { category, domSelectorOrdinal });
+  };
+  const compareEvaluationLimitHit = (
+    left: {
+      readonly category: BrowserObservationLimitCategory;
+      readonly domSelectorOrdinal: number | null;
+    },
+    right: {
+      readonly category: BrowserObservationLimitCategory;
+      readonly domSelectorOrdinal: number | null;
+    },
+  ): number => {
+    const categoryOrder = left.category < right.category
+      ? -1
+      : left.category > right.category ? 1 : 0;
+    return categoryOrder
+      || (left.domSelectorOrdinal ?? -1) - (right.domSelectorOrdinal ?? -1);
+  };
   const boundedMatches = (
     selector: string,
     maximum: number,
     demandedAttributes: readonly string[] | null,
+    firstMatchIsComplete: boolean,
   ): readonly ElementLike[] => {
     const root = pageGlobal.document.documentElement;
     if (root === null) {
@@ -579,7 +712,7 @@ function inspectRenderedPage(input: EvaluationInput): EvaluationOutput {
         )
       ) {
         matches.push(candidate);
-        if (matches.length > maximum) {
+        if (firstMatchIsComplete || matches.length > maximum) {
           break;
         }
       }
@@ -616,6 +749,7 @@ function inspectRenderedPage(input: EvaluationInput): EvaluationOutput {
         || !converted.isWellFormed()
       ) {
         truncated = true;
+        addEvaluationLimitHit("inspection.returnedValue");
         if (needsPresence) {
           facts.push({ scope, ordinal, kind: "presence" });
         }
@@ -629,6 +763,9 @@ function inspectRenderedPage(input: EvaluationInput): EvaluationOutput {
           return;
         }
         valueBudgetExhausted = true;
+        addEvaluationLimitHit("inspection.returnedValuesPerPage");
+      } else {
+        addEvaluationLimitHit("inspection.returnedValue");
       }
       truncated = true;
     }
@@ -638,6 +775,8 @@ function inspectRenderedPage(input: EvaluationInput): EvaluationOutput {
   };
 
   for (const inspection of input.dom) {
+    const existsOnly = inspection.facts.length > 0
+      && inspection.facts.every(({ kind }) => kind === "exists");
     const demandedAttributes: string[] = [];
     let attributeOnly = inspection.facts.length > 0;
     for (const fact of inspection.facts) {
@@ -653,14 +792,17 @@ function inspectRenderedPage(input: EvaluationInput): EvaluationOutput {
         inspection.selector,
         input.matchesPerSelector,
         attributeOnly ? demandedAttributes : null,
+        existsOnly,
       );
     } catch {
       truncated = true;
+      addEvaluationLimitHit("inspection.domAccess", inspection.ordinal);
       continue;
     }
     const count = Math.min(elements.length, input.matchesPerSelector);
     if (elements.length > count) {
       truncated = true;
+      addEvaluationLimitHit("inspection.domMatches", inspection.ordinal);
     }
     for (const fact of inspection.facts) {
       if (fact.kind === "exists") {
@@ -758,6 +900,7 @@ function inspectRenderedPage(input: EvaluationInput): EvaluationOutput {
   const linkCount = Math.min(pageGlobal.document.links.length, input.links + 1);
   if (pageGlobal.document.links.length > linkCount) {
     truncated = true;
+    addEvaluationLimitHit("inspection.navigationLinksCount");
   }
   for (let index = 0; index < linkCount; index += 1) {
     const href = pageGlobal.document.links[index]?.href;
@@ -769,14 +912,21 @@ function inspectRenderedPage(input: EvaluationInput): EvaluationOutput {
       links.push(href);
     } else if (href !== undefined) {
       truncated = true;
+      addEvaluationLimitHit("inspection.navigationLinkInvalid");
     }
   }
   if (links.length > input.links) {
     links.length = input.links;
     truncated = true;
+    addEvaluationLimitHit("inspection.navigationLinksCount");
   }
 
-  return { facts, links, truncated };
+  return {
+    facts,
+    links,
+    limitHits: [...limitHits.values()].sort(compareEvaluationLimitHit),
+    truncated,
+  };
 }
 
 function inspectionEvaluationInput(
@@ -788,7 +938,8 @@ function inspectionEvaluationInput(
   readonly javascriptByOrdinal: readonly CatalogJavascriptInspection[];
 } {
   const domByOrdinal: CatalogDomFact[] = [];
-  const dom: EvaluationDomInspection[] = plan.dom.map((inspection) => ({
+  const dom: EvaluationDomInspection[] = plan.dom.map((inspection, ordinal) => ({
+    ordinal,
     selector: inspection.selector,
     facts: inspection.facts.map((fact) => {
       const ordinal = domByOrdinal.length;
@@ -829,6 +980,7 @@ function inspectionEvaluationInput(
 function validateEvaluationOutput(
   output: EvaluationOutput,
   domByOrdinal: readonly CatalogDomFact[],
+  domInspectionCount: number,
   javascriptByOrdinal: readonly CatalogJavascriptInspection[],
   pageId: PageId,
   config: ScanConfig,
@@ -836,6 +988,7 @@ function validateEvaluationOutput(
   readonly dom: readonly BrowserDomObservation[];
   readonly javascript: readonly BrowserJavascriptObservation[];
   readonly links: readonly string[];
+  readonly limitTelemetry: BrowserLimitTelemetry;
   readonly truncated: boolean;
 } {
   const maximumFacts = domByOrdinal.reduce(
@@ -850,8 +1003,41 @@ function validateEvaluationOutput(
     || typeof output.truncated !== "boolean"
     || !Array.isArray(output.facts)
     || output.facts.length > maximumFacts
+    || !Array.isArray(output.limitHits)
+    || output.limitHits.length
+      > 4 + domInspectionCount * 2
   ) {
     throw new TypeError("Browser returned an invalid inspection result");
+  }
+  const limitHits = new Map<string, BrowserLimitHit>();
+  for (const raw of output.limitHits) {
+    if (
+      raw === null
+      || typeof raw !== "object"
+      || typeof raw.category !== "string"
+      || !browserEvaluationLimitCategorySet.has(raw.category)
+      || (raw.domSelectorOrdinal !== null
+        && (!Number.isSafeInteger(raw.domSelectorOrdinal)
+          || raw.domSelectorOrdinal < 0
+          || raw.domSelectorOrdinal >= domInspectionCount))
+      || ((raw.category === "inspection.domMatches"
+          || raw.category === "inspection.domAccess")
+        !== (raw.domSelectorOrdinal !== null))
+    ) {
+      throw new TypeError("Browser returned invalid limit telemetry");
+    }
+    const category = raw.category as BrowserObservationLimitCategory;
+    const identity = limitHitIdentity(category, raw.domSelectorOrdinal);
+    if (limitHits.has(identity)) {
+      throw new TypeError("Browser returned invalid selector telemetry");
+    }
+    limitHits.set(identity, Object.freeze({
+      category,
+      domSelectorOrdinal: raw.domSelectorOrdinal,
+    }));
+  }
+  if (output.truncated !== (limitHits.size > 0)) {
+    throw new TypeError("Browser returned inconsistent limit telemetry");
   }
   const dom: BrowserDomObservation[] = [];
   const javascript: BrowserJavascriptObservation[] = [];
@@ -927,6 +1113,9 @@ function validateEvaluationOutput(
     dom: Object.freeze(dom),
     javascript: Object.freeze(javascript),
     links: Object.freeze(links),
+    limitTelemetry: Object.freeze({
+      hits: Object.freeze([...limitHits.values()].sort(compareLimitHit)),
+    }),
     truncated: output.truncated,
   };
 }
@@ -1569,6 +1758,15 @@ function compareScriptCandidate(left: ScriptCandidate, right: ScriptCandidate): 
     || compareString(left.requestId, right.requestId);
 }
 
+function hasMeasuredScriptBody(candidate: ScriptCandidate): boolean {
+  return candidate.complete
+    && !candidate.failed
+    && Number.isSafeInteger(candidate.decodedBytes)
+    && candidate.decodedBytes > 0
+    && Number.isSafeInteger(candidate.encodedBytes)
+    && candidate.encodedBytes >= 0;
+}
+
 async function readMeasuredScript(
   candidate: ScriptCandidate,
   config: ScanConfig,
@@ -2204,6 +2402,7 @@ class BrowserDomainSessionImpl implements BrowserDomainSession {
         continuationAllowed: false,
         errors: [error],
         navigationLinks: Object.freeze([]),
+        limitTelemetry: emptyBrowserLimitTelemetry(),
       });
     }
 
@@ -2214,6 +2413,7 @@ class BrowserDomainSessionImpl implements BrowserDomainSession {
       networkHostnames: new Set<string>(),
       networkUrls: new Set<string>(),
       errors: pageErrors,
+      limitHits: new Map<string, BrowserLimitHit>(),
       navigationLocked: false,
       policyDenied: false,
       truncated: false,
@@ -2353,10 +2553,14 @@ class BrowserDomainSessionImpl implements BrowserDomainSession {
       const inspected = validateEvaluationOutput(
         raw,
         evaluation.domByOrdinal,
+        evaluation.input.dom.length,
         evaluation.javascriptByOrdinal,
         input.pageId,
         this.#config,
       );
+      for (const hit of inspected.limitTelemetry.hits) {
+        addLimitHit(state.limitHits, hit.category, hit.domSelectorOrdinal);
+      }
       if (inspected.truncated) {
         state.truncated = true;
         pageErrors.push(browserError(
@@ -2453,6 +2657,9 @@ class BrowserDomainSessionImpl implements BrowserDomainSession {
     }
 
     const errors = uniqueErrors(pageErrors);
+    for (const category of this.#slot.proxy.getLimitHits()) {
+      addLimitHit(state.limitHits, category);
+    }
     const onlyRecoverableTruncation = state.truncated
       && errors.every((error) =>
         error.stage === "browser"
@@ -2475,6 +2682,7 @@ class BrowserDomainSessionImpl implements BrowserDomainSession {
       continuationAllowed,
       errors,
       navigationLinks: admittedNavigationLinks,
+      limitTelemetry: browserLimitTelemetry(state),
     });
   }
 
@@ -2816,30 +3024,36 @@ class BrowserDomainSessionImpl implements BrowserDomainSession {
       }
       const valueBytes = Buffer.byteLength(cookie.value, "utf8");
       const cookieBytes = Buffer.byteLength(cookie.name, "utf8") + valueBytes;
-      let limit: string | null = null;
+      const limitCategories: BrowserObservationLimitCategory[] = [];
       if (
         cookie.name.length === 0
         || cookie.name.length > this.#config.limits.cookies.nameCodeUnits
         || !cookie.name.isWellFormed()
       ) {
-        limit = "cookies.nameCodeUnits";
-      } else if (
+        limitCategories.push("cookies.name");
+      }
+      if (
         !cookie.value.isWellFormed()
         || valueBytes > this.#config.limits.cookies.valueBytes
       ) {
-        limit = "cookies.valueBytes";
-      } else if (
+        limitCategories.push("cookies.value");
+      }
+      if (
         this.#cookieIdentities.size >= this.#config.limits.cookies.perDomain
       ) {
-        limit = "cookies.perDomain";
-      } else if (
+        limitCategories.push("cookies.perDomain");
+      }
+      if (
         this.#cookieBytes + cookieBytes
           > this.#config.limits.cookies.totalBytesPerDomain
       ) {
-        limit = "cookies.totalBytesPerDomain";
+        limitCategories.push("cookies.totalBytesPerDomain");
       }
-      if (limit !== null) {
+      if (limitCategories.length > 0) {
         state.truncated = true;
+        for (const category of limitCategories) {
+          addLimitHit(state.limitHits, category);
+        }
         state.errors.push(browserError(
           "BROWSER_LIMIT_EXCEEDED",
           pageId,
@@ -2871,6 +3085,7 @@ class BrowserDomainSessionImpl implements BrowserDomainSession {
         hostnames.push(hostname);
       } else {
         state.truncated = true;
+        addLimitHit(state.limitHits, "browser.networkHostnamesPerDomain");
         state.errors.push(browserError(
           "BROWSER_LIMIT_EXCEEDED",
           state.input.pageId,
@@ -2887,6 +3102,7 @@ class BrowserDomainSessionImpl implements BrowserDomainSession {
         urls.push(url);
       } else {
         state.truncated = true;
+        addLimitHit(state.limitHits, "browser.networkUrlsPerDomain");
         state.errors.push(browserError(
           "BROWSER_LIMIT_EXCEEDED",
           state.input.pageId,
@@ -2909,9 +3125,18 @@ class BrowserDomainSessionImpl implements BrowserDomainSession {
         this.#scriptCandidates.set(candidate.url, candidate);
       }
     }
-    const ranked = [...this.#scriptCandidates.values()]
-      .sort(compareScriptCandidate)
-      .slice(0, this.#config.limits.scripts.bodiesPerDomain);
+    const sorted = [...this.#scriptCandidates.values()]
+      .sort(compareScriptCandidate);
+    const ranked = sorted.slice(
+      0,
+      this.#config.limits.scripts.bodiesPerDomain,
+    );
+    if (
+      sorted.slice(this.#config.limits.scripts.bodiesPerDomain)
+        .some(hasMeasuredScriptBody)
+    ) {
+      addLimitHit(state.limitHits, "scripts.bodiesPerDomain");
+    }
     const next = new Map<string, SelectedScript>();
     let retainedBytes = 0;
 
@@ -2922,20 +3147,18 @@ class BrowserDomainSessionImpl implements BrowserDomainSession {
         selected = current;
       } else {
         const attemptIdentity = `${candidate.pageId}\0${candidate.requestId}`;
-        const measurable = candidate.complete
-          && !candidate.failed
-          && Number.isSafeInteger(candidate.decodedBytes)
-          && candidate.decodedBytes > 0
-          && candidate.decodedBytes <= this.#config.limits.scripts.bodyBytes
-          && Number.isSafeInteger(candidate.encodedBytes)
-          && candidate.encodedBytes <= this.#config.limits.scripts.bodyBytes;
+        const measurableSize = hasMeasuredScriptBody(candidate);
+        const bodyBytesExceeded = measurableSize
+          && (candidate.decodedBytes > this.#config.limits.scripts.bodyBytes
+            || candidate.encodedBytes > this.#config.limits.scripts.bodyBytes);
         const alreadyAttempted = this.#scriptBodyAttempts.has(attemptIdentity);
         const countExhausted = this.#scriptBodyAttempts.size
           >= this.#config.limits.scripts.bodiesPerDomain;
         const byteBudgetExhausted = this.#scriptBodyBytesRead
           + candidate.decodedBytes
           > this.#config.limits.scripts.totalBodyBytesPerDomain;
-        const mayRead = measurable
+        const mayRead = measurableSize
+          && !bodyBytesExceeded
           && !alreadyAttempted
           && !countExhausted
           && !byteBudgetExhausted;
@@ -2950,12 +3173,27 @@ class BrowserDomainSessionImpl implements BrowserDomainSession {
           });
         } else {
           selected = Object.freeze({ candidate, content: null, bytes: 0 });
-          if (measurable && !alreadyAttempted) {
-            state.truncated = true;
-            state.errors.push(browserError(
-              "BROWSER_LIMIT_EXCEEDED",
-              state.input.pageId,
-            ));
+          if (
+            measurableSize
+            && !alreadyAttempted
+            && (bodyBytesExceeded || countExhausted || byteBudgetExhausted)
+          ) {
+            if (bodyBytesExceeded) {
+              addLimitHit(state.limitHits, "scripts.bodyBytes");
+            }
+            if (countExhausted) {
+              addLimitHit(state.limitHits, "scripts.bodiesPerDomain");
+            }
+            if (byteBudgetExhausted) {
+              addLimitHit(state.limitHits, "scripts.totalBodyBytesPerDomain");
+            }
+            if (!bodyBytesExceeded && (countExhausted || byteBudgetExhausted)) {
+              state.truncated = true;
+              state.errors.push(browserError(
+                "BROWSER_LIMIT_EXCEEDED",
+                state.input.pageId,
+              ));
+            }
           }
         }
       }
@@ -2963,6 +3201,7 @@ class BrowserDomainSessionImpl implements BrowserDomainSession {
         && retainedBytes + selected.bytes
           > this.#config.limits.scripts.totalBodyBytesPerDomain) {
         selected = Object.freeze({ candidate, content: null, bytes: 0 });
+        addLimitHit(state.limitHits, "scripts.totalBodyBytesPerDomain");
       }
       retainedBytes += selected.bytes;
       next.set(candidate.url, selected);

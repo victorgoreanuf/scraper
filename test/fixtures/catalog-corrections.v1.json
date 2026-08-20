@@ -1,0 +1,126 @@
+[
+  {
+    "label": "Onsen UI basename",
+    "source": "script_url",
+    "value": "https://cdn.example.test/assets/onsenui.min.js",
+    "expected": ["Onsen UI"]
+  },
+  {
+    "label": "Angular Onsen UI basename with query",
+    "source": "script_url",
+    "value": "https://cdn.example.test/assets/angular-onsenui.js?revision=1",
+    "expected": ["Onsen UI"]
+  },
+  {
+    "label": "Consent is not Onsen UI",
+    "source": "script_url",
+    "value": "https://cdn.example.test/assets/consent.min.js",
+    "expected": []
+  },
+  {
+    "label": "DMM consent is not Onsen UI",
+    "source": "script_url",
+    "value": "https://cdn.example.test/assets/dmm-consent-manager.min.js",
+    "expected": []
+  },
+  {
+    "label": "Lightbox plus jQuery basename",
+    "source": "script_url",
+    "value": "https://cdn.example.test/assets/lightbox-plus-jquery.min.js",
+    "expected": ["Lightbox"]
+  },
+  {
+    "label": "Breakdance generic lightbox is not Lightbox",
+    "source": "script_url",
+    "value": "https://site.example.test/wp-content/plugins/breakdance/subplugins/lightbox/lightbox.js",
+    "expected": []
+  },
+  {
+    "label": "GLightbox is not Lightbox",
+    "source": "script_url",
+    "value": "https://cdn.example.test/assets/glightbox.min.js",
+    "expected": []
+  },
+  {
+    "label": "Liveinternet counter endpoint",
+    "source": "html",
+    "value": "<script>new Image().src='//counter.yadro.ru/hit?t52.6'</script>",
+    "expected": ["Liveinternet"]
+  },
+  {
+    "label": "Unrelated counter endpoint",
+    "source": "html",
+    "value": "<script>new Image().src='//counter.example.test/hit'</script>",
+    "expected": []
+  },
+  {
+    "label": "Wix generator is not WebsiteBuilder",
+    "source": "meta",
+    "key": "generator",
+    "value": "Wix.com Website Builder",
+    "expected": []
+  },
+  {
+    "label": "WebsiteBuilder retained JavaScript fallback",
+    "source": "javascript",
+    "key": "_site.urls.dataproxy",
+    "value": "https://customer.mywebsitebuilder.com/site",
+    "expected": ["WebsiteBuilder"]
+  },
+  {
+    "label": "Wix svSession cookie is not Store Vantage",
+    "source": "cookie",
+    "key": "svSession",
+    "value": "bounded-fixture",
+    "expected": []
+  },
+  {
+    "label": "Store Vantage retained cookie fallback",
+    "source": "cookie",
+    "key": "storevantage",
+    "value": "bounded-fixture",
+    "expected": ["Store Vantage"]
+  },
+  {
+    "label": "svSession script content is not Sirvoy",
+    "source": "script_content",
+    "value": "window.svSession = 'bounded-fixture';",
+    "expected": []
+  },
+  {
+    "label": "Sirvoy retained JavaScript fallback",
+    "source": "javascript",
+    "kind": "presence",
+    "key": "SirvoyBookingWidget",
+    "value": "",
+    "expected": ["Sirvoy"]
+  },
+  {
+    "label": "Generic Wix asset host is not Wix eCommerce",
+    "source": "script_content",
+    "value": "https://static.wixstatic.com/services/runtime.js",
+    "expected": []
+  },
+  {
+    "label": "Wix eCommerce retained DOM fallback",
+    "source": "dom",
+    "key": "[\"#wix-viewer-model\",\"text\",null]",
+    "value": "wixstores",
+    "expected": ["Wix eCommerce"]
+  },
+  {
+    "label": "Breakdance lightbox CSS DOM value is not Lightbox",
+    "source": "dom",
+    "key": "[\"link[href*='lightbox']\",\"attributes\",\"href\"]",
+    "value": "/wp-content/plugins/breakdance/lightbox/lightbox.css",
+    "expected": []
+  },
+  {
+    "label": "Lightbox retained JavaScript fallback",
+    "source": "javascript",
+    "kind": "presence",
+    "key": "Lightbox.activeImage",
+    "value": "",
+    "expected": ["Lightbox"]
+  }
+]

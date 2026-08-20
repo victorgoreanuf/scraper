@@ -20,6 +20,8 @@ import {
   type ScanConfig,
 } from "../src/config.ts";
 import {
+  CATALOG_CORRECTIONS_REVISION,
+  CATALOG_CORRECTIONS_SCHEMA,
   CATALOG_REVISION,
   CATALOG_SOURCE,
   compileFingerprintCatalog,
@@ -43,6 +45,10 @@ const userAgent =
 const textEncoder = new TextEncoder();
 const fixedSchemaBytes = readFileSync(new URL(
   "../fingerprints/upstream/webappanalyzer/schema.json",
+  import.meta.url,
+));
+const correctionLedgerBytes = readFileSync(new URL(
+  "../fingerprints/custom/corrections.v1.json",
   import.meta.url,
 ));
 
@@ -245,12 +251,16 @@ function baseline(): CompiledFingerprintCatalog {
   return loadedBaseline;
 }
 
-test("loads the exact pinned baseline as immutable plain data", () => {
+test("loads the pinned upstream plus the exact correction ledger as immutable plain data", () => {
   const catalog = baseline();
 
   assert.equal(catalog.source, CATALOG_SOURCE);
   assert.equal(catalog.revision, CATALOG_REVISION);
-  assert.equal(catalog.digest, PINNED_UPSTREAM_DIGEST);
+  assert.equal(
+    catalog.digest,
+    "sha256:614581009dc6ac2986763f8a324c656e629f63c5ecb7e46cf3ac10b121277724",
+  );
+  assert.notEqual(catalog.digest, PINNED_UPSTREAM_DIGEST);
   assert.deepEqual({
     categories: catalog.categories.length,
     technologies: catalog.technologies.length,
@@ -274,14 +284,14 @@ test("loads the exact pinned baseline as immutable plain data", () => {
     indexes: catalog.indexes.length,
   }, {
     categories: 109,
-    technologies: 7_575,
-    rules: 15_489,
-    declarationCount: 15_496,
-    relationshipCount: 2_241,
-    regexSourceCount: 8_541,
-    regexSourceCodeUnits: 200_325,
-    domSelectors: 1_769,
-    domFacts: 1_780,
+    technologies: 7_571,
+    rules: 15_474,
+    declarationCount: 15_481,
+    relationshipCount: 2_238,
+    regexSourceCount: 8_529,
+    regexSourceCodeUnits: 200_055,
+    domSelectors: 1_767,
+    domFacts: 1_778,
     javascriptPaths: 5_570,
     probePaths: 3,
     dnsRecordTypes: ["CNAME", "MX", "NS", "SOA", "TXT"],
@@ -321,6 +331,97 @@ test("loads the exact pinned baseline as immutable plain data", () => {
   );
   assertDeepFrozenPlainData(catalog);
   assert.deepEqual(structuredClone(catalog), catalog);
+});
+
+test("applies only the reviewed exact catalog corrections", () => {
+  const catalog = baseline();
+  const technologyNames = new Set(catalog.technologies.map((item) => item.name));
+  for (const alias of [
+    "All in One SEO Pack",
+    "Litespeed Cache",
+    "MUI",
+    "Typekit",
+  ]) {
+    assert.equal(technologyNames.has(alias), false, alias);
+  }
+  for (const canonical of [
+    "All in One SEO",
+    "LiteSpeed Cache",
+    "Material UI",
+    "Adobe Fonts",
+  ]) {
+    assert.equal(technologyNames.has(canonical), true, canonical);
+    assert.equal(
+      catalog.rules.some((rule) => rule.technology === canonical),
+      true,
+      canonical,
+    );
+  }
+
+  const removedRuleIds = [
+    "sha256:8e9c7f3202b8325304b438c575313428cdcaf624f9964faccd80796bda85dace",
+    "sha256:d7f095605f6119efb9aeb9f32ec240071f6d84dfec956fa6f86d0285a83ec413",
+    "sha256:c99464528d733625bb4fa3f2fca31291b912f3e279edd7932220d0c9bdc475c0",
+    "sha256:90c5a934e3c764cd5ab32d9501293cae26e8fde3e12083e5abe77d93527418f6",
+    "sha256:c8064a8a24514a7fa5d87d70ccf3f1000a9c2537a39856ede96374183d4d3052",
+    "sha256:8a527bf599e41dd04941f4dac7f14d8e73d9c2206ca6f043b2e829b59324d559",
+    "sha256:889fb7aaa24770cd4f38ad3434f891f8a1f28c2f35e013807f028bb9938df692",
+    "sha256:8032238690be0e13baeddcc35b2ce083b5292786609538af987ffcbc4c09792e",
+  ];
+  for (const ruleId of removedRuleIds) {
+    assert.equal(catalog.rules.some((rule) => rule.ruleId === ruleId), false);
+  }
+
+  const replacements = [
+    {
+      technology: "Onsen UI",
+      source: "script_url",
+      original: "(?:^|/)(?:angular-)?onsenui(?:\\.min)?\\.js(?:[?#]|$)",
+    },
+    {
+      technology: "Lightbox",
+      source: "script_url",
+      original: "(?:^|/)lightbox-plus-jquery(?:\\.min)?\\.js(?:[?#]|$)",
+    },
+    {
+      technology: "Liveinternet",
+      source: "html",
+      original: "//counter\\.yadro\\.ru/hit",
+    },
+  ] as const;
+  for (const replacement of replacements) {
+    const rule = catalog.rules.find((candidate) =>
+      candidate.technology === replacement.technology
+      && candidate.source === replacement.source
+      && candidate.original === replacement.original);
+    assert.notEqual(rule, undefined, replacement.technology);
+    assert.equal(rule?.namespace, CUSTOM_RULE_NAMESPACE);
+    assert.equal(rule?.locator, null);
+    assert.equal(rule?.ruleId, ruleId([
+      CUSTOM_RULE_NAMESPACE,
+      replacement.technology,
+      replacement.source,
+      null,
+      replacement.original,
+    ]));
+  }
+});
+
+test("applies the technology-count limit to the corrected effective catalog", () => {
+  const boundary = loadFingerprintCatalog(configWith([[
+    ["limits", "detector", "technologiesPerCatalog"],
+    7_571,
+  ]]));
+  assert.equal(boundary.technologies.length, 7_571);
+
+  expectCatalogError(
+    () => loadFingerprintCatalog(configWith([[
+      ["limits", "detector", "technologiesPerCatalog"],
+      7_570,
+    ]])),
+    "CATALOG_LIMIT_EXCEEDED",
+    /Effective catalog exceeds the technology-count limit/u,
+  );
 });
 
 test("compiles exact DOM facts and JavaScript segments with matching demand", () => {
@@ -466,9 +567,9 @@ test("preserves the pinned inspection-plan fact mix and unusual JavaScript paths
       ]),
     ),
     {
-      exists: { presenceOnly: 1_549, valueOnly: 0, both: 0 },
+      exists: { presenceOnly: 1_548, valueOnly: 0, both: 0 },
       text: { presenceOnly: 19, valueOnly: 36, both: 0 },
-      attribute: { presenceOnly: 35, valueOnly: 139, both: 0 },
+      attribute: { presenceOnly: 35, valueOnly: 138, both: 0 },
       property: { presenceOnly: 2, valueOnly: 0, both: 0 },
     },
   );
@@ -558,6 +659,25 @@ test("derives catalog semantics only from bounded bytes and the fixed schema", (
     ),
     "CATALOG_LIMIT_EXCEEDED",
     /JSON depth/u,
+  );
+});
+
+test("direct compilation binds corrections to the complete pinned upstream bytes", () => {
+  const incompleteUpstream = compilationInput([{
+    Alpha: technology({ url: ["alpha"] }),
+  }], {
+    extraFiles: [inputFile(
+      "corrections",
+      "custom/corrections.v1.json",
+      {},
+      { bytes: correctionLedgerBytes },
+    )],
+  });
+
+  expectCatalogError(
+    () => compileFingerprintCatalog(incompleteUpstream, configWith()),
+    "CATALOG_INVALID",
+    /exact pinned upstream bytes/u,
   );
 });
 
@@ -668,6 +788,74 @@ test("pins alternate roots and rejects unexpected or symlinked entries", () => {
       ),
       "CATALOG_INVALID",
       /non-symlink directory/u,
+    );
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test("fails closed on stale, duplicate, or identity-changing corrections", () => {
+  const temporary = mkdtempSync(join(tmpdir(), "catalog-corrections-test-"));
+  const sourceRoot = fileURLToPath(new URL("../fingerprints/", import.meta.url));
+  const copiedRoot = join(temporary, "fingerprints");
+
+  try {
+    cpSync(sourceRoot, copiedRoot, { recursive: true });
+    const correctionPath = join(copiedRoot, "custom", "corrections.v1.json");
+    const original = JSON.parse(readFileSync(correctionPath, "utf8")) as JsonRecord;
+    assert.equal(original.schema, CATALOG_CORRECTIONS_SCHEMA);
+    assert.equal(original.revision, CATALOG_CORRECTIONS_REVISION);
+    const checkMutation = (
+      mutate: (ledger: JsonRecord) => void,
+      message: RegExp,
+    ): void => {
+      const ledger = structuredClone(original);
+      mutate(ledger);
+      writeFileSync(correctionPath, `${JSON.stringify(ledger)}\n`);
+      expectCatalogError(
+        () => loadFingerprintCatalog(
+          configWith(),
+          pathToFileURL(`${copiedRoot}${sep}`),
+        ),
+        "CATALOG_INVALID",
+        message,
+      );
+    };
+
+    checkMutation(
+      (ledger) => {
+        ledger.revision = `${CATALOG_CORRECTIONS_REVISION}-stale`;
+      },
+      /fixed revision/u,
+    );
+    checkMutation(
+      (ledger) => {
+        const appliesTo = ledger.appliesTo as JsonRecord;
+        appliesTo.revision = "stale-upstream";
+      },
+      /pinned upstream revision/u,
+    );
+    checkMutation(
+      (ledger) => {
+        const drops = ledger.dropRules as string[];
+        drops[0] = `sha256:${"0".repeat(64)}`;
+      },
+      /missing or duplicated/u,
+    );
+    checkMutation(
+      (ledger) => {
+        const drops = ledger.dropRules as string[];
+        drops.push(drops[0] as string);
+      },
+      /targets .* more than once/u,
+    );
+    checkMutation(
+      (ledger) => {
+        const replacements = ledger.replaceRules as JsonRecord[];
+        const first = replacements[0] as JsonRecord;
+        first.technology = "Lightbox";
+      },
+      /changes rule identity/u,
     );
   } finally {
     rmSync(temporary, { recursive: true, force: true });

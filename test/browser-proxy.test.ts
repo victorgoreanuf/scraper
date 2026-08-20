@@ -295,6 +295,7 @@ test("the proxy forwards absolute-form HTTP through a validated pinned address",
     browserRequests: 1,
     browserTransferredBytes: 5,
   });
+  assert.deepEqual(proxy.getLimitHits(), []);
   assert.equal(proxy.getFailure(), null);
 
   await proxy.finishPage("p1");
@@ -306,6 +307,7 @@ test("the proxy forwards absolute-form HTTP through a validated pinned address",
     browserRequests: 0,
     browserTransferredBytes: 0,
   });
+  assert.deepEqual(proxy.getLimitHits(), []);
   await proxy.finishPage("p2");
   await proxy.finishDomain();
 });
@@ -438,6 +440,7 @@ test("methods, request bodies, excess headers, and upgrades are rejected before 
     {
       name: "method",
       expectedCode: "BROWSER_PROXY_FAILED",
+      expectedLimitHits: [],
       config: configWith(),
       payload:
         "POST http://guard.vendor.tld/ HTTP/1.1\r\nHost: guard.vendor.tld\r\nContent-Length: 0\r\n\r\n",
@@ -445,6 +448,7 @@ test("methods, request bodies, excess headers, and upgrades are rejected before 
     {
       name: "body",
       expectedCode: "BROWSER_PROXY_FAILED",
+      expectedLimitHits: [],
       config: configWith(),
       payload:
         "GET http://guard.vendor.tld/ HTTP/1.1\r\nHost: guard.vendor.tld\r\nContent-Length: 1\r\n\r\nx",
@@ -452,6 +456,7 @@ test("methods, request bodies, excess headers, and upgrades are rejected before 
     {
       name: "headers",
       expectedCode: "BROWSER_LIMIT_EXCEEDED",
+      expectedLimitHits: ["proxy.headerFields"],
       config: configWith([
         [["limits", "http", "headerFields"], 1],
       ]),
@@ -459,8 +464,19 @@ test("methods, request bodies, excess headers, and upgrades are rejected before 
         "GET http://guard.vendor.tld/ HTTP/1.1\r\nHost: guard.vendor.tld\r\nX-Extra: rejected\r\n\r\n",
     },
     {
+      name: "header bytes",
+      expectedCode: "BROWSER_LIMIT_EXCEEDED",
+      expectedLimitHits: ["proxy.headerBytes"],
+      config: configWith([
+        [["limits", "http", "headerBytes"], 1],
+      ]),
+      payload:
+        "GET http://guard.vendor.tld/ HTTP/1.1\r\nHost: guard.vendor.tld\r\nX-Extra: rejected\r\n\r\n",
+    },
+    {
       name: "upgrade",
       expectedCode: "BROWSER_PROXY_FAILED",
+      expectedLimitHits: [],
       config: configWith(),
       payload:
         "GET http://guard.vendor.tld/ HTTP/1.1\r\nHost: guard.vendor.tld\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
@@ -484,6 +500,7 @@ test("methods, request bodies, excess headers, and upgrades are rejected before 
       await writeRawUntilClose(proxy, scenario.payload);
 
       assertFailure(proxy, scenario.expectedCode, "browser");
+      assert.deepEqual(proxy.getLimitHits(), scenario.expectedLimitHits);
       assert.deepEqual(runtime.lookupCalls, []);
       assert.deepEqual(runtime.connectCalls, []);
       await proxy.finishPage("p1");
@@ -972,6 +989,7 @@ test("logical request and downstream byte caps latch stable browser limit failur
     t,
     configWith([
       [["limits", "browser", "requestsPerPage"], 1],
+      [["limits", "browser", "requestsPerDomain"], 1],
     ]),
   );
   requestLimited.activateDomain();
@@ -996,6 +1014,10 @@ test("logical request and downstream byte caps latch stable browser limit failur
     browserRequests: 1,
     browserTransferredBytes: 0,
   });
+  assert.deepEqual(requestLimited.getLimitHits(), [
+    "proxy.requestsPerDomain",
+    "proxy.requestsPerPage",
+  ]);
   await requestLimited.finishPage("p1");
   await requestLimited.finishDomain();
 
@@ -1028,6 +1050,10 @@ test("logical request and downstream byte caps latch stable browser limit failur
     browserRequests: 1,
     browserTransferredBytes: 0,
   });
+  assert.deepEqual(byteLimited.getLimitHits(), [
+    "proxy.transferBytesPerDomain",
+    "proxy.transferBytesPerPage",
+  ]);
   await byteLimited.finishPage("p1");
   await byteLimited.finishDomain();
 });

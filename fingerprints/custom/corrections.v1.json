@@ -1,0 +1,45 @@
+{
+  "schema": "website-technologies-scraper/catalog-corrections-v1",
+  "revision": "2026-08-20.1",
+  "appliesTo": {
+    "source": "enthec/webappanalyzer",
+    "revision": "5e7c47b1d441ded0bd476b252261e87634349f96",
+    "digest": "sha256:cdcccc905a14bbc7ad35a7ea6de636a2e6e51280c6ebbe5ba14f5e55aac18c8f"
+  },
+  "dropTechnologies": [
+    "All in One SEO Pack",
+    "Litespeed Cache",
+    "MUI",
+    "Typekit"
+  ],
+  "dropRules": [
+    "sha256:8e9c7f3202b8325304b438c575313428cdcaf624f9964faccd80796bda85dace",
+    "sha256:d7f095605f6119efb9aeb9f32ec240071f6d84dfec956fa6f86d0285a83ec413",
+    "sha256:c99464528d733625bb4fa3f2fca31291b912f3e279edd7932220d0c9bdc475c0",
+    "sha256:90c5a934e3c764cd5ab32d9501293cae26e8fde3e12083e5abe77d93527418f6",
+    "sha256:c8064a8a24514a7fa5d87d70ccf3f1000a9c2537a39856ede96374183d4d3052"
+  ],
+  "replaceRules": [
+    {
+      "targetRuleId": "sha256:8a527bf599e41dd04941f4dac7f14d8e73d9c2206ca6f043b2e829b59324d559",
+      "technology": "Onsen UI",
+      "source": "script_url",
+      "locator": null,
+      "original": "(?:^|/)(?:angular-)?onsenui(?:\\.min)?\\.js(?:[?#]|$)"
+    },
+    {
+      "targetRuleId": "sha256:889fb7aaa24770cd4f38ad3434f891f8a1f28c2f35e013807f028bb9938df692",
+      "technology": "Lightbox",
+      "source": "script_url",
+      "locator": null,
+      "original": "(?:^|/)lightbox-plus-jquery(?:\\.min)?\\.js(?:[?#]|$)"
+    },
+    {
+      "targetRuleId": "sha256:8032238690be0e13baeddcc35b2ce083b5292786609538af987ffcbc4c09792e",
+      "technology": "Liveinternet",
+      "source": "html",
+      "locator": null,
+      "original": "//counter\\.yadro\\.ru/hit"
+    }
+  ]
+}

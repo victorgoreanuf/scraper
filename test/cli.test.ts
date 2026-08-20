@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { Writable } from "node:stream";
@@ -13,6 +13,10 @@ import type { BrowserPool } from "../src/crawl/browser.ts";
 import type { ProtectedHttpTransport } from "../src/crawl/transport.ts";
 import type { CompiledFingerprintCatalog } from "../src/detect/catalog.ts";
 import type { DetectorPool } from "../src/detect/pool.ts";
+import {
+  SHADOW_EVALUATION_PROTOCOL_REVISION,
+  type ShadowEvaluationSnapshot,
+} from "../src/evaluation.ts";
 import {
   openParquetDomainsFromFile,
   type PreparedParquetDomains,
@@ -27,8 +31,13 @@ import {
   runCli,
   type CliDependencies,
 } from "../src/cli.ts";
+import {
+  preflightShadowEvaluationOutput,
+  writeShadowEvaluationArtifact,
+} from "../src/output/evaluation-writer.ts";
 import type {
   OpenResultWriterOptions,
+  ResultOutputPaths,
   ResultWriter,
   ResultWriterMode,
 } from "../src/output/writer.ts";
@@ -144,6 +153,59 @@ function failedResult(
   };
 }
 
+function shadowSnapshot(domain: string): ShadowEvaluationSnapshot {
+  const detectorView = Object.freeze({
+    state: "available" as const,
+    directNames: Object.freeze([]),
+    inferredNames: Object.freeze([]),
+    detectionStats: Object.freeze({
+      rawDirect: 0,
+      gatedDirect: 0,
+      suppressedDirect: 0,
+      retainedDirect: 0,
+    }),
+    completed: true,
+    errors: Object.freeze([]),
+  });
+  return Object.freeze({
+    protocolRevision: SHADOW_EVALUATION_PROTOCOL_REVISION,
+    runId: RUN_ID,
+    domain,
+    t1: detectorView,
+    t2: detectorView,
+    preBrowser: Object.freeze({
+      entryOutcome: "failed" as const,
+      entryStatusClass: null,
+      entryHtmlBytes: 0,
+      entryTextCodePoints: 0,
+      staticNavigationLinks: 0,
+      metadataEntries: 0,
+      resourceEntries: 0,
+      dnsRecords: 0,
+      tlsIssuerPresent: false,
+      t2Selected: false,
+      t2Role: null,
+      t2Outcome: "not-selected" as const,
+      probesObserved: 0,
+      httpRequests: 0,
+      staticTransferredBytes: 0,
+    }),
+    full: Object.freeze({
+      directNames: Object.freeze([]),
+      inferredNames: Object.freeze([]),
+      status: "failed" as const,
+    }),
+    fullCost: Object.freeze({
+      browserPagesAttempted: 0,
+      browserPagesAdmitted: 0,
+      browserRequests: 0,
+      browserTransferredBytes: 0,
+      browserMs: 0,
+    }),
+    browserLimitHits: Object.freeze([]),
+  });
+}
+
 class FakePreparedInput implements PreparedParquetDomains {
   readonly domainCount: number;
   readonly sourcePath: string;
@@ -239,12 +301,14 @@ interface HarnessOptions {
     options?: ScanDomainOptions,
   ) => Promise<DomainResult>;
   readonly openInput?: () => Promise<PreparedParquetDomains>;
+  readonly outputPaths?: ResultOutputPaths;
 }
 
 interface Harness {
   readonly events: string[];
   readonly input: FakePreparedInput;
   readonly writer: FakeWriter;
+  readonly detectorPools: readonly DetectorPool[];
   readonly dependencies: CliDependencies;
   readonly stdout: CapturedStream;
   readonly stderr: CapturedStream;
@@ -270,13 +334,7 @@ function createHarness(options: HarnessOptions = {}): Harness {
     revision: "fixture-v1",
     digest: `sha256:${"a".repeat(64)}`,
   } as unknown as CompiledFingerprintCatalog;
-  const detectorPool = {
-    catalog,
-    isAvailable: () => true,
-    close: async () => {
-      events.push("detector:close");
-    },
-  } as unknown as DetectorPool;
+  const detectorPools: DetectorPool[] = [];
   const browserPool = {
     runtime: {
       playwright: "1.62.1",
@@ -314,6 +372,14 @@ function createHarness(options: HarnessOptions = {}): Harness {
     },
     createDetectorPool: async () => {
       events.push("detector:ready");
+      const detectorPool = {
+        catalog,
+        isAvailable: () => true,
+        close: async () => {
+          events.push("detector:close");
+        },
+      } as unknown as DetectorPool;
+      detectorPools.push(detectorPool);
       return detectorPool;
     },
     createBrowserPool: async () => {
@@ -340,10 +406,23 @@ function createHarness(options: HarnessOptions = {}): Harness {
     },
     resolveResultOutputPaths: async () => {
       events.push("output:resolved");
-      return {
+      return options.outputPaths ?? {
         resultPath: "/private/tmp/veridion-cli-results.jsonl",
         summaryPath: "/private/tmp/veridion-cli-results.summary.json",
       };
+    },
+    preflightShadowEvaluationOutput: async (
+      evaluationOptions: Parameters<typeof preflightShadowEvaluationOutput>[0],
+    ) => {
+      events.push("evaluation:preflight");
+      return preflightShadowEvaluationOutput(evaluationOptions);
+    },
+    writeShadowEvaluationArtifact: async (
+      prepared: Parameters<typeof writeShadowEvaluationArtifact>[0],
+      artifact: Parameters<typeof writeShadowEvaluationArtifact>[1],
+    ) => {
+      events.push("evaluation:write");
+      await writeShadowEvaluationArtifact(prepared, artifact);
     },
     scanDomain: options.scan ?? (async (domain, context) => {
       events.push(`scan:${domain}`);
@@ -360,6 +439,7 @@ function createHarness(options: HarnessOptions = {}): Harness {
     stderr,
     writerMode: () => openedMode,
     writerResultPath: () => openedResultPath,
+    detectorPools,
   };
 }
 
@@ -377,6 +457,9 @@ function cliArguments(...extra: readonly string[]): string[] {
 
 test("parses the bounded operational surface without accepting ambiguous modes", () => {
   assert.doesNotThrow(() => parseCliArgs(cliArguments()));
+  const shadow = parseCliArgs(cliArguments("--shadow-evaluation"));
+  assert.equal(shadow.kind, "run");
+  if (shadow.kind === "run") assert.equal(shadow.shadowEvaluation, true);
   assert.doesNotThrow(() => parseCliArgs(["--config", "scan-config.json"]));
   assert.doesNotThrow(() => parseCliArgs(["--help"]));
   assert.doesNotThrow(() => parseCliArgs(["--version"]));
@@ -385,6 +468,9 @@ test("parses the bounded operational surface without accepting ambiguous modes",
     [],
     ["--contact", CONTACT, "--config", "scan-config.json"],
     cliArguments("--resume", "--force"),
+    cliArguments("--resume", "--shadow-evaluation"),
+    cliArguments("--force", "--shadow-evaluation"),
+    cliArguments("--shadow-evaluation", "--shadow-evaluation"),
     ["--contact", "mailto:.@veridion.com"],
     ["--contact", "mailto:a..b@veridion.com"],
     ["--contact", "mailto:a.@veridion.com"],
@@ -412,7 +498,7 @@ test("prints help, version, and usage failures without initializing the run", as
     stdout: version.stdout,
     stderr: version.stderr,
   }), 0);
-  assert.equal(version.stdout.text(), "0.1.4\n");
+  assert.equal(version.stdout.text(), "0.1.5\n");
   assert.equal(version.stderr.text(), "");
   assert.deepEqual(version.events, []);
 
@@ -436,7 +522,7 @@ test("loads one complete bounded JSON configuration before input preflight", asy
     await writeFile(
       configPath,
       JSON.stringify(createDefaultScanConfig(
-        "WebsiteTechScraper/0.1.4 (https://crawler.veridion.com/contact)",
+        "WebsiteTechScraper/0.1.5 (https://crawler.veridion.com/contact)",
       )),
       { encoding: "utf8", mode: 0o600 },
     );
@@ -479,11 +565,11 @@ test("loads one complete bounded JSON configuration before input preflight", asy
 
     const invalidContactPath = join(directory, "invalid-contact.json");
     const invalidContact = createDefaultScanConfig(
-      "WebsiteTechScraper/0.1.4 (https://crawler.veridion.com/contact)",
+      "WebsiteTechScraper/0.1.5 (https://crawler.veridion.com/contact)",
     );
     await writeFile(
       invalidContactPath,
-      JSON.stringify({ ...invalidContact, userAgent: "WebsiteTechScraper/0.1.4 (https://x)" }),
+      JSON.stringify({ ...invalidContact, userAgent: "WebsiteTechScraper/0.1.5 (https://x)" }),
       { encoding: "utf8", mode: 0o600 },
     );
     const rejectedContact = createHarness();
@@ -691,6 +777,212 @@ test("rejects an input and output pathname collision before destructive output w
   assert.match(harness.stderr.text(), /CLI_PATH_COLLISION/u);
 });
 
+test("requires the exact fixed cohort before shadow output or network startup", async () => {
+  const harness = createHarness({ domains: ["one.vendor.com"] });
+
+  assert.equal(await runCli(cliArguments("--shadow-evaluation"), {
+    dependencies: harness.dependencies,
+    stdout: harness.stdout,
+    stderr: harness.stderr,
+  }), 1);
+  assert.equal(harness.events.includes("output:resolved"), true);
+  assert.equal(harness.events.includes("evaluation:preflight"), false);
+  assert.equal(harness.events.includes("catalog:loaded"), false);
+  assert.equal(harness.events.includes("transport:created"), false);
+  assert.equal(
+    harness.events.some((event) => event.startsWith("writer:open:")),
+    false,
+  );
+  assert.match(harness.stderr.text(), /CLI_EVALUATION_INPUT_INVALID/u);
+});
+
+test("rejects an existing shadow sidecar before pools or output are opened", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "veridion-cli-shadow-collision-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const outputPaths = {
+    resultPath: join(directory, "cohort.jsonl"),
+    summaryPath: join(directory, "cohort.summary.json"),
+  };
+  const evaluationPath = join(directory, "cohort.evaluation.json");
+  await writeFile(evaluationPath, "keep me", { mode: 0o600 });
+  const harness = createHarness({
+    domains: Array.from(
+      { length: 200 },
+      (_, index) => `domain-${String(index).padStart(3, "0")}.vendor.com`,
+    ),
+    outputPaths,
+  });
+
+  assert.equal(await runCli(cliArguments("--shadow-evaluation"), {
+    dependencies: harness.dependencies,
+    stdout: harness.stdout,
+    stderr: harness.stderr,
+  }), 1);
+  assert.equal(harness.events.includes("evaluation:preflight"), true);
+  assert.equal(harness.events.includes("catalog:loaded"), false);
+  assert.equal(harness.events.includes("transport:created"), false);
+  assert.equal(
+    harness.events.some((event) => event.startsWith("writer:open:")),
+    false,
+  );
+  assert.equal(await readFile(evaluationPath, "utf8"), "keep me");
+  assert.match(harness.stderr.text(), /EVALUATION_EXISTS/u);
+});
+
+test("collects one snapshot per domain and publishes after finalize and cleanup", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "veridion-cli-shadow-success-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const domains = Array.from(
+    { length: 200 },
+    (_, index) => `domain-${String(index).padStart(3, "0")}.vendor.com`,
+  );
+  let snapshots = 0;
+  const harness = createHarness({
+    domains,
+    outputPaths: {
+      resultPath: join(directory, "cohort.jsonl"),
+      summaryPath: join(directory, "cohort.summary.json"),
+    },
+    scan: async (domain, context, options) => {
+      assert.ok(options?.onShadowSnapshot);
+      assert.ok(options.shadowDetectorPools);
+      assert.notEqual(options.shadowDetectorPools.t1, context.detectorPool);
+      assert.notEqual(options.shadowDetectorPools.t2, context.detectorPool);
+      assert.notEqual(
+        options.shadowDetectorPools.t1,
+        options.shadowDetectorPools.t2,
+      );
+      await options.onShadowSnapshot(shadowSnapshot(domain));
+      snapshots += 1;
+      return failedResult(domain, context.provenance);
+    },
+  });
+
+  const exitCode = await runCli(cliArguments("--shadow-evaluation", "--quiet"), {
+    dependencies: harness.dependencies,
+    stdout: harness.stdout,
+    stderr: harness.stderr,
+  });
+  assert.equal(exitCode, 0, harness.stderr.text());
+  assert.equal(snapshots, 200);
+  assert.equal(harness.detectorPools.length, 3);
+  const evaluationPath = join(directory, "cohort.evaluation.json");
+  const wire = await readFile(evaluationPath, "utf8");
+  assert.equal(wire.endsWith("\n"), true);
+  assert.equal(wire.slice(0, -1).includes("\n"), false);
+  const value = JSON.parse(wire) as {
+    readonly inputDomains: number;
+    readonly snapshots: readonly { readonly domain: string }[];
+    readonly calibration: {
+      readonly cohortDomains: number;
+      readonly deployable: { readonly selected: readonly unknown[] };
+    };
+  };
+  assert.equal(value.inputDomains, 200);
+  assert.deepEqual(value.snapshots.map(({ domain }) => domain), domains);
+  assert.equal(value.calibration.cohortDomains, 200);
+  assert.equal(value.calibration.deployable.selected.length, 40);
+  assert.doesNotMatch(wire, /rawHtml|scriptBodies|headers|cookies/u);
+  assert.equal((await lstat(evaluationPath)).mode & 0o777, 0o600);
+
+  const finalize = harness.events.indexOf("writer:finalize:200");
+  const inputClose = harness.events.indexOf("input:close");
+  const browserClose = harness.events.indexOf("browser:close");
+  const detectorClose = harness.events.indexOf("detector:close");
+  const evaluationWrite = harness.events.indexOf("evaluation:write");
+  assert.ok(finalize >= 0 && finalize < evaluationWrite);
+  assert.ok(inputClose >= 0 && inputClose < evaluationWrite);
+  assert.ok(browserClose >= 0 && browserClose < evaluationWrite);
+  assert.ok(detectorClose >= 0 && detectorClose < evaluationWrite);
+});
+
+test("leaves the shadow target absent when snapshot finalization fails", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "veridion-cli-shadow-failed-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const harness = createHarness({
+    domains: Array.from(
+      { length: 200 },
+      (_, index) => `domain-${String(index).padStart(3, "0")}.vendor.com`,
+    ),
+    outputPaths: {
+      resultPath: join(directory, "cohort.jsonl"),
+      summaryPath: join(directory, "cohort.summary.json"),
+    },
+  });
+
+  assert.equal(await runCli(cliArguments("--shadow-evaluation", "--quiet"), {
+    dependencies: harness.dependencies,
+    stdout: harness.stdout,
+    stderr: harness.stderr,
+  }), 1);
+  assert.deepEqual(harness.writer.finalizeCalls, [200]);
+  assert.equal(harness.events.includes("evaluation:write"), false);
+  await assert.rejects(
+    lstat(join(directory, "cohort.evaluation.json")),
+    { code: "ENOENT" },
+  );
+});
+
+test("observes cancellation after atomic shadow publication", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "veridion-cli-shadow-cancel-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const controller = new AbortController();
+  const domains = Array.from(
+    { length: 200 },
+    (_, index) => `domain-${String(index).padStart(3, "0")}.vendor.com`,
+  );
+  const harness = createHarness({
+    domains,
+    outputPaths: {
+      resultPath: join(directory, "cohort.jsonl"),
+      summaryPath: join(directory, "cohort.summary.json"),
+    },
+    scan: async (domain, context, options) => {
+      await options?.onShadowSnapshot?.(shadowSnapshot(domain));
+      return failedResult(domain, context.provenance);
+    },
+  });
+  const dependencies: CliDependencies = {
+    ...harness.dependencies,
+    writeShadowEvaluationArtifact: async (prepared, value) => {
+      await writeShadowEvaluationArtifact(prepared, value);
+      controller.abort(new DOMException("Interrupted", "AbortError"));
+    },
+  };
+
+  assert.equal(await runCli(cliArguments("--shadow-evaluation", "--quiet"), {
+    dependencies,
+    signal: controller.signal,
+    stdout: harness.stdout,
+    stderr: harness.stderr,
+  }), 130);
+  assert.match(harness.stderr.text(), /CLI_CANCELLED/u);
+  assert.equal(
+    (await lstat(join(directory, "cohort.evaluation.json"))).isFile(),
+    true,
+  );
+});
+
+test("does not expose a shadow callback during a regular run", async () => {
+  let observed = false;
+  const harness = createHarness({
+    scan: async (domain, context, options) => {
+      observed = true;
+      assert.equal(options?.onShadowSnapshot, undefined);
+      return failedResult(domain, context.provenance);
+    },
+  });
+
+  assert.equal(await runCli(cliArguments("--quiet"), {
+    dependencies: harness.dependencies,
+    stdout: harness.stdout,
+    stderr: harness.stderr,
+  }), 0);
+  assert.equal(observed, true);
+  assert.equal(harness.events.includes("evaluation:preflight"), false);
+  assert.equal(harness.events.includes("evaluation:write"), false);
+});
+
 test("resume validates its completed-domain subset before scanning and skips matches", async () => {
   const valid = createHarness({
     domains: ["one.vendor.com", "two.vendor.com", "three.vendor.com"],
@@ -807,7 +1099,7 @@ async function waitForContext(
   const event = harness.events.find((value) => value.startsWith("writer:open:"));
   assert.ok(event);
   return {
-    scannerVersion: "0.1.4",
+    scannerVersion: "0.1.5",
     runtime: {
       node: "24.19.0",
       playwright: "1.62.1",

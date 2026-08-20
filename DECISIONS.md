@@ -60,13 +60,26 @@
   catalog pentru domeniul input canonic și reutilizează exclusiv issuerul TLS
   din handshake-ul HTTPS final deja verificat și pin-uit.
 - `scanDomain()` unește într-o singură scanare bounded HTTP `p1`–`p3`, browser,
-  robots, probe declarative și DNS/TLS, apoi apelează detectorul exact o dată pe
-  setul complet de observații.
+  robots, probe declarative și DNS/TLS, apoi apelează detectorul o dată pentru
+  rezultatul `full`; numai evaluarea shadow explicită mai rulează două pass-uri
+  independente peste prefixele `T1` și `T2`.
 - Coada FIFO pentru slotul `full` rămâne în afara deadline-ului activ al
   domeniului; anularea callerului rămâne activă și în coadă.
 - Colectorul de probe revalidează maximum cinci pathuri sortate din planul
   catalogului și emite body observations bounded numai prin originul final,
   robots și transportul protejat comun.
+- Instrumentația tiered destinată runului v0.1.5 este numai shadow: rezervă
+  static candidatul `T2` și colectează prefixul înainte de browser, dar nu
+  rutează lucru și nu schimbă rezultatul `full`. Persistă doar snapshotul
+  allowlisted raw-free și agregatele lui; observațiile brute rămân în memorie.
+  Pragurile 95%/80%/20% descrise mai jos sunt guardrails provizorii pentru
+  experiment, nu KPI final de produs.
+- `--shadow-evaluation` este create-only, cere exact 200 de domenii și publică
+  sidecarul compact `.evaluation.json` separat de JSONL/summary; nu există resume,
+  force sau atomicitate tranzacțională între cele trei artefacte.
+- Numai acest mod pornește trei pool-uri detector distincte peste același catalog:
+  `full`, `T1` și `T2`. Nu împart slots, workeri sau failure state; orice
+  indisponibilitate shadow invalidează calibrarea și sidecarul fail-closed.
 
 ## Structura proiectului
 
@@ -74,6 +87,8 @@
 src/
 ├── cli.ts
 ├── config.ts
+├── evaluation.ts
+├── evaluation-calibration.ts
 ├── model.ts
 ├── network-policy.ts
 ├── pipeline.ts
@@ -92,6 +107,7 @@ src/
 │   ├── pool.ts
 │   └── worker.ts
 └── output/
+    ├── evaluation-writer.ts
     ├── writer.ts
     └── summary.ts
 
@@ -102,7 +118,8 @@ fingerprints/
 │       ├── categories.json
 │       └── technologies/
 └── custom/
-    └── technologies/
+    ├── corrections.v1.json
+    └── technologies/ # adăugiri originale opționale
 
 schemas/
 ├── domain-result.v1.schema.json
@@ -112,6 +129,9 @@ test/
 ├── fixtures/
 ├── browser-proxy.test.ts
 ├── browser.test.ts
+├── evaluation.test.ts
+├── evaluation-calibration.test.ts
+├── evaluation-writer.test.ts
 ├── probe.test.ts
 ├── toolchain.test.ts
 ├── domain-result-schema.test.ts
@@ -129,15 +149,17 @@ preflight complet: schemă, limite, domenii și duplicate
   ↓
 normalizare domeniu + candidat target + DNS/SSRF
   ↓
-robots protejat + decizie pentru path
+robots protejat + homepage HTTP
   ↓
-homepage HTTP + browser izolat
+DNS/TLS cerut de catalog
   ↓
-maximum două pagini interne determinate reproductibil
+rezervare/pagină `T2` statică + probe declarative bounded
   ↓
-HTTP + browser + probe declarative bounded
+browser izolat pe homepage + completarea planului `full`
   ↓
-DNS/TLS + scripturi deja observate
+HTTP/browser pentru maximum încă un candidat intern
+  ↓
+scripturi deja observate de browser
   ↓
 fingerprints în workeri regex terminabili
   ↓
@@ -181,10 +203,11 @@ pathul.
 - Dacă Veridion permite republicarea fișierului `input/domains.parquet`; până
   confirmăm, acesta rămâne local și ignorat de Git.
 
-Aceste puncte nu blochează scheletul de cod. Valorile de performanță și
-trigger-ele modului tiered vor fi ajustate numai după benchmark; contractele de
-siguranță, rezultat și redacție nu se relaxează pentru a crește numărul de
-detecții.
+Aceste puncte nu blochează scheletul de cod. Benchmarkul v0.1.4 permite doar
+protocolul shadow provizoriu de mai jos; triggerul și KPI-ul final se ratifică
+numai după evaluarea v0.1.5 out-of-fold și apoi pe un cohort reprezentativ nou.
+Contractele de siguranță, rezultat și redacție nu se relaxează pentru a crește
+numărul de detecții.
 
 ## Decizia contractului Parquet v1
 
@@ -301,8 +324,10 @@ metadata, URL și text păstrează prefixul bounded, emit o singură eroare
 browserul. Body/decode/DOM failure este starea distinctă `failed` și nu poate fi
 prezentată ca succes HTTP browser-only. Metadata are cap separat de 5.000 și
 descendenții `template` sunt inerți. În v1 nu există classifier CAPTCHA pe text.
-Pipeline-ul unește linkurile statice și randate ale `p1` înainte să clasifice și
-să fetch-uiască paginile interne.
+După entry, pipeline-ul colectează mai întâi infrastructura `T1`, apoi clasifică
+snapshotul static pentru rezervarea `T2`; numai după această colectare și după
+browser `p1` clasifică reuniunea static + randat pentru candidatul `full`
+suplimentar.
 
 ## Decizia implementării robots
 
@@ -372,9 +397,11 @@ toate detaliile RFC. Un contact real în User-Agent este precondiție pentru
 scanarea publică.
 
 Scanăm maximum trei pagini cu roluri wire exacte: `entry`, o pagină `detail` și
-o pagină `listing` sau fallback `content`. Candidații sunt exclusiv reuniunea
-deduplicată a linkurilor de navigare statice și randate din `p1`; nu ghicim
-pathuri, nu folosim linkuri din paginile interne și nu facem crawl recursiv.
+o pagină `listing` sau fallback `content`. Candidații sunt exclusiv linkurile de
+navigare din `p1`: snapshotul static înghețat pentru rezervarea `T2`, apoi
+reuniunea deduplicată static + randat pentru maximum încă un candidat `full`.
+Nu ghicim pathuri, nu folosim linkuri din paginile interne și nu facem crawl
+recursiv.
 Acceptăm numai HTTP(S) canonic pe exact originul final, fără credentials, query
 sau fragment, diferit de root și de URL-ul final și în limita URL configurată.
 
@@ -392,12 +419,21 @@ Ordinea tokenurilor de mai sus este rangul fix în fiecare clasă, urmat de
 pathname canonic mai scurt și apoi URL canonic în ordine directă UTF-16. Alegem
 maximum un `detail` și un `listing`; numai dacă nu există listing alegem un
 `content` cu un singur rang fix pentru acel slot. Slotul detail absent rămâne
-gol. Sortăm alegerile structurale după URL-ul canonic de rețea și păstrăm
-prefixul permis de `topLevelPerDomain - 1`. Apoi facem maximum două checks
-robots; denial sau unavailable elimină candidatul fără backfill. Sanitizăm
-supraviețuitorii pentru publicare, eliminăm coliziunile cu entry-ul sau între ei,
-îi resortăm după URL-ul public și abia apoi atribuim IDs compacte `p2`/`p3`, fără
-goluri.
+gol, iar alegerile structurale se sortează după URL-ul canonic de rețea.
+
+După ce entry + infrastructura au completat `T1`, rulăm selectorul numai pe
+linkurile statice `p1` înghețate și rezervăm prima alegere pentru `T2`. Îi facem
+un singur check robots și, dacă este admisă, o singură colectare HTTP înainte de
+probe și browser. Rezervarea consumă
+slotul detail sau non-detail chiar la denial, unavailable, coliziune sanitizată,
+skip ori failure și nu primește backfill. După browser `p1`, planul `full`
+păstrează rezervarea și poate adăuga din reuniunea static + randat maximum un
+candidat din slotul opus. Facem deci maximum două checks robots interne.
+
+Sanitizăm rezultatele admise pentru publicare, eliminăm coliziunile cu entry-ul
+sau între ele, le resortăm după URL-ul public și abia apoi atribuim IDs compacte
+`p2`/`p3`, fără goluri. Rezultatul HTTP rezervat provizoriu este remapat la ID-ul
+public final; ordinea colectării nu devine ordine wire.
 
 Maximum cinci pathuri de probe declarative sunt validate și sortate în planul
 catalogului, rămân în afara numărului de pagini și sunt colectate prin politica
@@ -434,6 +470,19 @@ numără numai elementele care corespund selectorului și au cel puțin unul din
 atributele cerute. Elementele irelevante sunt traversate streaming, dar nu
 consumă bugetul de observații; inspecțiile existence, text, property și mixte
 păstrează contabilizarea match-urilor brute ale selectorului.
+
+Pentru un selector ale cărui fapte sunt exclusiv `exists`, primul match eligibil
+este suficient: traversalul se oprește acolo, emite toate presence facts cerute
+și nu mai declară fals depășirea `domMatches`. Zero match rămâne observație goală
+după traversal complet. Inspecțiile mixte/value păstrează capul per selector,
+fiindcă elementele pot avea valori diferite.
+
+Colectorul întoarce intern, pe lângă eroarea publică sanitizată, hits bounded și
+deduplicate de forma `(category, domSelectorOrdinal|null)`. Ordinalul apare numai
+pentru `inspection.domMatches` și `inspection.domAccess`; celelalte limite DOM,
+cookie, network, script și proxy au `null`. Evaluatorul le leagă de `pageId` și
+catalog digest, apoi agregă `(category, ordinal)` în hits, pagini și domenii
+afectate fără să adauge acest diagnostic în schema publică `DomainResult`.
 
 Metodele mutabile și WebSocket sunt observate ca tentative, apoi blocate.
 Playwright routing decide și numără requesturile inițiale. Pentru redirecturile
@@ -500,9 +549,9 @@ baseline-ului `full`.
 Politica v1 este implementată în `crawl/probe.ts`. Colectorul primește URL-ul
 final de rețea numai pentru un entry HTML, maximum cinci pathuri din planul
 catalogului, configurația validată, sesiunea de transport protejat și serviciul
-robots al runului. Rulează secvențial după toate colectările HTTP/browser
-`p1`–`p3` și înainte de DNS/TLS, finalizarea sesiunii browser și singura
-invocare a detectorului.
+robots al runului. Rulează secvențial după infrastructura `T1` și colectarea HTTP
+a rezervării statice `T2`, dar înainte de orice navigare browser, finalizarea
+sesiunii browser și detecție.
 
 Compilatorul și collectorul validează independent pathurile. Ele trebuie să fie
 unice, să înceapă cu exact un `/`, să nu conțină backslash, query, fragment sau
@@ -606,14 +655,25 @@ pipeline-ului. Proxy-ul și sesiunea transport își păstrează timerele locale
 same-duration ca fail-safe pentru folosirea standalone, dar în `scanDomain()`
 primesc semnalul pipeline deja armat, primul și autoritativ.
 
-Ordinea bounded este: HTTP/robots `p1`; browser `p1` numai pentru HTML 2xx
-complete sau truncated; reuniunea linkurilor statice și randate; selecția v1 și
-maximum două checks robots; HTTP apoi browser pentru `p2`/`p3` eligibile;
-probele sortate pe originul final pentru un entry HTML; DNS cerut de catalog și
-issuerul TLS reutilizat numai după toate requesturile HTTP statice; finalizarea
-sesiunii browser; apoi o singură invocare a detectorului cu toate observațiile
-HTTP `p1`–`p3`, browser, robots, probe, DNS și TLS. Relațiile și excluderile se
-rezolvă astfel o singură dată pe setul combinat.
+Ordinea bounded este: HTTP/robots `p1`; DNS cerut de catalog și issuerul TLS
+reutilizat, care închid prefixul `T1`; înghețarea și rezervarea candidatului
+static `T2`; checkul robots și HTTP-ul rezervării; probele sortate pe originul
+final, care închid prefixul `T2`; browser `p1` numai pentru
+HTML 2xx complete sau truncated; completarea planului `full` din reuniunea
+static + randat cu maximum încă un candidat; check/HTTP pentru acel candidat;
+sortarea publică și browserul prefixului compact `p2`/`p3`; finalizarea sesiunii
+browser; apoi pass-ul detector `full` cu toate observațiile HTTP, browser,
+robots, probe, DNS și TLS. Relațiile și excluderile se rezolvă o dată pe setul
+combinat autoritativ.
+
+Într-un run obișnuit acesta este singurul pass. Cu callback shadow explicit,
+după materializarea și validarea `DomainResult` oprim deadline-ul activ și
+rulăm concurrent detectorul pe prefixele imutabile `T1` și `T2`, numai sub
+caller cancellation, în două pool-uri dedicate distincte între ele și de pool-ul
+`full`. Timpii acestor două pass-uri nu intră în `DomainResult`, iar snapshot
+sink-ul nu poate modifica rezultatul `full` deja validat. Pool-urile nu împart
+cozi, slots, regex objects sau lifecycle failures; rămâne totuși costul comun de
+CPU/memorie al hostului.
 
 Orice body robots admis cu succes în entry, precheck structural, colectarea unei
 pagini interne sau verificarea unui probe rămâne semnal de detector cu
@@ -997,15 +1057,43 @@ sursa, revizia, data și faptul că snapshotul este nemodificat. Aceasta este o
 decizie de conformitate tehnică, nu consultanță juridică.
 
 Compilatorul acceptă numai allowlistul upstream exact și fișiere custom regulate
-care adaugă nume noi; v1 nu definește merge sau override. Înainte de parsare se
-aplică limite de 64 fișiere, 1 MiB per fișier, 16 MiB total și adâncime JSON 64,
-iar duplicatele de membri JSON, symlinkurile și intrările neașteptate sunt
-respinse. Toate declarațiile directe, inclusiv presence și duplicatele care vor
-fi deduplicate, consumă limita de 20.000. Header/meta folosesc locatoare exacte
-lowercase; locatoarele cookie sunt regexuri whole-name ancorate, executate în
-worker și incluse în bugetul regex. Rule ID-urile folosesc namespace-uri
-versionate stabile, fără commit, în timp ce provenance păstrează separat
-revizia și digestul snapshotului.
+care adaugă nume noi fără redeclarare. Singura excepție de corecție este ledgerul
+fix `fingerprints/custom/corrections.v1.json`, cu schema închisă
+`website-technologies-scraper/catalog-corrections-v1` și revizia
+`2026-08-20.1`. Ledgerul se leagă de source, revision și digestul upstream exact
+și admite numai `dropTechnologies` cu nume upstream exacte, `dropRules` cu rule
+ID SHA-256 complet și `replaceRules` cu target exact plus un `original`
+declarativ nou. Replacementul păstrează obligatoriu aceeași tehnologie, sursă
+și locator normalizat, intră în namespace-ul local și primește un rule ID nou.
+
+Fiecare target trebuie să rezolve exact o declarație upstream. Targeturile
+lipsă, duplicate, folosite în două operații, stale, cu digest greșit sau cu
+identity schimbată invalidează catalogul. Nu acceptăm wildcarduri, alias engine,
+name heuristics, JSON Patch, merge generic, config switch, CLI ledger sau date
+executabile. Când ledgerul există, chiar și apelul direct
+`compileFingerprintCatalog()` recalculează digestul complet al byte-ilor
+upstream înainte să aplice corecțiile; loaderul păstrează aceeași verificare.
+Byte-ii upstream și ID-urile regulilor neschimbate rămân intacte, iar byte-ii
+ledgerului intră în digestul catalogului efectiv.
+
+`dropTechnologies` se aplică înainte de limita `technologiesPerCatalog`, astfel
+încât limita descrie catalogul efectiv. Revizia acceptată produce 7.571
+tehnologii, 109 categorii, 15.481 declarații directe, 15.474 reguli unice și
+2.238 relații. Accountingul are 8.529 surse regex declarate, iar planul
+workerilor 8.525 surse (8.022 value și 503 locatoare cookie), 1.767 selectori
+DOM, 5.570 pathuri JavaScript și trei probe. Digestul efectiv este
+`sha256:614581009dc6ac2986763f8a324c656e629f63c5ecb7e46cf3ac10b121277724`;
+digestul upstream rămâne
+`sha256:cdcccc905a14bbc7ad35a7ea6de636a2e6e51280c6ebbe5ba14f5e55aac18c8f`.
+
+Înainte de parsare se aplică limite de 64 fișiere, 1 MiB per fișier, 16 MiB
+total și adâncime JSON 64, iar duplicatele de membri JSON, symlinkurile și
+intrările neașteptate sunt respinse. Toate declarațiile directe efective,
+inclusiv presence și duplicatele care vor fi deduplicate, consumă limita de
+20.000. Header/meta folosesc locatoare exacte lowercase; locatoarele cookie sunt
+regexuri whole-name ancorate, executate în worker și incluse în bugetul regex.
+Rule ID-urile folosesc namespace-uri versionate stabile, fără commit, în timp ce
+provenance păstrează separat revizia upstream și digestul catalogului efectiv.
 
 Detectorul admite numai observațiile deja limitate ale collectorilor HTTP și
 browser: URL final/redirecturi, headere, cookie-uri, HTML, text, metadata,
@@ -1017,11 +1105,13 @@ reinterpretăm statusuri, stylesheet-uri, imagini, iframe-uri, linkuri sau
 navigation links ca semnale v1. Observațiile HTTP page-scoped păstrează exact
 `p1`, `p2` sau `p3`, la fel ca browserul; non-HTML entry și robots rămân cu
 `pageId: null`, probele folosesc tot `pageId: null` și pathul drept key, iar un
-răspuns intern deja selectat păstrează `p2`/`p3`. Pipeline-ul trimite o singură
-dată setul combinat HTTP/browser/probe/DNS/TLS, nu unește rezultate detectate
-separat pe pagini. Matchingul regex rulează pe valoarea raw bounded în worker;
-parentul primește doar spanul și versiunea sigură și construiește dovada prin
-sanitizerul comun. URL-urile se publică numai integral, canonic și sanitizat;
+răspuns intern deja selectat păstrează `p2`/`p3`. Pass-ul autoritativ `full`
+trimite o singură dată setul combinat HTTP/browser/probe/DNS/TLS și nu unește
+rezultate detectate separat pe pagini; numai modul shadow explicit adaugă
+pass-urile independente pe prefixele `T1` și `T2`. Matchingul regex rulează pe
+valoarea raw bounded în worker; parentul primește doar spanul și versiunea sigură
+și construiește dovada prin sanitizerul comun. URL-urile se publică numai
+integral, canonic și sanitizat;
 header/meta publică doar matchul după clasificarea întregii observații, iar
 cookie/HTML/text/robots/probe/DOM/JavaScript/script content rămân redacted.
 Candidații HTTP au prioritate înaintea tierului browser când bugetul admite doar
@@ -1070,26 +1160,229 @@ mărirea tăcută a bugetelor sau reinterpretarea dovezilor:
   generic; familia Lightbox este puternic suspectă; există patru perechi de
   aliasuri duplicate.
 
+Am închis această coadă punctuală prin ledgerul exact `2026-08-20.1`: eliminăm
+cele patru definiții alias, regulile slabe WebsiteBuilder, Store Vantage,
+Sirvoy, Wix eCommerce și DOM Lightbox; restrângem Onsen UI și scriptul Lightbox
+la basename-uri exacte; iar regula Liveinternet care a produs 13 timeouturi este
+înlocuită cu semnalul bounded `//counter\.yadro\.ru/hit`. Fixtures la nivel de
+candidat au câte un negativ pentru fiecare regulă eliminată și un pozitiv pentru
+fallbackul puternic păstrat, plus negativele `consent`, `dmm-consent`,
+Breakdance și un HTML Liveinternet negativ de 4 MiB. Această decizie se aplică
+următorului run fresh; nu rescrie statisticile istorice v0.1.4.
+
 Ținta inițială pe occurrence-uri, 95% din detecțiile directe cu browser pe
 maximum 20% dintre domenii, este infirmată de date: fără browser rămân cel mult
 1.317/2.061; chiar un oracle care alege cele mai productive 40 de domenii ajunge
 numai la 1.768/2.061 (85,78%), iar 95% cere minimum 68/200 domenii (34%). Nu mai
 folosim această țintă drept criteriu de acceptare implicit.
 
-Rămâne deschisă o alegere de produs/măsurare înainte de implementarea tiered:
+Pentru următorul experiment acceptăm varianta KISS+ numai ca protocol
+provizoriu: breadth-ul numelor directe canonicalizate este guardrail, iar
+retenția perechilor canonicalizate `(domain, technology)` este obiectivul
+principal. Retenția occurrence-urilor raw rămâne diagnostic secundar. Acest
+lucru nu ratifică încă un KPI de produs: fezabilitatea cunoscută este numai
+post-hoc și triggerul deployabil trebuie să folosească exclusiv semnale `T1`/`T2`.
+Nu adăugăm acum un framework generic de override, nu schimbăm capul browser și
+nu declarăm gate-ul final închis înaintea corecțiilor, shadow runului v0.1.5 și
+evaluării out-of-fold.
 
-1. păstrăm occurrence retention și acceptăm un plafon browser de cel puțin 34%
-   ca lower bound oracle; un trigger deployabil poate necesita mai mult;
-2. sau, recomandat pentru evaluare, cerem minimum 95% din numele directe
-   canonicalizate cu browser pe maximum 20%, păstrând occurrence retention ca
-   metrică secundară.
+## Protocolul provizoriu de evaluare tiered
 
-A doua variantă este fezabilă numai ca oracle post-hoc în acest moment: 25 de
-domenii acoperă 342/360 nume directe și 40 acoperă 357/360. Înainte să devină
-politică trebuie să corectăm aliasurile/false-positive-urile cu fixtures
-pozitive și negative și să măsurăm un trigger care folosește exclusiv semnale
-tier 1/2. Nu adăugăm acum un framework generic de override, nu schimbăm capul
-browser și nu declarăm gate-ul final închis fără această decizie și o rerulare.
+Protocolul `2026-08-20.1` și instrumentația lui shadow sunt implementate pentru
+măsurarea următoare; runul public fresh v0.1.5 și verdictul nu sunt încă
+finalizate. Nu este routing funcțional, KPI final sau afirmație de capacitate la
+scară de producție. Toate views folosesc același catalog efectiv validat,
+aceeași revizie de corecții, configurație și semantică deterministă a
+detectorului. Nu obținem un view intermediar filtrând dovezile din rezultatul
+final; detectorul rulează separat pe fiecare prefix.
+
+Views sunt exacte:
+
+- `T1` conține targetul și observațiile HTTP statice bounded ale entry page,
+  inclusiv URL final/redirecturi, observațiile robots necesare admiterii acestui
+  lucru, DNS-ul cerut de catalog și issuerul TLS reținut. Nu conține probe,
+  pagină internă sau observații browser.
+- `T2` conține `T1`, toate probele declarative bounded pe originul exact și
+  observațiile robots aferente, plus maximum o pagină internă colectată static.
+  Nu conține linkuri randate, DOM, browser network sau script bodies din browser.
+  Un failure păstrează prefixul disponibil și rămâne în populația evaluată.
+- `full` este labelul detectat separat peste scanarea bounded completă. Niciun
+  rezultat sau failure `full` nu poate deveni feature al triggerului.
+
+Pagina `T2` se alege numai din copia înghețată a linkurilor de navigare extrase
+static din `p1`. Refolosim exact filtrarea existentă pentru origin canonic,
+credentials, query/fragment, lungime URL, pathuri excluse, fișiere, root/URL
+final și clasificarea rolurilor. Păstrăm cel mai bun `detail` și cel mai bun
+`listing`, sau cel mai bun `content` numai când listingul lipsește, cu rankingul
+existent pe token, pathname mai scurt și URL canonic. Sortăm cele maximum două
+alegeri structurale după URL-ul canonic de rețea în ordine directă UTF-16 și o
+alegem pe prima. Astfel capul de o pagină nu introduce o preferință de rol nouă.
+
+Facem un singur check robots pentru candidatul ales. Denial, unavailable,
+coliziunea după sanitizer sau lipsa unui candidat produc zero pagini și fără
+backfill; altfel colectăm exact acea pagină prin HTTP protejat. „O pagină” este
+deci maximumul determinist, nu o promisiune de a ocoli policy sau de a inventa
+un URL.
+
+Pipeline-ul implementat colectează DNS/TLS imediat după HTTP `p1`, închizând
+prefixul `T1` înainte ca lucrul `T2` să-i consume deadline-ul. Apoi îngheață și
+rezervă candidatul static `T2`, îl colectează înainte de probe, iar toate acestea
+precedă browserul. După browser `p1`, planul `full` păstrează rezervarea într-unul
+dintre cele două sloturi interne și permite maximum încă un candidat din slotul
+opus. Capul total de trei pagini, sanitizarea și regulile IDs publice rămân
+neschimbate. Observațiile bounded sunt reutilizate, dar detectorul primește trei
+seturi imutabile independente; `full` rulează sub deadline, apoi, după validarea
+rezultatului și oprirea acelui timer, `T1` și `T2` rulează separat sub semnalul
+callerului, concurrent și în pool-uri detector dedicate distincte. Timpul
+shadow nu intră în timings și nu modifică labelul `full`. Un view
+`detector-unavailable` invalidează cohortul; nu îl calibrăm ca zero semnale.
+
+Lifecycle-ul `full` admite totuși slotul și contextul browser înaintea HTTP
+`p1`, deoarece admission pornește unicul deadline activ al domeniului. Un eșec
+de pre-open face ambele prefixuri shadow explicit unavailable, iar latența de
+setup poate influența disponibilitatea capturii. Nu permite însă niciunei
+observații browser să intre în `T1`/`T2`; prefixul indisponibil invalidează
+calibrarea fail-closed în loc să fie convertit într-un set gol.
+
+Artefactul top-level are `schemaVersion: 1`, protocol/run, numărul exact de
+domenii, provenance complet, snapshoturi sortate, agregatele limitelor și
+raportul de calibrare. Snapshotul per domeniu este un allowlist raw-free:
+protocol/run/domain; pentru
+`T1`/`T2`, state disponibil/indisponibil, nume direct/inferred sortate,
+`detectionStats`, completed și erori grupate numai după
+`(stage, code, retryable, count)`; features pre-browser bounded pentru outcome și
+status entry, mărimea HTML/text, numărul de linkuri statice, metadata, resurse,
+DNS, prezența issuerului TLS, selecția/rolul/outcome `T2`, probe, requesturi HTTP
+și bytes statici; labelul `full` cu nume/status; costurile browser; și hits de
+limită `(pageId, category, domSelectorOrdinal|null)`. Un prefix care nu a putut
+fi capturat este explicit unavailable, nu o detecție goală inventată.
+
+Nu admitem URL, evidence, rule ID, pattern, message, valoare matched, HTML, DOM,
+script, header, cookie, JavaScript value sau altă observație brută; proprietățile
+extra sunt eliminate înainte de acumulare. Snapshoturile sunt sortate după
+domeniu și provenance leagă ordinalele selectorilor de digestul catalogului.
+Hits per pagină se deduplică după `(pageId, category, ordinal)`, apoi artefactul
+agregă după `(category, ordinal)` numărul de hits, pagini și domenii afectate.
+Numai `inspection.domMatches` și `inspection.domAccess` poartă ordinal; celelalte
+categorii de inspection, cookie, network, script și proxy folosesc `null`.
+Allowlistul exact este `inspection.domMatches`, `inspection.domAccess`,
+`inspection.returnedValue`, `inspection.returnedValuesPerPage`,
+`inspection.navigationLinksCount`, `inspection.navigationLinkInvalid`,
+`cookies.name`, `cookies.value`, `cookies.perDomain`,
+`cookies.totalBytesPerDomain`, `browser.networkHostnamesPerDomain`,
+`browser.networkUrlsPerDomain`, `scripts.bodyBytes`,
+`scripts.bodiesPerDomain`, `scripts.totalBodyBytesPerDomain`,
+`proxy.headerFields`, `proxy.headerBytes`, `proxy.requestsPerPage`,
+`proxy.requestsPerDomain`, `proxy.transferBytesPerPage` și
+`proxy.transferBytesPerDomain`.
+
+Înainte de calibrare, acumulatorul admite cumulativ maximum 10.000 identity
+values: câte o identitate de domeniu, toate numele directe și inferred din
+`T1`/`T2`/`full`, fiecare grup de erori `T1`/`T2` sau markerul unui view
+indisponibil și fiecare browser-limit hit. O adăugare care ar produce 10.001
+este respinsă atomic, fără inserarea snapshotului. Limita protejează cohortul în
+memorie și este independentă de preflightul structural de 500.000 valori JSON și
+capul UTF-8 de 64 MiB ale writerului.
+
+Bugetul provizoriu este maximum 40 de domenii unice din 200 care ajung la orice
+lucru browser. Un domeniu consumă un loc chiar dacă browserul eșuează, nu admite
+o pagină sau primește ulterior Tier 4. Pentru evaluarea OOF, cele 40 de locuri
+sunt repartizate între folds numai din mărimea lor, iar exact două dintre aceste
+locuri sunt repartizate drept control. Restul de 38 sunt locuri trigger.
+Controlul se alege numai din restul netriggerat al aceluiași fold, deci nu este
+prezentat drept trafic gratuit.
+
+Pentru fiecare domeniu canonic `d`, `F(d)` este setul numelor directe
+canonicalizate din labelul `full`. Simularea folosește `T2(d)` pentru domeniul
+nerutat și `F(d)` pentru cel rutat. Inferred rămâne separat. Guardrails sunt:
+
+- minimum 95% din setul global de nume directe canonicalizate din `full`;
+- minimum provizoriu 80% din perechile canonicalizate
+  `(domain, technology)`, acesta fiind obiectivul principal de optimizare;
+- maximum 40 de domenii rutate după contabilizarea de mai sus.
+
+Ambele retenții sunt intersecții cu labelul `full` împărțite la setul `full`
+nenul corespunzător. Detecțiile shadow suplimentare nu pot mări scorul și sunt
+raportate separat ca disagreements. Raportăm și macro recall pe domeniile cu
+`F(d)` nenul, macro recall pe tehnologiile cu minimum un domeniu `full`, plus
+numărul explicit al domeniilor fără label. Costul include valori absolute și
+relative pentru domenii și pagini browser, requesturi, bytes transferați și
+suma `browserMs`; procentul domeniilor nu este proxy suficient pentru cost.
+
+Feature function-ul triggerului vede numai state/completed, nume directe,
+`detectionStats`, erorile controlate din `T1`/`T2` și features pre-browser de mai
+sus. Numele inferred se păstrează pentru raport, dar nu sunt tokens. Labelul
+`full`, costul browser și telemetry browser nu intră în features.
+
+Calibrarea folosește cinci folds determinate prin primul uint32 big-endian din
+`SHA-256(salt + NUL + domain) mod 5`. Pentru fiecare fold antrenăm pe celelalte
+patru și concatenăm o singură dată predicțiile held-out. Modelul direct
+`smoothed-empirical-token-lift-v1` țintește numărul de perechi directe
+incrementale din `full` față de `T2`. Valorile bounded devin tokens deterministe,
+counters folosesc bins fixe zero/unu/puteri de doi, iar media empirică a fiecărui
+token este netezită spre media globală a foldului cu prior weight 4. Scorul este
+media dintre global mean și estimările tokenurilor matched; nu îl prezentăm ca
+probabilitate sau framework ML generic.
+
+Salturile înghețate sunt
+`website-technologies-scraper/shadow/2026-08-20.1/fold/v1`,
+`website-technologies-scraper/shadow/2026-08-20.1/score-tie/v1`,
+`website-technologies-scraper/shadow/2026-08-20.1/control/v1`,
+`website-technologies-scraper/shadow/2026-08-20.1/random/v1` și
+`website-technologies-scraper/shadow/2026-08-20.1/greedy-tie/v1`.
+
+Cotele fold-local folosesc regula Hamilton/largest-remainder. Pentru un fold de
+mărime `n`, cota routed inițială este `floor(40 * n / 200)`; locurile rămase se
+dau după restul fracționar descrescător, apoi numărul foldului. Cele două cote
+control se distribuie prin aceeași regulă și același tie-break, bounded de cota
+routed; cota trigger a foldului este routed minus control. Distribuțiile
+imposibile sunt respinse fail-closed. În fiecare fold rankăm numai scorurile lui
+held-out, iar controlul se alege cu saltul control numai dintre domeniile
+netriggerate ale acelui fold. Uniunile au exact 38 trigger și două control.
+Astfel schimbarea tuturor labelurilor `full` dintr-un fold nu poate schimba
+membership-ul routed în acel fold, chiar dacă poate modifica modelele celorlalte
+folds.
+
+Comparatorii de buget egal sunt un sample hash label-blind de 40 și un greedy
+post-hoc label-aware de 40, care maximizează întâi liftul de perechi și apoi
+numele canonice noi; îl numim greedy, nu oracle sau upper bound. După evaluarea
+OOF antrenăm aceeași formă pe toate cele 200 snapshoturi și persistăm separat
+deployment model-ul pentru un cohort ulterior; acesta nu înlocuiește selecțiile
+held-out ale verdictului curent.
+
+Prima implementare este exclusiv shadow: nu schimbă routingul și rezultatul
+`full` rămâne autoritativ. `--shadow-evaluation` este create-only, incompatibil
+cu `--resume` și `--force`, cere exact 200 de domenii și ține în memorie maximum
+un snapshot allowlisted per domeniu, cu cap fix 200. Modului shadow îi aparțin
+trei pool-uri peste același catalog (`full`, `T1`, `T2`), fiecare cu
+`limits.detector.workers`: implicit șase worker isolates în loc de două și trei
+seturi distincte de compilări worker-local. Separarea împiedică o coadă sau un
+lifecycle failure să contamineze alt view, dar nu elimină competiția CPU/memorie
+la nivelul hostului. Orice pool shadow indisponibil sau snapshot cu view `T1`
+sau `T2` indisponibil oprește fail-closed înainte de calibrare/publicare. După finalizarea
+JSONL/summary și închiderea resurselor runului publică un JSON compact: sufixul
+terminal `.jsonl` devine `.evaluation.json`, iar alt sufix primește
+`.evaluation.json` appended. Writerul folosește temporary file exclusiv, mode
+`0600`, sync și no-clobber atomic pentru sidecar. Înainte de serializare
+revalidează forma fixă protocol/cohort/folds/38+2, respinge structuri
+non-plain/ciclice/cu accessors sau excesive, cu maximum 500.000 de valori JSON,
+și aplică un cap UTF-8 fix de 64 MiB inclusiv newline
+(`EVALUATION_ARTIFACT_LIMIT`). Orice target existent/alias/race este respins; nu
+promitem atomicitate între result, summary și sidecar și nu anulăm
+artefactele principale deja finalizate dacă evaluarea eșuează. Failure-ul rămâne
+exit non-zero, iar sidecarul nu are resume sau force.
+
+Sidecarul include selecțiile/predicțiile, retențiile prin intersecție, macro
+recall, disagreements extra, costurile reale, comparatoarele, deployment model
+și verdictul machine-readable `provisional-shadow-challenge`. Câmpul `passed`
+nu ratifică singur nimic: gate-ul rămâne deschis până când runul fresh v0.1.5
+termină și selecția deployabilă OOF trece simultan 95% nume, 80% perechi și
+maximum 40 domenii.
+
+Cele 200 de domenii sunt set descriptiv/de dezvoltare, deoarece v0.1.4 a
+influențat corecțiile și metrica. Out-of-fold reduce leakage-ul calibrării, dar
+nu transformă setul într-un holdout de producție. Ratificarea KPI-ului cere mai
+întâi trecerea triggerului deployabil și apoi un cohort nou reprezentativ.
 
 ## Probleme posibile
 
@@ -1107,15 +1400,14 @@ browser și nu declarăm gate-ul final închis fără această decizie și o rer
 ## Scalare la milioane de domenii
 
 - Fiecare domeniu va fi un job independent și idempotent.
-- Tier 1 rulează pentru toate domeniile: target, robots, homepage HTTP, DNS/TLS,
-  headere, meta și URL-uri de resurse.
-- Tier 2 adaugă probe și o pagină internă statică pentru site-uri ecommerce/CMS,
-  pagini HTML subțiri sau zero detecții directe.
-- Tier 3 rulează browserul pe homepage și folosește script bodies din răspunsurile
-  deja descărcate pentru site-uri relevante obiectivului, dinamice sau
-  necunoscute și pentru un sample de control determinist de 1%.
-- Tier 4 adaugă product page și scripturile sale numai pentru subsetul ecommerce
-  unde homepage-ul nu oferă suficiente semnale.
+- Forma tiered rămâne provizorie până trece protocolul shadow: `T1` este view-ul
+  entry HTTP static + robots + DNS/TLS, iar `T2` adaugă probele și zero sau o
+  pagină internă statică selectată numai din linkurile statice `p1` prin regula
+  exactă de mai sus.
+- Un Tier 3 viitor rulează browserul pe entry numai pentru domeniile selectate
+  din `T1`/`T2` și pentru controlul determinist de 1%.
+- Un Tier 4 viitor poate adăuga product page pentru subsetul ecommerce, dar
+  domeniul consumă același buget browser indiferent de tier sau outcome.
 - Domeniile vor fi împărțite într-o coadă durabilă.
 - Un run distribuit `full` poate păstra câte un job idempotent per domeniu; modul
   tiered va persista rezultatul fiecărei etape și va ruta selectiv joburile între
@@ -1127,10 +1419,10 @@ browser și nu declarăm gate-ul final închis fără această decizie și o rer
 - Vom monitoriza durata, erorile, throughput-ul și dimensiunea cozilor.
 - Numărul de workeri va fi calculat după ce măsurăm costul scanării HTTP și al scanării cu browserul.
 - Ținta inițială de 95% din occurrence-urile directe cu browser pe maximum 20%
-  a fost infirmată de benchmarkul v0.1.4. KPI-ul final rămâne alegerea explicită
-  dintre occurrence retention cu plafon browser mai mare și nume directe
-  canonicalizate cu occurrence retention secundar; nu extrapolăm capacitatea
-  până nu măsurăm triggerul ales.
+  a fost infirmată de benchmarkul v0.1.4. Protocolul următor folosește provizoriu
+  breadth canonicalizat >=95%, retenția perechilor canonicalizate >=80% și
+  maximum 40/200 domenii browser, dar acestea nu devin KPI final înaintea unui
+  trigger out-of-fold deployabil și a unui cohort reprezentativ nou.
 
 ## Descoperirea tehnologiilor noi
 

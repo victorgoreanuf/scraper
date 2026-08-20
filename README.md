@@ -5,7 +5,10 @@
 > isolated detector, protected Playwright/Chromium collector and pool, and
 > bounded catalog-probe and DNS/TLS infrastructure collection plus pipeline
 > orchestration are implemented and tested. Incremental output, resume, summary
-> generation, and the runnable local CLI are also implemented and tested.
+> generation, the runnable local CLI, the exact correction ledger, bounded
+> browser-limit telemetry, and the raw-free shadow evaluator/calibration
+> sidecar are also implemented and tested. The fresh v0.1.5 public run,
+> calibration verdict, KPI decision, and functional tier routing remain pending.
 
 ## Goal
 
@@ -62,13 +65,15 @@ The provided benchmark contains 200 unique domains in a Snappy-compressed Parque
 8. **Bounded resources:** requests, pages, redirects, response sizes, scripts, browser contexts, and time are limited.
 9. **No speculative layers:** no service containers, plugin framework, repositories, controllers, or generic utility folders without a current need.
 
-## Planned repository layout
+## Repository layout
 
 ```text
 .
 ├── src/
 │   ├── cli.ts
 │   ├── config.ts
+│   ├── evaluation.ts
+│   ├── evaluation-calibration.ts
 │   ├── model.ts
 │   ├── network-policy.ts
 │   ├── pipeline.ts
@@ -87,6 +92,7 @@ The provided benchmark contains 200 unique domains in a Snappy-compressed Parque
 │   │   ├── pool.ts
 │   │   └── worker.ts
 │   └── output/
+│       ├── evaluation-writer.ts
 │       ├── writer.ts
 │       └── summary.ts
 ├── fingerprints/
@@ -99,7 +105,8 @@ The provided benchmark contains 200 unique domains in a Snappy-compressed Parque
 │   │           ├── b.json
 │   │           └── ...
 │   └── custom/
-│       └── technologies/
+│       ├── corrections.v1.json
+│       └── technologies/ # optional original additions
 ├── schemas/
 │   ├── domain-result.v1.schema.json
 │   └── scan-config.v1.schema.json
@@ -107,6 +114,9 @@ The provided benchmark contains 200 unique domains in a Snappy-compressed Parque
 │   ├── fixtures/
 │   ├── browser-proxy.test.ts
 │   ├── browser.test.ts
+│   ├── evaluation.test.ts
+│   ├── evaluation-calibration.test.ts
+│   ├── evaluation-writer.test.ts
 │   ├── toolchain.test.ts
 │   ├── catalog.test.ts
 │   ├── config.test.ts
@@ -205,23 +215,25 @@ Build a target candidate and validate all resolved addresses
         ↓
 Fetch robots.txt through the protected transport and evaluate the candidate path
         ↓
-Collect the entry page with HTTP and the isolated browser
-        ↓
-Select at most two eligible internal pages deterministically
-        ↓
-Collect the selected pages and browser script observations
-        ↓
-Collect bounded catalog probes on the exact final origin
+Collect the entry page with protected HTTP
         ↓
 Collect catalog-requested DNS records and the retained TLS issuer
         ↓
-Match direct fingerprints in the isolated detector pool
+Freeze and reserve at most one static-only internal candidate
+        ↓
+Collect the reserved page with HTTP and the bounded catalog probes
+        ↓
+Render the entry page, complete the bounded full-page plan, and collect browsers
+        ↓
+Match the complete `full` observations in the isolated detector pool
         ↓
 Apply requires / requiresCategory / implies / excludes relationships
         ↓
 Sanitize, merge, sort, and write one complete result record
         ↓
 Generate run summary
+        ↓
+Optionally publish the raw-free 200-domain shadow evaluation sidecar
 ```
 
 The robots fetch is itself an infrastructure request and is not gated by
@@ -232,11 +244,14 @@ before the next page request. A cross-authority redirect therefore receives its
 own robots policy, while a same-authority redirect still receives a new path
 decision.
 
-Catalog probe paths are validated and compiled as non-executable data. After
-the selected pages finish, the pipeline requests their sorted bounded prefix
-on the exact final origin, then collects DNS/TLS and submits every observation
-to the detector once. Probe requests use the same protected transport, robots
-policy, active-domain deadline, and aggregate HTTP limits as page requests.
+Catalog probe paths are validated and compiled as non-executable data. For an
+HTML entry, the pipeline requests their sorted bounded prefix on the exact final
+origin after `T1` infrastructure and the reserved static `T2` page, but before
+any browser navigation. Probe requests use the same protected transport, robots policy,
+active-domain deadline, and aggregate HTTP limits as page requests. A normal
+run submits the complete observation set to the detector once; an explicitly
+requested shadow run later performs two additional independent detector passes
+over the already bounded `T1` and `T2` prefixes.
 
 ## Parquet input contract v1
 
@@ -302,9 +317,9 @@ behind a killable resource boundary or use a reviewed page-header preflight.
 
 The first implemented scan mode is `full`. It is intentionally exhaustive for
 the supplied 200-domain benchmark: every eligible page receives both the static
-HTTP collector and the browser collector. A future tiered mode is defined in
-the scaling section, but it is not another abstraction to implement before the
-full-mode benchmark provides measurements.
+HTTP collector and the browser collector. The shadow instrumentation below
+measures exact static prefixes without skipping that work; functional tiered
+routing remains a later orchestration slice.
 
 ### Canonical target
 
@@ -627,9 +642,8 @@ The scanner visits at most three top-level pages:
 3. one discovered collection/category/shop `listing`, or a useful `content`
    fallback.
 
-Page-selection policy v1 takes the set union of navigation links observed by
-static HTTP and by the rendered `p1`; it never guesses a path, reads links from
-`p2`/`p3`, or crawls recursively. Each candidate must parse as canonical
+Page-selection policy v1 never guesses a path, reads links from `p2`/`p3`, or
+crawls recursively. Each candidate must parse as canonical
 HTTP(S), use exactly the final entry origin (scheme, hostname, and effective
 port), have empty credentials, query, and fragment, fit the configured URL
 limit, and differ from both the final entry URL and the origin root. Canonical
@@ -649,20 +663,29 @@ least one following non-empty segment. Otherwise a `listing` candidate contains
 
 Within each class, the token order written above is the fixed class rank, then
 the shorter canonical pathname wins, then the complete canonical URL in direct
-ascending UTF-16 code-unit order. Policy v1 keeps at most one `detail` and one
-`listing`; only when no listing exists may one `content` candidate occupy the
-listing slot; `content` has one fixed class rank. An absent detail never receives
-a different role. The structural choices are sorted by complete canonical
-network URL, then the configured page cap keeps the first at most
-`topLevelPerDomain - 1` internal candidates.
+ascending UTF-16 code-unit order. The selector keeps at most one `detail` and
+one `listing`; only when no listing exists may one `content` candidate occupy
+the non-detail slot. An absent detail never receives a different role. Its at
+most two choices are sorted by complete canonical network URL.
 
-Only after this bounded structural choice does the orchestrator perform robots
-checks, at most two in total. A denied or unavailable candidate is removed
-without backfilling from the discarded link set. Each survivor is then
-sanitized for publication, collisions with the entry page or another survivor
-are removed, and the survivors are sorted by that public URL before receiving
-compact IDs `p2` and `p3`; therefore sanitization cannot invalidate wire order
-and a removed first candidate cannot leave an ID gap.
+After entry infrastructure has completed, the orchestrator runs that selector
+on a frozen copy of the static `p1` navigation links and reserves its first
+choice as the only possible internal page in `T2`. The candidate receives
+exactly one robots check and, if admitted, one protected HTTP collection before
+probes or browser work. The reservation consumes either the detail or non-detail slot
+even when denied, unavailable, skipped after sanitization, or failed; it is
+never backfilled. After browser `p1`, the full plan applies the same selector to
+the union of static and rendered links, preserves the reservation, and may add
+at most one candidate from the opposite structural slot. That candidate also
+receives no backfill, so the domain still performs at most two internal robots
+checks and visits at most `topLevelPerDomain - 1` internal pages.
+
+Admitted internal results are sanitized for publication, collisions with the
+entry page or another survivor are removed, and the survivors are sorted by
+public URL before receiving compact IDs `p2` and `p3`. A provisionally collected
+reserved page is remapped to that final ID; therefore pre-browser collection
+cannot invalidate wire order and a removed first candidate cannot leave an ID
+gap.
 
 Catalog probes do not count as pages. Their collection policy is defined below
 and does not change page selection, page IDs, `pagesVisited`, or browser-prefix
@@ -674,9 +697,9 @@ semantics.
 probe paths from the deeply frozen catalog inspection plan, the validated
 configuration, and the same protected transport session and run-scoped robots
 service used by static pages. A non-HTML or unresolved entry schedules no
-probes. Probe collection is sequential after all selected-page HTTP/browser
-collection and before DNS/TLS, browser-session finalization, and the single
-detector invocation.
+probes. Probe collection is sequential after T1 DNS/TLS and the reserved static
+`T2` page, but before browser navigation, browser-session finalization, and
+detection.
 
 The compiler and collector both enforce at most five unique paths. Each path is
 an absolute same-origin pathname beginning with one `/`, with no credentials,
@@ -758,6 +781,18 @@ and truncated admitted drafts. A failure before observation admission produces
 no usable draft; a terminal proxy, timeout, navigation, policy, lifecycle, or
 cleanup failure always closes the prefix even when the current page's earlier
 bounded draft remains admissible.
+
+A DOM inspection whose facts are all `exists` needs only one qualifying match.
+It stops at that first match and emits every requested presence fact without a
+false `inspection.domMatches` truncation; a zero-match selector traverses to the
+end and remains an ordinary empty observation. Mixed, text, attribute, and
+property inspections retain the existing per-selector match cap because their
+values can differ across elements.
+
+The collector also returns a bounded, deduplicated limit-hit list for the
+evaluation boundary. Each hit is a stable category plus a DOM-selector ordinal
+only for selector-specific DOM failures; public `DomainResult.errors` keeps its
+existing generic sanitized error and does not expose this diagnostic detail.
 
 The browser keeps its sandbox and CSP, has no permissions, blocks service
 workers, disables downloads, and never clicks, scrolls, submits forms, accepts
@@ -903,23 +938,30 @@ The admitted scan performs these bounded steps:
 
 1. collect the selected target as HTTP `p1`, with robots checked for the
    candidate and every redirect;
-2. for a complete or truncated 2xx HTML `p1`, collect the same URL in the
-   browser and immediately combine its rendered navigation links with the
-   static navigation links;
-3. apply page-selection policy v1, perform at most two asynchronous robots
-   checks, assign compact `p2`/`p3`, and collect each survivor with exact-origin
-   HTTP followed by browser only when its HTTP page is browser-eligible;
-4. for an HTML entry, collect the sorted bounded catalog probes on its exact
-   final origin, after all page requests and before infrastructure collection;
-5. collect the catalog-requested DNS records and reuse the final verified HTTPS
-   issuer, so infrastructure admission does not race any static HTTP request on
-   the shared session budget;
-6. finish the browser session, then invoke the detector pool exactly once with
-   the complete bounded HTTP `p1`–`p3`, browser, robots, probe, DNS, and TLS
-   observations; relationships and exclusions therefore also run once over the
-   combined candidate set;
-7. sanitize, deduplicate, sort, enforce result caps, and pass the complete
-   `DomainResult` through the semantic validator before returning it.
+2. collect catalog-requested DNS records and reuse the verified entry HTTPS
+   issuer; entry plus infrastructure completes `T1` before any `T2` work can
+   consume the active-domain deadline;
+3. for an HTML `p1`, freeze the static links, reserve the deterministic `T2`
+   candidate, perform its one robots check, collect it once with protected HTTP
+   when admitted, and then collect sorted bounded probes on the exact final
+   origin; denial or failure consumes the reservation without backfill, and this
+   stage completes the pre-browser `T2` prefix;
+4. for a complete or truncated 2xx HTML `p1`, collect the same URL in the
+   browser, combine rendered and static links for the `full` plan, preserve the
+   reservation, and add at most one candidate from the opposite structural
+   slot;
+5. collect that additional candidate with robots and HTTP when admitted, sort
+   all admitted internal results by sanitized public URL, assign compact
+   `p2`/`p3`, and collect their browser-eligible ordered prefix;
+6. finish the browser session, then invoke the detector pool once under the
+   active-domain deadline with the complete bounded HTTP `p1`–`p3`, browser,
+   robots, probe, DNS, and TLS observations;
+7. sanitize, deduplicate, sort, enforce result caps, and pass the authoritative
+   `DomainResult` through the semantic validator;
+8. only when shadow evaluation was explicitly requested, clear the pipeline
+   deadline and invoke the detector independently for `T1` and `T2` under caller
+   cancellation, then emit one allowlisted raw-free snapshot. These extra passes
+   do not alter the validated `full` result or its timings.
 
 Every successfully admitted robots body from entry collection, structural
 prechecks, internal-page collection, or probe checks remains a detector signal
@@ -1120,7 +1162,7 @@ A representative direct detection is shown below.
     "browserTransferredBytes": 130000
   },
   "provenance": {
-    "scannerVersion": "0.1.4",
+    "scannerVersion": "0.1.5",
     "runtime": {
       "node": "24.19.0",
       "playwright": "1.62.1",
@@ -1542,9 +1584,11 @@ source is required:
 - `--config <path>` reads at most 1 MiB of strict UTF-8 JSON and requires one
   complete `ScanConfig` v1 whose User-Agent carries the actual package version.
 
-Operational flags are `--resume`, `--force`, `--quiet`, `--help`, and
-`--version`. Resume and force are mutually exclusive. Unknown, positional, or
-duplicate options fail before input, output, browser, or network work. The CLI
+Operational flags are `--resume`, `--force`, `--shadow-evaluation`, `--quiet`,
+`--help`, and `--version`. Resume and force are mutually exclusive, and shadow
+evaluation is valid only in the default fresh-create mode, never with either of
+them. Unknown, positional, or duplicate options fail before input, output,
+browser, or network work. The CLI
 validates the exact Node version, preflights the complete Parquet input, rejects
 result or paired-summary aliases of input/config files, compiles the catalog,
 preflights detector workers and protected Chromium, and only then opens the
@@ -1563,6 +1607,61 @@ and graceful SIGINT/SIGTERM cleanup exits `130`/`143`. The first signal aborts
 work and closes input, writer, browser, and detector resources without a false
 summary; a second signal uses the operating system default termination.
 `CLI_DEGRADED` identifies the unavailable `detector`, `browser`, or both pools.
+
+### Shadow evaluation CLI
+
+`--shadow-evaluation` is the narrow measurement entry point for protocol
+revision `2026-08-20.1`. It requires the exact validated 200-domain input before
+catalog, pool, writer, or network startup and keeps at most one allowlisted
+snapshot per unique domain, with a hard cohort cap of 200. It does not enable
+functional tier routing: every domain still receives the authoritative `full`
+scan. A regular run exposes no shadow callback and retains the single detector
+pass described above.
+
+A shadow run creates three run-owned detector pools over the same compiled
+catalog: the ordinary `full` pool and distinct dedicated `T1` and `T2` pools.
+The two shadow pools are also distinct from one another and their passes run
+concurrently after the corresponding `full` result is validated. They do not
+share detector slots, worker lifecycle state, or per-worker regex objects, so a
+shadow queue/failure cannot be reinterpreted as a result from another view or
+consume the full pool's slots. This isolation has a deliberate cost: startup
+compiles the catalog independently in every worker across three pools and holds
+`3 * limits.detector.workers` worker isolates (six with the reviewed default),
+while shadow matching adds CPU after each full result. The pools can still
+contend for host CPU and memory, so the sidecar does not claim unchanged
+wall-clock performance.
+
+The sidecar name is derived from the canonical result path: a terminal
+`.jsonl` is replaced with `.evaluation.json`, while another suffix receives an
+appended `.evaluation.json`. Thus `results.jsonl` produces
+`results.evaluation.json`. The CLI preflights this create-only target alongside
+the result, summary, input, and optional configuration paths. Any existing
+regular file, symlink, hard link, non-file, alias, or late publication race is
+rejected without clobbering it. The compact UTF-8 JSON sidecar is written to an
+exclusive temporary regular file with mode `0600`, synchronized, and published
+without replacement as a single-link `0600` file. There is no shadow resume or
+force mode.
+
+The primary JSONL and summary finalize first. The exact 200 snapshots are then
+validated, calibrated, and the browser-limit aggregates are built; run-owned
+input/browser/detector resources close before the sidecar is published. A
+snapshot, calibration, serialization, or sidecar I/O failure is fatal.
+Before serialization, the writer rejects non-plain, cyclic, accessor-bearing,
+sparse, non-finite, or unsupported structures, as well as structures deeper
+than 32 levels or larger than 500,000 JSON values. It revalidates the fixed
+protocol, cohort, fold, and 38+2 shapes and enforces a 64 MiB UTF-8 artifact cap
+including the terminal newline (`EVALUATION_ARTIFACT_LIMIT`).
+Validation and serialization failures leave the target absent; publication
+races never overwrite the racing target, and cleanup removes only paths whose
+file identity is still owned by the writer. The already finalized
+result/summary pair is not rolled back: atomicity is guaranteed for publication
+of the sidecar itself, not across all three artifacts. The CLI exits non-zero,
+so a missing sidecar cannot be mistaken for a successful shadow evaluation.
+If either dedicated shadow pool becomes unavailable, or any snapshot contains
+an unavailable `T1` or `T2` view, the run is not calibratable and fails before
+publishing the sidecar. Incremental JSONL lines and any summary already finalized before a
+post-run validation failure are not deleted, but neither is relabeled as a
+successful shadow evaluation.
 
 ## Incremental output and resume
 
@@ -1707,10 +1806,11 @@ included in canonical form.
   an external edge breaking a cycle, gate-then-exclude of a base technology,
   and pruning an inference whose only parent was suppressed.
 - Pipeline tests use injected deterministic collectors or controlled local
-  servers, never unstable public websites, and cover one combined detector
-  call, HTTP/browser `p1`–`p3`, sorted exact-origin probes, DNS/TLS,
-  queue/deadline separation, cleanup, partial/failed results, deterministic
-  error merge, probe evidence, and transport-owned `probesIssued` accounting.
+  servers, never unstable public websites, and cover the authoritative combined
+  `full` detector pass, independent shadow `T1`/`T2` passes, HTTP/browser
+  `p1`–`p3`, sorted exact-origin probes, DNS/TLS, queue/deadline separation,
+  cleanup, partial/failed results, deterministic error merge, probe evidence,
+  and transport-owned `probesIssued` accounting.
 - Catalog-probe tests cover path revalidation and sorting, composed-URL limits,
   robots allow/deny/unavailable behavior, one-shot GET/no-follow/no-retry,
   2xx and empty-body presence, UTF-8 replacement, denial/transient stop
@@ -1761,30 +1861,33 @@ Idempotency keys, leases, retries with backoff, dead-letter handling, per-host
 rate limits, partitioned storage, metrics, and recrawl scheduling belong to
 that distributed orchestration layer, not the challenge CLI.
 
-The measured scaling policy has four tiers:
+The four-tier shape is provisional until the shadow evaluation below passes;
+it is not yet production routing policy:
 
-1. every domain receives canonical-target resolution, robots, static entry-page
-   HTTP, DNS/TLS, headers, metadata, and resource-URL matching;
-2. bounded probes and one internal static page run for likely ecommerce/CMS
-   sites, thin client-rendered shells, or zero direct detections;
-3. the browser renders the entry page and captures its bounded script-response
-   bodies for sites selected by the commercial objective or dynamic/unknown
-   signals, plus a deterministic 1% control sample;
-4. a product page and its bounded script-response bodies are rendered only for
-   the ecommerce subset whose entry page did not expose sufficient application
-   signals.
+1. `T1` is the detector view over canonical-target and entry-page static HTTP,
+   the robots observations needed to admit that work, and the catalog-requested
+   DNS/TLS signals;
+2. `T2` adds the bounded catalog probes and zero or one internal static page
+   selected only from the entry page's frozen static links by the deterministic
+   rule in [Provisional tiering evaluation protocol](#provisional-tiering-evaluation-protocol);
+3. a later browser tier may render the entry page and retain its bounded
+   script-response observations for domains selected only from `T1`/`T2`, plus
+   a deterministic 1% control sample;
+4. a later ecommerce tier may render a selected product page, but every domain
+   which reaches either browser tier consumes the same routed-domain quota.
 
-The 200-domain `full` run is the reference dataset used to simulate these
-triggers before implementing tiered orchestration. The original acceptance
-target was at least 95% of `full` mode's direct detection occurrences while
-rendering at most 20% of domains. That target is infeasible on the v0.1.4
-baseline under the optimistic evidence-based upper bound: even an oracle
-selecting the best 40 domains retains only 85.78%, and at least 68 domains (34%)
-are required for 95%. The final objective therefore remains an explicit
-evaluation decision rather than an implementation invariant. HTTP and browser
-worker counts are then sized independently from observed p95 cost with at least
-2x throughput headroom. Robots, opt-out, retention, terms-of-service review,
-and an operational contact remain release gates for a production-scale crawl.
+The 200-domain `full` run is the development dataset for shadow evaluation, not
+an untouched production holdout. The original target of retaining 95% of direct
+detection occurrences while rendering at most 20% of domains is infeasible on
+v0.1.4. The provisional replacement therefore optimizes canonical
+`(domain, technology)` pair retention, keeps canonical-name breadth as a
+guardrail, and measures real browser work rather than treating routed-domain
+count as a complete cost model. No target becomes a final product KPI until an
+out-of-fold deployable trigger passes and a separate representative cohort is
+evaluated. HTTP and browser worker counts are then sized independently from
+observed p95 cost with at least 2x throughput headroom. Robots, opt-out,
+retention, terms-of-service review, and an operational contact remain release
+gates for a production-scale crawl.
 
 ## Runtime baseline
 
@@ -1925,12 +2028,14 @@ configuration emits only `src` into `dist`.
 `categories.json`, and `technologies/{_,a..z}.json`. It rejects missing or extra
 upstream entries, symlinks and non-regular files, invalid UTF-8, duplicate JSON
 members, excessive nesting, and all configured file/count/byte limits before
-the catalog can reach a scan. Custom v1 files may add only new technology names
-under `fingerprints/custom/technologies`; they cannot patch or override an
-upstream definition. The fixed upstream schema is validation layer one, and a
-semantic compiler then closes its permissive nested shapes, validates all
-references and supported locators, and produces only deeply frozen plain data.
-No catalog-selected schema or executable object enters Ajv or a worker.
+the catalog can reach a scan. Regular custom v1 files may add only new
+technology names under `fingerprints/custom/technologies`; they cannot redeclare
+or implicitly override an upstream definition. The only reviewed correction
+boundary is the fixed `fingerprints/custom/corrections.v1.json` ledger described
+below. The fixed upstream schema is validation layer one, and a semantic
+compiler then closes its permissive nested shapes, validates all references and
+supported locators, and produces only deeply frozen plain data. No
+catalog-selected schema or executable object enters Ajv or a worker.
 
 The pinned snapshot compiles without modification to 7,575 technologies, 109
 categories, 15,496 direct declarations, 15,489 unique rules, and 2,241
@@ -1941,10 +2046,37 @@ selectors, 5,570 JavaScript paths, and three probe paths. The reproducible
 upstream digest is
 `sha256:cdcccc905a14bbc7ad35a7ea6de636a2e6e51280c6ebbe5ba14f5e55aac18c8f`.
 
-Every direct declaration counts against `patternsPerCatalog` before exact
-duplicates are deduplicated, including empty presence rules. Non-empty value
-regexes and cookie-locator regexes independently count toward the regex count
-and total source limits. Stable direct rule IDs hash the UTF-8 JSON tuple
+Correction ledger revision `2026-08-20.1` has the closed schema identifier
+`website-technologies-scraper/catalog-corrections-v1` and binds itself to that
+exact upstream source, revision, and digest. It supports only three bounded
+operations: exact upstream technology names in `dropTechnologies`, complete
+upstream SHA-256 rule IDs in `dropRules`, and `replaceRules` entries containing
+one complete target rule ID plus a new declarative `original`. A replacement
+must retain the target's exact technology, signal source, and normalized
+locator. Every rule target must resolve to exactly one upstream declaration;
+missing, duplicate, cross-operation, stale-revision, wrong-digest, or
+identity-changing targets reject the catalog. There are no wildcards, aliases,
+name heuristics, JSON Patch, merges, config switches, or CLI-selected ledgers.
+When a correction ledger is present, `compileFingerprintCatalog()` independently
+recomputes the upstream digest even when called outside the filesystem loader.
+
+Dropped technologies are removed before enforcing `technologiesPerCatalog` on
+the effective catalog. Replacements receive the local
+`website-technologies-scraper/custom:rule-v1` namespace and a new stable rule
+ID; unchanged upstream IDs and all vendored bytes remain untouched. The raw
+ledger bytes participate in the effective catalog digest. Revision
+`2026-08-20.1` compiles to 7,571 technologies, 109 categories, 15,481 direct
+declarations, 15,474 unique rules, and 2,238 relationship entries. Catalog
+accounting sees 8,529 regex-source declarations, while the worker plan contains
+8,525 sources (8,022 value expressions and 503 cookie locators), alongside
+1,767 DOM selectors, 5,570 JavaScript paths, and three probe paths. Its effective
+digest is
+`sha256:614581009dc6ac2986763f8a324c656e629f63c5ecb7e46cf3ac10b121277724`.
+
+Every effective direct declaration counts against `patternsPerCatalog` before
+exact duplicates are deduplicated, including empty presence rules. Non-empty
+value regexes and cookie-locator regexes independently count toward the regex
+count and total source limits. Stable direct rule IDs hash the UTF-8 JSON tuple
 `[namespace, technology, signal, normalizedLocator, originalTaggedRule]`;
 relationship IDs use
 `[namespace, parent, "implies", target, originalTaggedValue]`. The namespaces
@@ -1973,9 +2105,10 @@ use `pageId: null`; probes also use `pageId: null` with the validated path as
 key, while an already selected internal response remains linked to its assigned
 `p2`/`p3`. Exact candidate duplicates are removed and HTTP candidates rank
 before the additional browser tier when a domain work cap admits only a prefix.
-The pipeline submits the complete bounded HTTP/browser/probe/infrastructure set
-to the detector once per domain instead of merging independently detected page
-results.
+The authoritative `full` pass submits the complete bounded
+HTTP/browser/probe/infrastructure set to one detector invocation instead of
+merging independently detected page results. Only an explicit shadow run adds
+the separate `T1` and `T2` prefix passes described below.
 
 Workers match raw bounded candidates, while the parent materializes only
 sanitized evidence. Cookie, HTML, text, and robots matches are always redacted;
@@ -2237,6 +2370,15 @@ lightbox implementations. Four alias families also duplicate the same
 technology: LiteSpeed Cache/Litespeed Cache, All in One SEO/All in One SEO Pack,
 MUI/Material UI, and Adobe Fonts/Typekit.
 
+The subsequent exact ledger revision `2026-08-20.1` removes the four duplicate
+alias definitions; drops the reviewed weak WebsiteBuilder, `svSession`, generic
+Wix asset, and Lightbox DOM rules; narrows Onsen UI and Lightbox script URLs to
+exact basenames; and replaces the timeout-prone Liveinternet HTML expression
+with the bounded `//counter\.yadro\.ru/hit` signal. Candidate-level positive and
+negative fixtures retain each stronger fallback and reject the reviewed false
+signals; the Liveinternet negative fixture is 4 MiB. These changes define the
+next fresh run and do not rewrite the historical v0.1.4 measurements above.
+
 The original occurrence-based tiering target is infeasible on this baseline
 under the optimistic evidence-based upper bound. Without browser evidence, at
 most 1,317/2,061 direct occurrences remain; an oracle selecting the best 40/200
@@ -2248,6 +2390,235 @@ yet a deployable policy because it uses full-result knowledge; aliases/false
 positives must be corrected and a trigger based only on tier-1/tier-2 signals
 must be measured. Consequently, the scan-and-analysis gate is complete while
 the final-results and debate gate remains open.
+
+## Provisional tiering evaluation protocol
+
+Protocol revision `2026-08-20.1` and its shadow instrumentation are implemented;
+the fresh v0.1.5 public run and its verdict are not yet complete. This remains a
+shadow experiment, not functional routing, a final KPI, a production capacity
+claim, or permission to skip an existing safety check. All three detector views
+use the same validated effective catalog, correction revision, configuration,
+and deterministic matching semantics. A prefix is never approximated by
+filtering technologies or evidence from the final result.
+
+### Observation views and the static internal page
+
+- `T1` contains the entry page's bounded static HTTP observations, including
+  its final/redirect URL signals, the robots observations needed to admit entry
+  work, and the catalog-requested DNS records and retained TLS issuer. It
+  contains no probe, internal-page, rendered-DOM, browser-network, or browser
+  script-body observation.
+- `T2` contains all of `T1`, the current bounded exact-origin catalog probes and
+  their robots observations, and at most one internal page collected by static
+  HTTP. It contains no browser observation and no link learned from rendered
+  content. A failure preserves the latest available prefix; it is not removed
+  from the evaluation population.
+- `full` remains a separately detected label over the complete bounded scan,
+  including browser observations. `full` detections and failures are labels,
+  never trigger features.
+
+The `T2` page is selected from a frozen copy of the navigation links extracted
+by static `p1` only. The existing exact-origin canonicalization, credential,
+query/fragment, URL-length, excluded-path, file-like, root/final-URL, and role
+classification rules are reused. Within those candidates, retain the existing
+best `detail` candidate and the best `listing` candidate, or the best `content`
+candidate only when no listing exists. Sort those at most two structural
+choices by complete canonical network URL in direct UTF-16 code-unit order and
+choose the first. This is the existing deterministic selector with one
+internal-page slot and does not introduce an unmeasured role preference.
+
+Exactly one candidate is checked with robots; denial, unavailable policy, a
+publication-sanitizer collision, or the absence of an eligible link produces
+zero internal pages and no backfill. Otherwise that one page is fetched once by
+the protected static collector. Thus "one internal page" is a hard maximum and
+a deterministic choice, not a promise to bypass policy or fabricate a URL.
+
+The implemented order is entry HTTP, DNS/TLS infrastructure, static-only
+reservation and HTTP collection, probes, browser `p1`, and then the remaining
+full-page plan. Keeping infrastructure before `T2` work gives `T1` its exact
+deadline prefix. The reservation occupies one of the existing two internal
+slots even on denial or failure; the union of static and rendered links may
+contribute at most one candidate from the opposite slot and never backfills the
+reservation.
+The normal three-page cap, at-most-two internal robots checks, sanitized public
+URL sort, and compact `p2`/`p3` rules remain in force.
+
+The run-owned full pipeline still admits its browser slot and disposable
+context before collecting the entry page, because admission starts the single
+active-domain lifecycle. A browser pre-open failure therefore records both
+shadow prefixes as unavailable, and setup latency can affect whether a prefix
+is captured. It cannot add browser observations to `T1` or `T2`; an unavailable
+prefix is excluded fail-closed from calibration rather than treated as empty.
+
+The authoritative `full` detector pass runs first under the active-domain
+deadline. After the result has been materialized and semantically validated,
+the pipeline clears its deadline and, only for a shadow run, performs independent
+`T1` and `T2` detector passes concurrently under caller cancellation, each in
+its own dedicated pool and separate from the `full` pool. Sharing immutable
+bounded collector results is allowed; sharing a combined detection result,
+worker slot, or pool failure state is not. Shadow pass duration is excluded from
+`DomainResult.timings`, and neither pass can change the already validated
+result. Any `detector-unavailable` shadow view invalidates calibration rather
+than being scored as an empty or low-signal domain.
+
+### Raw-free snapshot and limit telemetry
+
+One allowlisted snapshot is produced for each domain. The top-level artifact has
+`schemaVersion: 1`, protocol revision, run identity, exact input-domain count,
+full provenance, domain-sorted snapshots, browser-limit aggregates, and the
+calibration report. Each snapshot persists only its protocol/run/domain identity
+plus:
+
+- `T1` and `T2` availability, sorted unique direct and inferred names,
+  `detectionStats`, completion state, and grouped
+  `(stage, code, retryable, count)` diagnostics;
+- a pre-browser feature object with entry outcome/status class, bounded entry
+  HTML bytes and text code points, static-link/metadata/resource counts,
+  DNS-record count, TLS-issuer presence, reserved-page selection/role/outcome,
+  observed-probe count, HTTP requests, and static transferred bytes;
+- the authoritative `full` direct/inferred name sets and domain status;
+- actual full browser pages attempted/admitted, requests, transferred bytes,
+  and browser milliseconds;
+- unique browser-limit hits identified by page, stable category, and a
+  catalog-plan DOM-selector ordinal only where that ordinal is meaningful.
+
+An unavailable early prefix uses an explicit unavailable state rather than an
+invented empty detection. No URL, evidence, matched value, rule ID, pattern,
+error message, HTML, DOM, script, header, cookie, JavaScript value, or other raw
+observation is accepted into the snapshot. Extra object properties are dropped
+by construction before accumulation. Snapshots are sorted by canonical domain;
+the artifact is tied to the effective catalog through provenance, so a DOM
+selector ordinal is interpreted only with that catalog digest.
+
+Before calibration, the accumulator admits at most 10,000 identity values over
+the cohort. The count includes one domain identity per snapshot, every direct
+and inferred name in `T1`, `T2`, and `full`, each grouped `T1`/`T2` error or the
+marker for an unavailable view, and every browser-limit hit. An addition which
+would reach 10,001 is rejected without inserting that snapshot. This in-memory
+bound is independent of the writer's 500,000-value structural preflight and
+64 MiB serialized-artifact cap.
+
+The stable limit categories are:
+
+- DOM/evaluation: `inspection.domMatches`, `inspection.domAccess`,
+  `inspection.returnedValue`, `inspection.returnedValuesPerPage`,
+  `inspection.navigationLinksCount`, and
+  `inspection.navigationLinkInvalid`;
+- cookies/network/scripts: `cookies.name`, `cookies.value`,
+  `cookies.perDomain`, `cookies.totalBytesPerDomain`,
+  `browser.networkHostnamesPerDomain`, `browser.networkUrlsPerDomain`,
+  `scripts.bodyBytes`, `scripts.bodiesPerDomain`, and
+  `scripts.totalBodyBytesPerDomain`;
+- protected proxy: `proxy.headerFields`, `proxy.headerBytes`,
+  `proxy.requestsPerPage`, `proxy.requestsPerDomain`,
+  `proxy.transferBytesPerPage`, and `proxy.transferBytesPerDomain`.
+
+Only `inspection.domMatches` and `inspection.domAccess` carry the zero-based DOM
+selector ordinal. Per-page hits are deduplicated by
+`(pageId, category, ordinal)`. The artifact additionally groups them by
+`(category, ordinal)` and reports hit count, affected pages, and affected
+domains. This telemetry diagnoses which bound was reached without weakening a
+limit or exposing it in the public result schema.
+
+### Quota, score, and comparators
+
+For each canonical domain `d`, let `F(d)` be the set of corrected canonical
+direct technology names in its `full` label. A simulated result uses its `T2`
+set when `d` is not routed and `F(d)` when it is routed. Inferred technologies
+are reported separately and do not enter these provisional retention scores.
+Raw direct-occurrence retention remains a secondary diagnostic rather than the
+optimization target.
+
+The browser gate is at most 40 unique domains out of this fixed 200-domain set.
+Every domain admitted to any browser work consumes one place even when it
+fails, produces no browser page, or later receives Tier-4 work. For this OOF
+evaluation, the 40 routed places are apportioned across the five held-out folds
+from fold sizes alone, and exactly two of those places are apportioned as
+controls. The remaining 38 are trigger places. Controls are selected only from
+the non-triggered remainder of their own fold, so control traffic cannot be
+presented as free coverage.
+
+The provisional acceptance guardrails are:
+
+- at least 95% retention of the set of corrected canonical direct technology
+  names present anywhere in `full`;
+- at least 80% retention of corrected canonical direct
+  `(domain, technology)` pairs, treated as the primary optimization target;
+- at most 40 routed domains under the accounting rule above.
+
+Both retention values are intersections with the `full` label divided by the
+corresponding non-empty `full` set. Extra shadow detections cannot increase
+retention and are reported separately as disagreements for quality review.
+Pair retention is also reported as macro recall across domains with a non-empty
+`F(d)` and across technologies with at least one `full` domain; empty-label
+domain counts remain explicit rather than being assigned a convenient recall.
+The report includes absolute and relative browser pages, requests, transferred
+bytes, and summed browser milliseconds, as well as routed-domain count.
+
+A deployable trigger may use only the `T1`/`T2` direct names and controlled
+states, completion/errors/detection counts, plus the allowlisted pre-browser
+features above. Inferred names are retained for reporting but are not feature
+tokens. `full`, browser costs, and browser-limit telemetry are excluded from the
+feature function; changing those fields for a held-out domain cannot change its
+fold, tokens, or score.
+
+Calibration uses five deterministic folds. A domain's fold is the first
+unsigned 32-bit big-endian word of
+`SHA-256(foldSalt + NUL + canonicalDomain) mod 5`. Each held-out fold is scored
+by a model trained on the other four, and the five held-out prediction sets are
+concatenated once. The frozen salts are:
+
+| Purpose | Salt |
+| --- | --- |
+| Fold | `website-technologies-scraper/shadow/2026-08-20.1/fold/v1` |
+| Score tie | `website-technologies-scraper/shadow/2026-08-20.1/score-tie/v1` |
+| Control | `website-technologies-scraper/shadow/2026-08-20.1/control/v1` |
+| Random comparator | `website-technologies-scraper/shadow/2026-08-20.1/random/v1` |
+| Greedy tie | `website-technologies-scraper/shadow/2026-08-20.1/greedy-tie/v1` |
+
+The model target is the count of incremental direct `(domain, technology)`
+pairs in `full` relative to `T2`. Features are deterministic tokens for the
+allowlisted values; numeric counts use fixed zero/one/power-of-two bins. For
+each token, its empirical target mean is smoothed toward the training-fold
+global mean with prior weight four. A domain score is the arithmetic mean of
+that global mean and all estimates for its matched tokens. This deliberately
+small `smoothed-empirical-token-lift-v1` model is descriptive, not a calibrated
+probability or a generic machine-learning framework.
+
+Fold quotas use Hamilton's largest-remainder rule. For a fold of size `n`, the
+initial routed quota is `floor(40 * n / 200)`; remaining routed places go by
+descending fractional remainder, then lower fold number. The two control places
+are apportioned by the same rule and tie-break, bounded by each fold's routed
+quota; that fold's trigger quota is routed minus control. Impossible
+distributions fail closed. Within each fold, only its held-out scores are
+ranked with the frozen score tie-break. Controls are then chosen by the control
+salt only among the non-triggered domains in that same fold. The unions contain
+exactly 38 trigger and two control domains. Consequently, changing every
+`full` label in a held-out fold cannot change routed membership in that fold,
+even though it may alter models trained for other folds.
+
+Equal-budget comparators are a 40-domain deterministic label-blind hash sample
+and a 40-domain post-hoc label-aware greedy selection which maximizes
+incremental pair lift, then newly covered canonical names, with its own frozen
+tie-break. The latter is reported as greedy, never as an oracle or mathematical
+upper bound. After out-of-fold evaluation, the same model form is trained on
+all 200 snapshots and stored as the deployment model for a later cohort; it
+does not replace the held-out fold selections used for this verdict.
+
+The sidecar includes absolute/intersection retention, macro recall, extra
+shadow disagreements, actual browser-cost ratios, all selections and
+predictions, the full-cohort deployment model, and a machine-readable
+`provisional-shadow-challenge` guardrail verdict. That boolean is not a
+ratification by itself. The v0.1.5 fresh run must complete and its deployable
+out-of-fold selection must pass all three guardrails before the roadmap can
+ratify the provisional KPI; production generalization still requires a fresh
+representative cohort.
+
+The 95% and 80% values are provisional challenge guardrails. This cohort has
+already informed catalog fixes and metric design, so even out-of-fold results
+are descriptive development evidence rather than a production generalization
+claim. A final KPI requires a deployable trigger which passes this protocol and
+then a fresh representative cohort.
 
 ## Implementation roadmap
 
@@ -2291,6 +2662,20 @@ Completion and evaluation gates:
 
 - [x] Run deterministic tests and a small real-site smoke test.
 - [x] Scan all 200 domains and analyze misses and false positives.
+- [x] Freeze the provisional shadow protocol and exact `T1`/`T2` observation
+  views without adopting a final KPI.
+- [x] Correct false browser `exists` truncation and add bounded aggregate limit
+  telemetry.
+- [x] Add the exact catalog-correction ledger with positive and negative
+  fixtures.
+- [x] Implement independent shadow `T1`/`T2` detector views without functional
+  routing or raw-observation persistence.
+- [ ] Release v0.1.5 and run one fresh 200-domain `full` plus shadow evaluation.
+- [ ] Calibrate and evaluate the deployable trigger with a frozen deterministic
+  out-of-fold split and equal-budget random/label-aware comparators.
+- [ ] Ratify or reject the provisional KPI from the deployable trigger result.
+- [ ] Implement functional tiered orchestration only as a later slice, with
+  v0.1.6 as a candidate version rather than a promise.
 - [ ] Produce final results and complete the debate topics.
 
 ## Readiness gate for the coding stage
@@ -2318,5 +2703,7 @@ The readiness gate, application foundation, protected HTTP/browser transports,
 robots policy, static and rendered observation collectors, fingerprint
 compiler, isolated detector, bounded Chromium pool, catalog probes, DNS/TLS
 infrastructure collector, pipeline orchestration, incremental output, resume,
-summary generation, and the runnable local CLI are complete. The remaining
-roadmap items are evaluation gates rather than implementation slices.
+summary generation, runnable local CLI, exact correction ledger, bounded limit
+telemetry, and raw-free shadow evaluator are complete. The remaining gates are
+the fresh v0.1.5 run, its calibration/KPI decision, and only afterward the
+separate functional tiering slice.

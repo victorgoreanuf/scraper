@@ -10,6 +10,7 @@ import {
 import type {
   BrowserDomainResult,
   BrowserDomainSession,
+  BrowserLimitHit,
   BrowserPageCollection,
   BrowserPageInput,
   BrowserPool,
@@ -40,18 +41,22 @@ import type {
   DetectorMatchResult,
   DetectorPool,
 } from "../src/detect/pool.ts";
+import type { ShadowEvaluationSnapshot } from "../src/evaluation.ts";
 import {
   sanitizeUrl,
   validateDomainResult,
   type BrowserPageObservations,
   type DnsRecordObservation,
+  type HttpPageResult,
   type PageId,
   type Provenance,
   type ScanError,
 } from "../src/model.ts";
 import {
+  remapHttpPageResultPageId,
   scanDomain,
   selectInternalPages,
+  selectTier2InternalPage,
 } from "../src/pipeline.ts";
 
 type JsonRecord = Record<string, unknown>;
@@ -161,11 +166,17 @@ class ScriptedSession implements ProtectedTransportSession {
     ResponseItem[]
   >();
   readonly #signal: AbortSignal;
+  readonly #events: string[] | undefined;
   #retries = 0;
   #staticTransferredBytes = 0;
 
-  constructor(steps: readonly ResponseStep[], signal?: AbortSignal) {
+  constructor(
+    steps: readonly ResponseStep[],
+    signal?: AbortSignal,
+    events?: string[],
+  ) {
     this.#signal = signal ?? new AbortController().signal;
+    this.#events = events;
     for (const [url, item] of steps) {
       const queued = this.#responses.get(url) ?? [];
       queued.push(item);
@@ -177,6 +188,7 @@ class ScriptedSession implements ProtectedTransportSession {
     request: ProtectedTransportRequest,
   ): Promise<ProtectedTransportResponse> {
     this.#signal.throwIfAborted();
+    this.#events?.push(`http:${request.url}`);
     this.calls.push(Object.freeze({ ...request }));
     if (request.isRetry === true) {
       this.#retries += 1;
@@ -242,16 +254,23 @@ class ScriptedTransport implements ProtectedHttpTransport {
   readonly sessions: ScriptedSession[] = [];
   readonly #steps: readonly ResponseStep[];
   readonly #sessionSignal: AbortSignal | undefined;
+  readonly #events: string[] | undefined;
 
-  constructor(steps: readonly ResponseStep[], sessionSignal?: AbortSignal) {
+  constructor(
+    steps: readonly ResponseStep[],
+    sessionSignal?: AbortSignal,
+    events?: string[],
+  ) {
     this.#steps = steps;
     this.#sessionSignal = sessionSignal;
+    this.#events = events;
   }
 
   createSession(options?: ProtectedTransportSessionOptions): ScriptedSession {
     const session = new ScriptedSession(
       this.#steps,
       this.#sessionSignal ?? options?.signal,
+      this.#events,
     );
     this.sessions.push(session);
     return session;
@@ -269,23 +288,27 @@ class FakeRobotsService implements RobotsPolicyService {
   readonly #denied: ReadonlySet<string>;
   readonly #failures: ReadonlyMap<string, ProtectedTransportError>;
   readonly #texts: Map<string, Array<string | null>>;
+  readonly #events: string[] | undefined;
 
   constructor(
     denied: readonly string[] = [],
     failures: ReadonlyMap<string, ProtectedTransportError> = new Map(),
     texts: ReadonlyMap<string, readonly (string | null)[]> = new Map(),
+    events?: string[],
   ) {
     this.#denied = new Set(denied);
     this.#failures = failures;
     this.#texts = new Map(
       [...texts].map(([url, values]) => [url, [...values]]),
     );
+    this.#events = events;
   }
 
   async check(
     _session: ProtectedTransportSession,
     url: string,
   ): Promise<RobotsCheck> {
+    this.#events?.push(`robots:${url}`);
     this.checks.push(url);
     const failure = this.#failures.get(url);
     if (failure !== undefined) throw failure;
@@ -336,6 +359,8 @@ interface FakeBrowserScenario {
   readonly finishErrors?: readonly ScanError[];
   readonly throwOnPage?: PageId;
   readonly onClose?: () => void;
+  readonly events?: string[];
+  readonly limitHits?: Partial<Record<PageId, readonly BrowserLimitHit[]>>;
   readonly usage?: {
     readonly browserRequests: number;
     readonly browserTransferredBytes: number;
@@ -355,6 +380,7 @@ class FakeBrowserSession implements BrowserDomainSession {
   }
 
   async collectPage(input: BrowserPageInput): Promise<BrowserPageCollection> {
+    this.#scenario.events?.push(`browser:${input.pageId}`);
     this.inputs.push(input);
     assert.equal(input.allowTopLevelUrl(input.url), true);
     if (this.#scenario.throwOnPage === input.pageId) {
@@ -378,6 +404,9 @@ class FakeBrowserSession implements BrowserDomainSession {
       continuationAllowed,
       errors: error === undefined ? Object.freeze([]) : Object.freeze([error]),
       navigationLinks,
+      limitTelemetry: Object.freeze({
+        hits: Object.freeze([...(this.#scenario.limitHits?.[input.pageId] ?? [])]),
+      }),
     });
   }
 
@@ -532,6 +561,13 @@ class RecordingDetectorPool implements DetectorPool {
   }
 }
 
+function isolatedShadowDetectorPools(catalog: CompiledFingerprintCatalog) {
+  return Object.freeze({
+    t1: new RecordingDetectorPool(catalog),
+    t2: new RecordingDetectorPool(catalog),
+  });
+}
+
 function provenanceFor(
   config: ScanConfig,
   catalog: CompiledFingerprintCatalog,
@@ -616,6 +652,68 @@ test("selects deterministic detail and listing pages from static and rendered li
   assert.deepEqual(reversed, selected);
   assert.equal(Object.isFrozen(selected), true);
   assert.equal(Object.isFrozen(selected[0]), true);
+});
+
+test("selects T2 from static p1 links and excludes rendered-only links", () => {
+  const config = configWith();
+  const staticLinks = [
+    `${ENTRY_URL}products/zeta`,
+    `${ENTRY_URL}collections/zeta`,
+    `${ENTRY_URL}products/a`,
+  ];
+  const renderedListing = `${ENTRY_URL}collections/a`;
+
+  const selected = selectTier2InternalPage(ENTRY_URL, staticLinks, config);
+  const reversed = selectTier2InternalPage(
+    ENTRY_URL,
+    [...staticLinks].reverse(),
+    config,
+  );
+  const fullSelection = selectInternalPages(
+    ENTRY_URL,
+    staticLinks,
+    [renderedListing],
+    config,
+  );
+
+  assert.deepEqual(selected, {
+    role: "listing",
+    url: `${ENTRY_URL}collections/zeta`,
+  });
+  assert.deepEqual(reversed, selected);
+  assert.deepEqual(fullSelection[0], {
+    role: "listing",
+    url: renderedListing,
+  });
+  assert.equal(Object.isFrozen(selected), true);
+});
+
+test("remaps an internal result without mutating the provisional T2 identity", () => {
+  const original = Object.freeze({
+    kind: "failed" as const,
+    pageId: "p2" as const,
+    requestedUrl: `${ENTRY_URL}products/zeta`,
+    response: null,
+    robots: Object.freeze([]),
+    errors: Object.freeze([scanError(
+      "http",
+      "HTTP_REQUEST_FAILED",
+      "p2",
+      "The HTTP request failed.",
+      true,
+    )]) as readonly [ScanError],
+  }) satisfies HttpPageResult;
+
+  const remapped = remapHttpPageResultPageId(original, "p3");
+
+  assert.notEqual(remapped, original);
+  assert.equal(original.pageId, "p2");
+  assert.equal(original.errors[0].pageId, "p2");
+  assert.equal(remapped.kind, "failed");
+  assert.equal(remapped.kind === "failed" ? remapped.pageId : null, "p3");
+  assert.equal(remapped.errors[0]?.pageId, "p3");
+  assert.equal(Object.isFrozen(remapped), true);
+  assert.equal(Object.isFrozen(remapped.errors), true);
 });
 
 test("keeps the detail slot empty and uses only the listing slot for content fallback", () => {
@@ -741,7 +839,7 @@ test("orchestrates p1-p3 once and combines HTTP, browser, TLS, usage, and proven
   ]);
   assert.deepEqual(
     transport.sessions[0]?.calls.map((call) => call.url),
-    [ENTRY_URL, listingUrl, detailUrl],
+    [ENTRY_URL, detailUrl, listingUrl],
   );
   assert.deepEqual(
     browserPool.session.inputs.map(({ pageId, url }) => ({ pageId, url })),
@@ -811,6 +909,568 @@ test("orchestrates p1-p3 once and combines HTTP, browser, TLS, usage, and proven
     retainedDirect: 0,
   });
   assertValidResult(result, config, true);
+});
+
+test("keeps the static T2 reservation when rendered p1 finds a better detail", async () => {
+  const config = configWith();
+  const catalog = catalogWith();
+  const reservedDetailUrl = `${ENTRY_URL}products/zeta`;
+  const renderedDetailUrl = `${ENTRY_URL}product/a`;
+  const renderedListingUrl = `${ENTRY_URL}collections/a`;
+  const transport = new ScriptedTransport([
+    [ENTRY_URL, htmlResponse(
+      ENTRY_URL,
+      `<html><body><a href="${reservedDetailUrl}">Static detail</a></body></html>`,
+    )],
+    [renderedListingUrl, htmlResponse(renderedListingUrl)],
+    [reservedDetailUrl, htmlResponse(reservedDetailUrl)],
+  ]);
+  const robots = new FakeRobotsService();
+  const browserPool = new FakeBrowserPool({
+    navigationLinks: { p1: [renderedDetailUrl, renderedListingUrl] },
+  });
+
+  const result = await scanDomain(DOMAIN, {
+    runId: RUN_ID,
+    config,
+    provenance: provenanceFor(config, catalog),
+    transport,
+    robots,
+    browserPool,
+    detectorPool: new RecordingDetectorPool(catalog),
+    catalog,
+  }, deterministicOptions());
+
+  assert.equal(result.status, "success");
+  assert.deepEqual(result.pages, [
+    {
+      id: "p1",
+      role: "entry",
+      url: ENTRY_URL,
+      httpStatus: 200,
+      collectors: ["http", "browser"],
+    },
+    {
+      id: "p2",
+      role: "listing",
+      url: renderedListingUrl,
+      httpStatus: 200,
+      collectors: ["http", "browser"],
+    },
+    {
+      id: "p3",
+      role: "detail",
+      url: reservedDetailUrl,
+      httpStatus: 200,
+      collectors: ["http", "browser"],
+    },
+  ]);
+  assert.deepEqual(robots.checks, [
+    ENTRY_URL,
+    reservedDetailUrl,
+    renderedListingUrl,
+  ]);
+  assert.deepEqual(
+    browserPool.session.inputs.map(({ pageId, url }) => ({ pageId, url })),
+    [
+      { pageId: "p1", url: ENTRY_URL },
+      { pageId: "p2", url: renderedListingUrl },
+      { pageId: "p3", url: reservedDetailUrl },
+    ],
+  );
+  assertValidResult(result, config, true);
+});
+
+test("collects the exact T2 prefix and infrastructure before browser p1", async () => {
+  const events: string[] = [];
+  const config = configWith();
+  const detailUrl = `${ENTRY_URL}products/zeta`;
+  const listingUrl = `${ENTRY_URL}collections/a`;
+  const probePath = "/exists.svg";
+  const probeUrl = new URL(probePath, ENTRY_URL).href;
+  const baseCatalog = catalogWith({
+    tlsIssuer: true,
+    probePaths: [probePath],
+  });
+  const inspectionPlan = new Proxy(baseCatalog.inspectionPlan, {
+    get(target, property, receiver): unknown {
+      if (property === "tlsIssuer") events.push("infrastructure");
+      return Reflect.get(target, property, receiver);
+    },
+  });
+  const catalog: CompiledFingerprintCatalog = Object.freeze({
+    ...baseCatalog,
+    inspectionPlan,
+  });
+  const transport = new ScriptedTransport([
+    [ENTRY_URL, htmlResponse(
+      ENTRY_URL,
+      `<html><body><a href="${detailUrl}">Detail</a></body></html>`,
+      { tlsIssuer: "CN=Fixture", tlsHandshakeMs: 2 },
+    )],
+    [detailUrl, htmlResponse(detailUrl)],
+    [probeUrl, response(probeUrl, 204)],
+    [listingUrl, htmlResponse(listingUrl)],
+  ], undefined, events);
+  const robots = new FakeRobotsService([], new Map(), new Map(), events);
+  const browserPool = new FakeBrowserPool({
+    events,
+    navigationLinks: { p1: [listingUrl] },
+  });
+
+  const result = await scanDomain(DOMAIN, {
+    runId: RUN_ID,
+    config,
+    provenance: provenanceFor(config, catalog),
+    transport,
+    robots,
+    browserPool,
+    detectorPool: new RecordingDetectorPool(catalog),
+    catalog,
+  }, deterministicOptions());
+
+  assert.equal(result.status, "success");
+  assert.deepEqual(events, [
+    `robots:${ENTRY_URL}`,
+    `http:${ENTRY_URL}`,
+    "infrastructure",
+    `robots:${detailUrl}`,
+    `http:${detailUrl}`,
+    `robots:${probeUrl}`,
+    `http:${probeUrl}`,
+    "browser:p1",
+    `robots:${listingUrl}`,
+    `http:${listingUrl}`,
+    "browser:p2",
+    "browser:p3",
+  ]);
+  assert.deepEqual(result.pages.map(({ id, url }) => ({ id, url })), [
+    { id: "p1", url: ENTRY_URL },
+    { id: "p2", url: listingUrl },
+    { id: "p3", url: detailUrl },
+  ]);
+  assertValidResult(result, config, true);
+});
+
+test("runs independent raw-free shadow detections without changing the full result", async () => {
+  const config = configWith([
+    [["limits", "output", "technologiesPerDomain"], 3],
+  ]);
+  const detailUrl = `${ENTRY_URL}products/static`;
+  const listingUrl = `${ENTRY_URL}collections/rendered`;
+  const probePath = "/shadow-probe.txt";
+  const probeUrl = new URL(probePath, ENTRY_URL).href;
+  const rawMarker = "RAW_SHADOW_MARKER_MUST_NOT_ESCAPE";
+  const category = Object.freeze({ id: 1, name: "Fixture category" });
+  const rules: readonly CompiledFingerprintRule[] = Object.freeze([
+    Object.freeze({
+      ruleId: `sha256:${"1".repeat(64)}`,
+      namespace: "test/pipeline:shadow-v1",
+      technology: "Entry Parent",
+      source: "html" as const,
+      locator: null,
+      locatorPattern: null,
+      original: "entry-signal",
+      pattern: "entry-signal",
+      matchMode: "regex" as const,
+      confidence: 100,
+      versionTemplate: null,
+    }),
+    Object.freeze({
+      ruleId: `sha256:${"2".repeat(64)}`,
+      namespace: "test/pipeline:shadow-v1",
+      technology: "Probe Tech",
+      source: "probe" as const,
+      locator: probePath,
+      locatorPattern: null,
+      original: "probe-signal",
+      pattern: "probe-signal",
+      matchMode: "regex" as const,
+      confidence: 100,
+      versionTemplate: null,
+    }),
+    Object.freeze({
+      ruleId: `sha256:${"3".repeat(64)}`,
+      namespace: "test/pipeline:shadow-v1",
+      technology: "Browser Tech",
+      source: "url" as const,
+      locator: null,
+      locatorPattern: null,
+      original: "https://",
+      pattern: "https://",
+      matchMode: "regex" as const,
+      confidence: 100,
+      versionTemplate: null,
+    }),
+  ]);
+  const baseCatalog = catalogWith({ tlsIssuer: true, probePaths: [probePath] });
+  const catalog: CompiledFingerprintCatalog = Object.freeze({
+    ...baseCatalog,
+    categories: Object.freeze([category]),
+    technologies: Object.freeze([
+      Object.freeze({
+        name: "Entry Parent",
+        categories: Object.freeze([category]),
+        requires: Object.freeze([]),
+        requiresCategory: Object.freeze([]),
+        implies: Object.freeze([Object.freeze({
+          technology: "Implied Child",
+          ruleId: `sha256:${"4".repeat(64)}`,
+          confidence: 100,
+          version: null,
+        })]),
+        excludes: Object.freeze([]),
+      }),
+      Object.freeze({
+        name: "Implied Child",
+        categories: Object.freeze([category]),
+        requires: Object.freeze([]),
+        requiresCategory: Object.freeze([]),
+        implies: Object.freeze([]),
+        excludes: Object.freeze([]),
+      }),
+      ...["Probe Tech", "Browser Tech"].map((name) => Object.freeze({
+        name,
+        categories: Object.freeze([category]),
+        requires: Object.freeze([]),
+        requiresCategory: Object.freeze([]),
+        implies: Object.freeze([]),
+        excludes: Object.freeze([]),
+      })),
+    ]),
+    rules,
+    declarationCount: rules.length,
+    relationshipCount: 1,
+    regexSourceCount: rules.length,
+    regexSourceCodeUnits: rules.reduce(
+      (total, rule) => total + (rule.pattern?.length ?? 0),
+      0,
+    ),
+  });
+
+  const run = async (shadow: boolean) => {
+    const fullCalls: RecordedDetectorCandidate[][] = [];
+    const t1Calls: RecordedDetectorCandidate[][] = [];
+    const t2Calls: RecordedDetectorCandidate[][] = [];
+    const fullSignals: Array<AbortSignal | undefined> = [];
+    const t1Signals: Array<AbortSignal | undefined> = [];
+    const t2Signals: Array<AbortSignal | undefined> = [];
+    const makeDetectorPool = (
+      calls: RecordedDetectorCandidate[][],
+      signals: Array<AbortSignal | undefined>,
+    ): DetectorPool => ({
+      catalog,
+      async match(candidates, signal): Promise<DetectorMatchResult> {
+        signals.push(signal);
+        calls.push([...candidates] as RecordedDetectorCandidate[]);
+        const matches: DetectorMatchResult["matches"][number][] = [];
+        const addMatch = (
+          ruleOrdinal: number,
+          predicate: (candidate: RecordedDetectorCandidate) => boolean,
+          marker: string,
+        ): void => {
+          const candidateOrdinal = candidates.findIndex((candidate) =>
+            predicate(candidate as RecordedDetectorCandidate)
+            && candidate.value.includes(marker));
+          if (candidateOrdinal < 0) return;
+          const index = candidates[candidateOrdinal]!.value.indexOf(marker);
+          matches.push(Object.freeze({
+            ruleOrdinal,
+            candidateOrdinal,
+            index,
+            length: marker.length,
+            version: null,
+          }));
+        };
+        addMatch(0, (candidate) => candidate.source === "html", "entry-signal");
+        addMatch(1, (candidate) => candidate.source === "probe", "probe-signal");
+        addMatch(
+          2,
+          (candidate) =>
+            candidate.source === "url" && candidate.collector === "browser",
+          "https://",
+        );
+        return Object.freeze({
+          matches: Object.freeze(matches),
+          errors: Object.freeze([]),
+          completed: true,
+          executions: matches.length,
+        });
+      },
+      isAvailable: () => true,
+      close: () => Promise.resolve(),
+    });
+    const detectorPool = makeDetectorPool(fullCalls, fullSignals);
+    const shadowDetectorPools = Object.freeze({
+      t1: makeDetectorPool(t1Calls, t1Signals),
+      t2: makeDetectorPool(t2Calls, t2Signals),
+    });
+    const transport = new ScriptedTransport([
+      [ENTRY_URL, htmlResponse(
+        ENTRY_URL,
+        `<html><head><meta name="fixture" content="${rawMarker}"></head>`
+          + `<body>entry-signal<a href="${detailUrl}">Detail</a></body></html>`,
+        { tlsIssuer: "CN=Shadow Fixture", tlsHandshakeMs: 2 },
+      )],
+      [detailUrl, htmlResponse(detailUrl, `<html>${rawMarker}</html>`)],
+      [probeUrl, response(probeUrl, 200, { body: `probe-signal ${rawMarker}` })],
+      [listingUrl, htmlResponse(listingUrl)],
+    ]);
+    const browserPool = new FakeBrowserPool({
+      navigationLinks: { p1: [listingUrl] },
+      limitHits: {
+        p1: [Object.freeze({
+          category: "inspection.domMatches",
+          domSelectorOrdinal: 7,
+        })],
+        p2: [Object.freeze({
+          category: "proxy.requestsPerPage",
+          domSelectorOrdinal: null,
+        })],
+      },
+      usage: {
+        browserRequests: 9,
+        browserTransferredBytes: 900,
+        scriptBodiesInspected: 0,
+      },
+    });
+    const snapshots: ShadowEvaluationSnapshot[] = [];
+    const result = await scanDomain(DOMAIN, {
+      runId: RUN_ID,
+      config,
+      provenance: provenanceFor(config, catalog),
+      transport,
+      robots: new FakeRobotsService(),
+      browserPool,
+      detectorPool,
+      catalog,
+    }, {
+      ...deterministicOptions(),
+      ...(shadow
+        ? {
+            shadowDetectorPools,
+            onShadowSnapshot: (snapshot: ShadowEvaluationSnapshot) => {
+              snapshots.push(snapshot);
+            },
+          }
+        : {}),
+    });
+    return {
+      calls: [fullCalls[0] ?? [], t1Calls[0] ?? [], t2Calls[0] ?? []],
+      result,
+      signals: [fullSignals[0], t1Signals[0], t2Signals[0]],
+      snapshots,
+    };
+  };
+
+  const enabled = await run(true);
+  const disabled = await run(false);
+
+  assert.equal(JSON.stringify(enabled.result), JSON.stringify(disabled.result));
+  assert.equal(enabled.result.status, "partial");
+  assert.equal(enabled.snapshots.length, 1);
+  assert.equal(enabled.calls.length, 3);
+  assert.deepEqual(enabled.signals.map((signal) => signal !== undefined), [
+    true,
+    false,
+    false,
+  ]);
+
+  const [fullCandidates, t1Candidates, t2Candidates] = enabled.calls;
+  assert.equal(
+    fullCandidates?.some((candidate) => candidate.collector === "browser"),
+    true,
+  );
+  assert.equal(
+    t1Candidates?.some((candidate) =>
+      candidate.source === "probe"
+      || candidate.collector === "browser"
+      || candidate.pageId === "p2"
+      || candidate.pageId === "p3"),
+    false,
+  );
+  assert.equal(
+    t2Candidates?.some((candidate) => candidate.source === "probe"),
+    true,
+  );
+  assert.equal(
+    t2Candidates?.some((candidate) => candidate.pageId === "p2"),
+    true,
+  );
+  assert.equal(
+    t2Candidates?.some((candidate) =>
+      candidate.collector === "browser" || candidate.pageId === "p3"),
+    false,
+  );
+
+  const snapshot = enabled.snapshots[0]!;
+  assert.deepEqual(snapshot.t1, {
+    state: "available",
+    directNames: ["Entry Parent"],
+    inferredNames: ["Implied Child"],
+    detectionStats: {
+      rawDirect: 1,
+      gatedDirect: 0,
+      suppressedDirect: 0,
+      retainedDirect: 1,
+    },
+    completed: true,
+    errors: [],
+  });
+  assert.deepEqual(snapshot.t2, {
+    state: "available",
+    directNames: ["Entry Parent", "Probe Tech"],
+    inferredNames: ["Implied Child"],
+    detectionStats: {
+      rawDirect: 2,
+      gatedDirect: 0,
+      suppressedDirect: 0,
+      retainedDirect: 2,
+    },
+    completed: true,
+    errors: [],
+  });
+  assert.deepEqual(snapshot.full, {
+    directNames: [],
+    inferredNames: [],
+    status: "partial",
+  });
+  assert.deepEqual(snapshot.preBrowser, {
+    entryOutcome: "html",
+    entryStatusClass: "2xx",
+    entryHtmlBytes: Buffer.byteLength(
+      `<html><head><meta name="fixture" content="${rawMarker}"></head>`
+        + `<body>entry-signal<a href="${detailUrl}">Detail</a></body></html>`,
+      "utf8",
+    ),
+    entryTextCodePoints: "entry-signalDetail".length,
+    staticNavigationLinks: 1,
+    metadataEntries: 1,
+    resourceEntries: 0,
+    dnsRecords: 0,
+    tlsIssuerPresent: true,
+    t2Selected: true,
+    t2Role: "detail",
+    t2Outcome: "html",
+    probesObserved: 1,
+    httpRequests: 3,
+    staticTransferredBytes: enabled.result.usage.staticTransferredBytes
+      - Buffer.byteLength("<html><body>fixture</body></html>", "utf8"),
+  });
+  assert.deepEqual(snapshot.fullCost, {
+    browserPagesAttempted: 3,
+    browserPagesAdmitted: 3,
+    browserRequests: 9,
+    browserTransferredBytes: 900,
+    browserMs: enabled.result.timings.browserMs,
+  });
+  assert.deepEqual(snapshot.browserLimitHits, [
+    {
+      pageId: "p1",
+      category: "inspection.domMatches",
+      domSelectorOrdinal: 7,
+    },
+    {
+      pageId: "p2",
+      category: "proxy.requestsPerPage",
+      domSelectorOrdinal: null,
+    },
+  ]);
+  assert.equal(JSON.stringify(snapshot).includes(rawMarker), false);
+  assert.equal(Object.isFrozen(snapshot), true);
+});
+
+test("emits one shadow snapshot for controlled success, partial, and failed results", async () => {
+  const config = configWith();
+  const catalog = catalogWith();
+  const cases = [
+    {
+      expected: "success" as const,
+      browserPool: new FakeBrowserPool(),
+    },
+    {
+      expected: "partial" as const,
+      browserPool: new FakeBrowserPool({
+        pageErrors: {
+          p1: scanError(
+            "browser",
+            "BROWSER_TIMEOUT",
+            "p1",
+            "The browser page exceeded its deadline.",
+            true,
+          ),
+        },
+        admittedPages: ["p1"],
+      }),
+    },
+    {
+      expected: "failed" as const,
+      browserPool: new FakeBrowserPool(),
+    },
+  ];
+  cases[2]!.browserPool.available = false;
+
+  for (const [index, fixture] of cases.entries()) {
+    const snapshots: ShadowEvaluationSnapshot[] = [];
+    const transport = new ScriptedTransport(
+      fixture.expected === "failed"
+        ? []
+        : [[ENTRY_URL, htmlResponse(ENTRY_URL)]],
+    );
+    const result = await scanDomain(DOMAIN, {
+      runId: RUN_ID,
+      config,
+      provenance: provenanceFor(config, catalog),
+      transport,
+      robots: new FakeRobotsService(),
+      browserPool: fixture.browserPool,
+      detectorPool: new RecordingDetectorPool(catalog),
+      catalog,
+    }, {
+      ...deterministicOptions(),
+      shadowDetectorPools: isolatedShadowDetectorPools(catalog),
+      onShadowSnapshot: (snapshot) => {
+        snapshots.push(snapshot);
+      },
+    });
+
+    assert.equal(result.status, fixture.expected, `case ${index}`);
+    assert.equal(snapshots.length, 1, `case ${index}`);
+    assert.equal(snapshots[0]?.full.status, fixture.expected, `case ${index}`);
+  }
+  assert.deepEqual(cases[2]!.browserPool.session.inputs, []);
+});
+
+test("propagates a shadow snapshot sink failure after closing domain resources", async () => {
+  const config = configWith();
+  const catalog = catalogWith();
+  const transport = new ScriptedTransport([
+    [ENTRY_URL, htmlResponse(ENTRY_URL)],
+  ]);
+  const browserPool = new FakeBrowserPool();
+  const sinkError = new Error("shadow sink rejected the snapshot");
+
+  await assert.rejects(
+    scanDomain(DOMAIN, {
+      runId: RUN_ID,
+      config,
+      provenance: provenanceFor(config, catalog),
+      transport,
+      robots: new FakeRobotsService(),
+      browserPool,
+      detectorPool: new RecordingDetectorPool(catalog),
+      catalog,
+    }, {
+      ...deterministicOptions(),
+      shadowDetectorPools: isolatedShadowDetectorPools(catalog),
+      onShadowSnapshot: () => {
+        throw sinkError;
+      },
+    }),
+    (error: unknown) => error === sinkError,
+  );
+  assert.equal(transport.sessions[0]?.closeCount, 1);
+  assert.equal(browserPool.session.closeCount, 1);
 });
 
 test("continues the browser prefix after admitting a truncated browser draft", async () => {
@@ -1314,10 +1974,10 @@ test("propagates a pre-aborted caller reason without starting domain work", asyn
   assert.equal(detectorPool.calls.length, 0);
 });
 
-test("checks at most two structural pages without backfill and compacts admitted page IDs", async () => {
+test("does not backfill after the reserved T2 page is denied by robots", async () => {
   const config = configWith();
   const catalog = catalogWith();
-  const listingUrl = `${ENTRY_URL}collections/a`;
+  const listingUrl = `${ENTRY_URL}shop/a`;
   const deniedDetailUrl = `${ENTRY_URL}product/a`;
   const backupDetailUrl = `${ENTRY_URL}products/b`;
   const contentUrl = `${ENTRY_URL}about`;
@@ -1367,7 +2027,6 @@ test("checks at most two structural pages without backfill and compacts admitted
   ]);
   assert.deepEqual(robots.checks, [
     ENTRY_URL,
-    listingUrl,
     deniedDetailUrl,
     listingUrl,
   ]);
@@ -1764,7 +2423,7 @@ test("assigns p2 and p3 after ordering candidates by their sanitized public URLs
   ]);
   assert.deepEqual(
     transport.sessions[0]?.calls.map((call) => call.url),
-    [ENTRY_URL, listingUrl, detailUrl],
+    [ENTRY_URL, detailUrl, listingUrl],
   );
   assert.deepEqual(
     browserPool.session.inputs.map(({ pageId, url }) => ({ pageId, url })),
@@ -1836,8 +2495,6 @@ test("reuses p2 after a redirect becomes robots-disallowed and keeps the browser
   );
   assert.deepEqual(robots.checks, [
     ENTRY_URL,
-    listingUrl,
-    detailUrl,
     listingUrl,
     deniedRedirectUrl,
     detailUrl,
@@ -2206,7 +2863,7 @@ test("reports a deadline exceeded when synchronous materialization crosses the a
   assertValidResult(result, config, true);
 });
 
-test("feeds robots text refetched for p2 into detector evidence", async () => {
+test("feeds the single reserved-page robots check into detector evidence", async () => {
   const config = configWith();
   const detailUrl = `${ENTRY_URL}products/a`;
   const marker = "technology-marker";
@@ -2253,7 +2910,7 @@ test("feeds robots text refetched for p2 into detector evidence", async () => {
   const robots = new FakeRobotsService(
     [],
     new Map(),
-    new Map([[detailUrl, [null, robotsText]]]),
+    new Map([[detailUrl, [robotsText]]]),
   );
   const browserPool = new FakeBrowserPool();
   let detectorCandidates: readonly DetectorCandidate[] = Object.freeze([]);
@@ -2300,7 +2957,7 @@ test("feeds robots text refetched for p2 into detector evidence", async () => {
   assert.equal(result.status, "success");
   assert.equal(
     robots.checks.filter((url) => url === detailUrl).length,
-    2,
+    1,
   );
   assert.deepEqual(
     detectorCandidates
