@@ -40,6 +40,13 @@ export interface DetectHttpContext {
   readonly robots?: readonly HttpRobotsObservation[];
   readonly browserPages?: readonly BrowserPageObservations[];
   readonly infrastructure?: InfrastructureObservations;
+  readonly priorityObservations?: {
+    readonly httpPages?: readonly HttpPageResult[];
+    readonly probes?: readonly HttpProbeObservation[];
+    readonly robots?: readonly HttpRobotsObservation[];
+    readonly browserPages?: readonly BrowserPageObservations[];
+    readonly infrastructure?: InfrastructureObservations;
+  };
   readonly signal?: AbortSignal;
 }
 
@@ -220,6 +227,16 @@ function candidateIdentity(candidate: CandidateDraft): string {
   ]);
 }
 
+function candidateSchedulingIdentity(candidate: CandidateDraft): string {
+  return JSON.stringify([
+    candidate.collector,
+    candidate.kind,
+    candidate.source,
+    candidate.key,
+    candidate.value,
+  ]);
+}
+
 function collectCandidates(
   input: HttpEntryResult,
   httpPages: readonly HttpPageResult[],
@@ -228,6 +245,7 @@ function collectCandidates(
   browserPages: readonly BrowserPageObservations[],
   infrastructure: InfrastructureObservations | undefined,
   config: ScanConfig,
+  priorityIdentityCounts: ReadonlyMap<string, number> | null = null,
 ): readonly CollectedDetectorCandidate[] {
   const candidates: CandidateDraft[] = [];
   const add = (
@@ -372,17 +390,44 @@ function collectCandidates(
     unique.set(candidateIdentity(candidate), candidate);
   }
 
+  const remainingPriorities = priorityIdentityCounts === null
+    ? null
+    : new Map(priorityIdentityCounts);
   return [...unique.values()]
     .sort(compareCandidateDraft)
-    .map((candidate, index) => Object.freeze({
-      id: `c${String(index).padStart(8, "0")}`,
-      collector: candidate.collector,
-      kind: candidate.kind,
-      source: candidate.source,
-      pageId: candidate.pageId,
-      key: candidate.key,
-      value: candidate.value,
-    }));
+    .map((candidate, index) => {
+      const schedulingIdentity = candidateSchedulingIdentity(candidate);
+      const remaining = remainingPriorities?.get(schedulingIdentity) ?? 0;
+      const priority = remainingPriorities === null || remaining > 0;
+      if (remainingPriorities !== null && remaining > 0) {
+        if (remaining === 1) {
+          remainingPriorities.delete(schedulingIdentity);
+        } else {
+          remainingPriorities.set(schedulingIdentity, remaining - 1);
+        }
+      }
+      return Object.freeze({
+        id: `c${String(index).padStart(8, "0")}`,
+        priority,
+        collector: candidate.collector,
+        kind: candidate.kind,
+        source: candidate.source,
+        pageId: candidate.pageId,
+        key: candidate.key,
+        value: candidate.value,
+      });
+    });
+}
+
+function schedulingIdentityCounts(
+  candidates: readonly CollectedDetectorCandidate[],
+): ReadonlyMap<string, number> {
+  const counts = new Map<string, number>();
+  for (const candidate of candidates) {
+    const identity = candidateSchedulingIdentity(candidate);
+    counts.set(identity, (counts.get(identity) ?? 0) + 1);
+  }
+  return counts;
 }
 
 function evidenceFromMatch(
@@ -1203,6 +1248,17 @@ export async function detectHttp(
   if (context.pool.catalog !== context.catalog) {
     throw new TypeError("Detector pool and catalog must share the same instance");
   }
+  const priorityCandidates = context.priorityObservations === undefined
+    ? null
+    : collectCandidates(
+      input,
+      context.priorityObservations.httpPages ?? [],
+      context.priorityObservations.probes ?? [],
+      context.priorityObservations.robots ?? [],
+      context.priorityObservations.browserPages ?? [],
+      context.priorityObservations.infrastructure,
+      context.config,
+    );
   const candidates = collectCandidates(
     input,
     context.httpPages ?? [],
@@ -1211,6 +1267,9 @@ export async function detectHttp(
     context.browserPages ?? [],
     context.infrastructure,
     context.config,
+    priorityCandidates === null
+      ? null
+      : schedulingIdentityCounts(priorityCandidates),
   );
   if (candidates.length === 0) {
     return Object.freeze({

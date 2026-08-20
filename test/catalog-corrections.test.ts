@@ -98,9 +98,11 @@ function correctionCatalog(): CompiledFingerprintCatalog {
   const technologyNames = new Set([
     "Lightbox",
     "Liveinternet",
+    "Magento",
     "Onsen UI",
     "Sirvoy",
     "Store Vantage",
+    "TYPO3 CMS",
     "WebsiteBuilder",
     "Wix eCommerce",
   ]);
@@ -125,6 +127,7 @@ test("correction fixtures match only the reviewed exact signals", {
     for (const [index, fixture] of fixtures.entries()) {
       const candidate: DetectorCandidate = {
         id: index.toString().padStart(4, "0"),
+        priority: true,
         kind: fixture.kind ?? "value",
         source: fixture.source,
         key: fixture.key ?? null,
@@ -159,6 +162,7 @@ test("the bounded Liveinternet replacement rejects a 4 MiB negative without time
   try {
     const result = await pool.match([{
       id: "negative-liveinternet",
+      priority: true,
       kind: "value",
       source: "html",
       key: null,
@@ -207,6 +211,7 @@ test("shared alias observations emit only the retained canonical technology", {
   const candidates: readonly DetectorCandidate[] = [
     {
       id: "0001",
+      priority: true,
       kind: "value",
       source: "header",
       key: "x-litespeed-cache",
@@ -214,6 +219,7 @@ test("shared alias observations emit only the retained canonical technology", {
     },
     {
       id: "0002",
+      priority: true,
       kind: "value",
       source: "html",
       key: null,
@@ -221,6 +227,7 @@ test("shared alias observations emit only the retained canonical technology", {
     },
     {
       id: "0003",
+      priority: true,
       kind: "value",
       source: "css",
       key: null,
@@ -228,6 +235,7 @@ test("shared alias observations emit only the retained canonical technology", {
     },
     {
       id: "0004",
+      priority: true,
       kind: "value",
       source: "script_url",
       key: null,

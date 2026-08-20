@@ -112,6 +112,7 @@ function testCatalog(inputs: readonly RuleInput[]): CompiledFingerprintCatalog {
 function candidate(value: string): DetectorCandidate {
   return {
     id: "0001",
+    priority: true,
     kind: "value",
     source: "html",
     key: null,
@@ -470,6 +471,80 @@ test("presence and literal rules consume the bounded rule-candidate work budget"
     ]);
     assert.equal(result.completed, false);
     assert.equal(result.executions, 0);
+  } finally {
+    await pool.close();
+  }
+});
+
+test("priority work is admitted before lower-ID remainder work at the plan limit", async () => {
+  let dispatched: DetectorWorkerRequest | undefined;
+  const factory: DetectorWorkerFactory = (_moduleUrl, options) =>
+    asWorker(new FakeWorker(options, "ready", (worker, request) => {
+      dispatched = request;
+      worker.emit("message", {
+        type: "complete",
+        taskId: request.taskId,
+        nextWorkIndex: request.work.length,
+        matches: request.work.map((item) =>
+          match(item.ruleOrdinal, item.candidateOrdinals[0])),
+      } satisfies DetectorWorkerResponse);
+    }));
+  const pool = await createDetectorPool(
+    testCatalog([
+      { pattern: null, matchMode: "presence" },
+      { pattern: "a", matchMode: "literal" },
+    ]),
+    testConfig({ executionsPerDomain: 2 }),
+    factory,
+  );
+
+  try {
+    const result = await pool.match([
+      { ...identifiedCandidate("0001", "a"), priority: false },
+      identifiedCandidate("0002", "a"),
+    ]);
+
+    assert.deepEqual(dispatched?.candidates.map((item) => item.id), ["0002"]);
+    assert.deepEqual(result.matches, [match(0, 1), match(1, 1)]);
+    assert.deepEqual(result.errors.map((error) => error.code), [
+      "REGEX_EXECUTION_LIMIT",
+    ]);
+    assert.equal(result.completed, false);
+  } finally {
+    await pool.close();
+  }
+});
+
+test("active budget cannot be consumed by remainder work before the priority phase", {
+  timeout: 10_000,
+}, async () => {
+  const pool = await createDetectorPool(
+    testCatalog([
+      { pattern: "^a" },
+      { pattern: "(a+)+$" },
+    ]),
+    testConfig({
+      activeMsPerDomain: 100,
+      ruleWatchdogMs: 1_000,
+      executionsPerDomain: 10,
+      checkpointRules: 10,
+    }),
+  );
+
+  try {
+    const result = await pool.match([
+      {
+        ...identifiedCandidate("0001", `${"a".repeat(30_000)}!`),
+        priority: false,
+      },
+      identifiedCandidate("0002", "a"),
+    ]);
+
+    assert.deepEqual(result.matches, [match(0, 1), match(1, 1)]);
+    assert.deepEqual(result.errors.map((error) => error.code), [
+      "REGEX_DOMAIN_BUDGET_EXCEEDED",
+    ]);
+    assert.equal(result.completed, false);
   } finally {
     await pool.close();
   }

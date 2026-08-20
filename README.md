@@ -8,10 +8,12 @@
 > generation, the runnable local CLI, the exact correction ledger, bounded
 > browser-limit telemetry, and the raw-free shadow evaluator/calibration
 > sidecar are also implemented and tested. The bounded v0.1.7 KISS+ trigger and
-> frozen-holdout boundary are implemented, but their pinned offline development
-> verdict is `NO-GO`; no candidate was published. The next experiment is the
-> preregistered, paired v0.1.8 ablation of exactly one raw-free feature family,
-> direct `T2` catalog category IDs. Functional tier routing remains on hold.
+> paired v0.1.8 direct-category ablation both produced development `NO-GO`
+> verdicts; no candidate was published and sealed `H1` was not scanned. Version
+> 0.1.9 contains three bounded remediations from the D2 diagnosis: stronger
+> exact probe rules, `T2`-first detector scheduling under existing limits, and
+> a bounded browser cleanup drain. A future fresh `D3`/`H2` experiment is not
+> yet frozen or authorized. Functional tier routing remains on hold.
 
 ## Goal
 
@@ -776,6 +778,14 @@ The complete startup or replacement preflight for a slot is bounded by
 teardown uses a fixed one-second watchdog, so a wedged Playwright close cannot
 hold FIFO admission indefinitely. A replacement that cannot complete its own
 preflight is removed rather than retried in a spawn loop.
+
+The same one-second cleanup watchdog bounds an internal drain when caller or
+domain cancellation wins the race against an already-started page collection.
+`collectPage()` waits for that collection to settle, or for the watchdog, before
+it propagates the failure. This lets `finish()` retain the exact proxy/page
+diagnostic and raw-free limit telemetry already being finalized instead of
+racing the still-active collection; it neither retries the page nor extends the
+domain work without a bound.
 
 Every selected 2xx HTML page in `full` mode is rendered in a non-persistent
 Chromium context dedicated to that domain. The same context is reused
@@ -1547,7 +1557,7 @@ defaults with a required real contact, or accepts one complete local JSON
 `ScanConfig`; it does not add a second YAML system or dozens of partial flag
 overrides.
 
-The pinned catalog currently yields 1,769 unique DOM selectors, 1,780 exact DOM
+The effective catalog currently yields 1,767 unique DOM selectors, 1,778 exact DOM
 facts, 5,570 unique JavaScript paths, and 113 browser request-URL rules after
 deduplication, so the inspection-plan and request caps admit the entire reviewed
 baseline. A future effective upstream-plus-custom catalog which
@@ -2082,7 +2092,7 @@ selectors, 5,570 JavaScript paths, and three probe paths. The reproducible
 upstream digest is
 `sha256:cdcccc905a14bbc7ad35a7ea6de636a2e6e51280c6ebbe5ba14f5e55aac18c8f`.
 
-Correction ledger revision `2026-08-20.1` has the closed schema identifier
+Correction ledger revision `2026-08-20.2` has the closed schema identifier
 `website-technologies-scraper/catalog-corrections-v1` and binds itself to that
 exact upstream source, revision, and digest. It supports only three bounded
 operations: exact upstream technology names in `dropTechnologies`, complete
@@ -2096,18 +2106,30 @@ name heuristics, JSON Patch, merges, config switches, or CLI-selected ledgers.
 When a correction ledger is present, `compileFingerprintCatalog()` independently
 recomputes the upstream digest even when called outside the filesystem loader.
 
+Revision `2026-08-20.2` contains exactly four dropped technologies, five
+dropped rules, and five exact replacements. Its raw ledger SHA-256 is
+`sha256:68d702a5496f2d5c304c6608cd31c06c7679b3078b436e3ba3a1d1c4f34a8393`.
+The two additions relative to revision `.1` replace the Magento
+`/magento_version` rule with the literal `Magento/2.` and replace the TYPO3 CMS
+probe presence rule with a distinctive bounded fragment from the official
+TYPO3 SVG. Positive fixtures retain the intended signatures; negative fixtures
+cover an empty successful body, generic soft-404 content, and a response which
+only echoes the requested path. The historical D2 bodies were not persisted,
+so these fixtures close the demonstrated mechanism without relabeling all 17
+historical probe detections as proven false positives.
+
 Dropped technologies are removed before enforcing `technologiesPerCatalog` on
 the effective catalog. Replacements receive the local
 `website-technologies-scraper/custom:rule-v1` namespace and a new stable rule
 ID; unchanged upstream IDs and all vendored bytes remain untouched. The raw
 ledger bytes participate in the effective catalog digest. Revision
-`2026-08-20.1` compiles to 7,571 technologies, 109 categories, 15,481 direct
+`2026-08-20.2` compiles to 7,571 technologies, 109 categories, 15,481 direct
 declarations, 15,474 unique rules, and 2,238 relationship entries. Catalog
 accounting sees 8,529 regex-source declarations, while the worker plan contains
 8,525 sources (8,022 value expressions and 503 cookie locators), alongside
 1,767 DOM selectors, 5,570 JavaScript paths, and three probe paths. Its effective
 digest is
-`sha256:614581009dc6ac2986763f8a324c656e629f63c5ecb7e46cf3ac10b121277724`.
+`sha256:5aedde4f83d1ad977d646e1495b9b91d4d3b0f6f3acbd34d54906d099da18870`.
 
 Every effective direct declaration counts against `patternsPerCatalog` before
 exact duplicates are deduplicated, including empty presence rules. Non-empty
@@ -2140,7 +2162,17 @@ browser evidence already does. A terminal non-HTML entry response and robots
 use `pageId: null`; probes also use `pageId: null` with the validated path as
 key, while an already selected internal response remains linked to its assigned
 `p2`/`p3`. Exact candidate duplicates are removed and HTTP candidates rank
-before the additional browser tier when a domain work cap admits only a prefix.
+before the additional browser tier in the stable candidate identity order. For
+the authoritative `full` pass, the detector additionally marks the exact
+multiset of candidates already present in the captured `T2` observation prefix.
+Candidate IDs and ordinary result ordering remain unchanged, but bounded
+admission and worker execution process that `T2` phase before all full-only
+candidates. A checkpoint at the phase boundary confirms its matches before
+remainder work may consume the active detector deadline. Remapped internal-page
+IDs do not lose priority because the scheduling identity is the collector,
+kind, source, key, and bounded value rather than the provisional page ID. With
+no detector limit or timeout the same complete candidate set is matched; this
+ordering neither raises a budget nor changes the `T1`/`T2` feature definitions.
 The authoritative `full` pass submits the complete bounded
 HTTP/browser/probe/infrastructure set to one detector invocation instead of
 merging independently detected page results. Only an explicit shadow run adds
@@ -2961,6 +2993,74 @@ sealed `H2`. Preregistration and manifests do not themselves authorize public
 traffic. Functional tier routing remains `HOLD` until the frozen winner passes
 the distinct holdout and a later implementation slice is explicitly approved.
 
+### D2 paired-development verdict and bounded v0.1.9 remediation
+
+The authorized fresh D2 run was built from clean commit
+`29ccc4ff3577a5cb80fae86c46e6cd643182b014` with scanner `0.1.8`, Node.js
+`24.19.0`, Playwright `1.62.1`, Chromium revision `1234`, catalog digest
+`sha256:614581009dc6ac2986763f8a324c656e629f63c5ecb7e46cf3ac10b121277724`,
+and configuration digest
+`sha256:9bd1d4ab621075abdc669f6caf1393a6fc5d36e69e6a5297eb35f2c57ee79584`.
+It completed all 200 frozen domains without cohort replacement or resume: 9
+`success`, 182 `partial`, and 9 `failed`, with 2,305 direct and 234 inferred
+occurrences.
+The summary was reconstructed byte-for-byte. The Git-ignored local artifacts
+are pinned as follows:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `output/work/d2-crux-202606.results.jsonl` | `90242459ed4fc7a88601911a057a7951d2562388cd3fbcf1db188407493b40d1` |
+| `output/work/d2-crux-202606.results.summary.json` | `d8ec4532b585a57c4c769ee33e0d0b5a5352371077ae9301a48343e22bc79f3f` |
+| `output/work/d2-crux-202606.results.evaluation.json` | `054b14bf7109823775cb2b3aa422ca1983df8d619584e874d66554293c135bb4` |
+| `output/work/d2-crux-202606.paired.report.json` | `e8f53b9eb75d23254a55e97efb6e6e96dfc5cc8bbf4809b2608cfc1c93ff0a8d` |
+
+The preregistered decision is `NO-GO`:
+
+| Arm | Canonical names | Domain-technology pairs | Cost dimensions at or below 30% | Category fold wins |
+| --- | ---: | ---: | ---: | ---: |
+| `baseline-v2` | 302/388 = 77.84% | 1,748/2,305 = 75.84% | 2/5 | not applicable |
+| `baseline-v2+t2-direct-category-id-v1` | 302/388 = 77.84% | 1,757/2,305 = 76.23% | 3/5 | 1/5 |
+
+Both arms fail the 95% name and 80% pair guardrails. Baseline also exceeds the
+30% ceiling for admitted pages, requests, and browser milliseconds; category
+exceeds it for requests and browser milliseconds. The category arm wins only
+fold 4, below the required four folds. The machine decision is therefore
+`selectedFeatureSet: null`, `reason: "no-arm-eligible"`, and `candidate: null`.
+No model was frozen. The H1 evaluation branch is closed as not applicable; its
+manifest and Parquet remain sealed, archived, unused, and unscanned.
+
+The bounded diagnosis identified three implementation defects without changing
+the frozen weights, folds, salts, quota, thresholds, or global limits:
+
+1. All 17 direct occurrences with probe evidence were probe-only: 13 TYPO3 CMS
+   and four Magento. Because raw bodies were intentionally not persisted, the
+   run cannot prove that all 17 were false. Local fixtures demonstrate that the
+   old presence/generic-literal rules admitted empty, soft-404, or path-echo
+   responses; ledger revision `2026-08-20.2` replaces both rules with exact
+   stronger literals and covers the mechanism with positive and negative
+   fixtures.
+2. Nineteen direct T2 pairs disappeared from the authoritative `full` result on
+   11 domains; every affected full pass ended with
+   `REGEX_EXECUTION_LIMIT` or `REGEX_DOMAIN_BUDGET_EXCEEDED`. Version 0.1.9
+   schedules the exact T2 candidate multiset as the first detector phase and
+   checkpoints that phase before full-only work, without raising either limit.
+3. All 24 historical `BROWSER_UNAVAILABLE` errors co-occur with
+   `BROWSER_NAVIGATION_FAILED`. Thirteen have causal proxy telemetry
+   (12 `proxy.requestsPerPage`, one `proxy.requestsPerDomain`); one has only an
+   earlier unrelated DOM hit, and ten have no limit hit. For those latter 11,
+   the exact terminal cause is historically unrecoverable from the raw-free
+   artifact because abort won the race against the still-active collection and
+   `finish()` emitted the false unavailable. Version 0.1.9 boundedly drains the
+   collection first; local fixtures reproduce both a causal limit hit and a
+   proxy failure without a hit.
+
+D2 has now informed these fixes and cannot ratify them. The next prospective
+experiment therefore requires a fresh development cohort `D3` and a separately
+sealed holdout `H2`, with a new digest-bound preregistration and manifests for
+the v0.1.9 scanner/catalog identity. Neither cohort, source frame, artifact
+chain, nor public traffic is currently frozen or authorized. H1 is not recycled
+as H2, and functional tier routing remains `HOLD`.
+
 ## Implementation roadmap
 
 - [x] Confirm challenge scope and input format.
@@ -3027,12 +3127,17 @@ Completion and evaluation gates:
 - [x] Freeze exact-200 `D2` and exact-200 sealed `H1` manifests simultaneously
   from one named immutable source frame, with zero `D1`/`D2`/`H1` overlap and
   no network prescreen or post-freeze replacement.
-- [ ] Run the two frozen arms once on `D2`; accept category IDs only after all
-  global guardrails and at least four fold wins, otherwise retain a passing
-  baseline or record `NO-GO`.
-- [ ] Freeze the eligible `D2` winner and evaluate it once on sealed `H1`
-  without training, retraining, or changing features, thresholds, salts,
-  folds, quota, or cost ceiling. A failure requires a future sealed `H2`.
+- [x] Run the two frozen arms once on `D2`. Both failed the global guardrails,
+  category won only 1/5 folds, and the result is `NO-GO` with
+  `candidate: null`.
+- [x] Close the H1 branch as not applicable because D2 produced no eligible
+  winner; H1 remains sealed, archived, unused, and unscanned.
+- [x] Implement the bounded D2 remediations in v0.1.9: exact Magento/TYPO3
+  probe literals with fixtures, T2-first detector work under unchanged limits,
+  and bounded draining of the browser collection cleanup race.
+- [ ] Preregister, freeze, and separately authorize a fresh `D3` development
+  cohort and sealed `H2` holdout. No source frame, manifest, or traffic for
+  these cohorts is currently approved.
 - [ ] Implement functional tiered orchestration only after a frozen deployable
   trigger passes a new representative cohort; this slice is on hold and has no
   reserved version.
@@ -3066,11 +3171,11 @@ infrastructure collector, pipeline orchestration, incremental output, resume,
 summary generation, runnable local CLI, exact correction ledger, bounded limit
 telemetry, raw-free shadow evaluator, bounded set-aware trigger, standalone
 candidate boundary, and no-training frozen-holdout evaluator are complete in
-versions 0.1.7–0.1.8. The offline development verdict is `NO-GO`, so no
-candidate followed from v0.1.7. The v0.1.8 experiment preregisters exactly one
-raw-free feature family; its concrete CrUX source and disjoint `D2`/sealed-`H1`
-manifests are now frozen as recorded above, but neither cohort has been scanned.
-Functional routing remains a later slice and has no reserved version. The
-v0.1.5 and v0.1.7
-rejections are not authorization to lower the guardrails, ratify a same-cohort
-adjustment, or use documentation as crawl authorization.
+versions 0.1.7–0.1.9. Both the v0.1.7 offline development run and the paired
+v0.1.8 D2 experiment produced `NO-GO`; D2 published `candidate: null`, so H1
+was never scanned and its branch is closed as not applicable. Version 0.1.9
+contains only the three bounded remediations recorded above and does not claim
+that they pass a prospective cohort. Functional routing remains a later slice
+with no reserved version. A fresh `D3`/`H2` chain is neither frozen nor
+authorized, and none of the development rejections authorizes lower guardrails,
+same-cohort ratification, or public traffic.

@@ -585,6 +585,80 @@ test("maps p2 and p3 HTTP variants with stable page-linked candidates", async ()
   );
 });
 
+test("marks the T2 observation prefix without changing full candidate identities", async () => {
+  const fingerprintCatalog = catalog([], []);
+  const page = (
+    pageId: "p2" | "p3",
+    finalNetworkUrl: string,
+    marker: string,
+  ): HttpPageResult => {
+    const base = htmlEntry({
+      response: response({
+        finalNetworkUrl,
+        headers: [{ name: "X-Tier-Marker", value: marker }],
+      }),
+      html: `<html>${marker}</html>`,
+      text: marker,
+    });
+    assert.equal(base.kind, "html");
+    return {
+      kind: "html",
+      page: { ...base.page, pageId },
+      robots: [],
+      errors: [],
+    };
+  };
+  const preferred = page(
+    "p2",
+    "https://shop.vendor.tld/preferred",
+    "t2-signal",
+  );
+  const remappedPreferred = page(
+    "p3",
+    "https://shop.vendor.tld/preferred",
+    "t2-signal",
+  );
+  const remainder = page(
+    "p2",
+    "https://shop.vendor.tld/remainder",
+    "full-only-signal",
+  );
+  const run = async (withPriority: boolean): Promise<readonly DetectorCandidate[]> => {
+    let observed: readonly DetectorCandidate[] = [];
+    await detectHttp(htmlEntry(), {
+      catalog: fingerprintCatalog,
+      pool: fakePool(fingerprintCatalog, (candidates) => {
+        observed = candidates;
+        return emptyMatchResult();
+      }),
+      config: defaultConfig,
+      httpPages: [remainder, remappedPreferred],
+      ...(withPriority
+        ? { priorityObservations: { httpPages: [preferred] } }
+        : {}),
+    });
+    return observed;
+  };
+
+  const baseline = await run(false);
+  const prioritized = await run(true);
+  const withoutPriority = (candidate: DetectorCandidate): unknown => {
+    const { priority: _priority, ...identity } = candidate;
+    return identity;
+  };
+  assert.deepEqual(
+    prioritized.map(withoutPriority),
+    baseline.map(withoutPriority),
+  );
+  const fullOnly = prioritized.find((candidate) =>
+    candidate.source === "header" && candidate.value === "full-only-signal");
+  const retainedT2 = prioritized.find((candidate) =>
+    candidate.source === "header" && candidate.value === "t2-signal");
+  assert.equal(fullOnly?.priority, false);
+  assert.equal(retainedT2?.priority, true);
+  assert.equal((fullOnly?.id ?? "") < (retainedT2?.id ?? ""), true);
+});
+
 test("orders infrastructure candidates and publishes bounded DNS and TLS evidence", async () => {
   const rules = [
     rule(1, "Infrastructure service", {

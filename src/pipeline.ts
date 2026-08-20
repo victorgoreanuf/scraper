@@ -1491,6 +1491,7 @@ export async function scanDomain(
         pool: context.detectorPool,
         config: context.config,
         ...tierViews.full,
+        priorityObservations: tierViews.t2,
         signal,
       });
       errors.push(...detection.errors);

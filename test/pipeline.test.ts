@@ -1292,6 +1292,15 @@ test("runs independent raw-free shadow detections without changing the full resu
     true,
   );
   assert.equal(
+    fullCandidates?.find((candidate) => candidate.source === "probe")?.priority,
+    true,
+  );
+  assert.equal(
+    fullCandidates?.find((candidate) => candidate.collector === "browser")
+      ?.priority,
+    false,
+  );
+  assert.equal(
     t1Candidates?.some((candidate) =>
       candidate.source === "probe"
       || candidate.collector === "browser"

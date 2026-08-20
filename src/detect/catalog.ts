@@ -42,7 +42,7 @@ export const CUSTOM_RULE_NAMESPACE =
   "website-technologies-scraper/custom:rule-v1";
 export const CATALOG_CORRECTIONS_SCHEMA =
   "website-technologies-scraper/catalog-corrections-v1";
-export const CATALOG_CORRECTIONS_REVISION = "2026-08-20.1";
+export const CATALOG_CORRECTIONS_REVISION = "2026-08-20.2";
 export const PINNED_UPSTREAM_DIGEST =
   "sha256:cdcccc905a14bbc7ad35a7ea6de636a2e6e51280c6ebbe5ba14f5e55aac18c8f";
 

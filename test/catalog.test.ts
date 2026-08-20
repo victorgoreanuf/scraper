@@ -258,7 +258,7 @@ test("loads the pinned upstream plus the exact correction ledger as immutable pl
   assert.equal(catalog.revision, CATALOG_REVISION);
   assert.equal(
     catalog.digest,
-    "sha256:614581009dc6ac2986763f8a324c656e629f63c5ecb7e46cf3ac10b121277724",
+    "sha256:5aedde4f83d1ad977d646e1495b9b91d4d3b0f6f3acbd34d54906d099da18870",
   );
   assert.notEqual(catalog.digest, PINNED_UPSTREAM_DIGEST);
   assert.deepEqual({
@@ -314,7 +314,7 @@ test("loads the pinned upstream plus the exact correction ledger as immutable pl
         rule.pattern,
       ]),
     [
-      ["Magento", "/magento_version", "literal", "magento"],
+      ["Magento", "/magento_version", "literal", "Magento/2."],
       [
         "Sitecore",
         "/layouts/System/VisitorIdentification.aspx",
@@ -324,8 +324,8 @@ test("loads the pinned upstream plus the exact correction ledger as immutable pl
       [
         "TYPO3 CMS",
         "/typo3/sysext/core/Resources/Public/Images/typo3_orange.svg",
-        "presence",
-        null,
+        "literal",
+        "M31.7,28.8c-0.6,0.2-1.1,0.2-1.7,0.2c-5.2,0-12.9-18.2-12.9-24.3",
       ],
     ],
   );
@@ -367,6 +367,8 @@ test("applies only the reviewed exact catalog corrections", () => {
     "sha256:8a527bf599e41dd04941f4dac7f14d8e73d9c2206ca6f043b2e829b59324d559",
     "sha256:889fb7aaa24770cd4f38ad3434f891f8a1f28c2f35e013807f028bb9938df692",
     "sha256:8032238690be0e13baeddcc35b2ce083b5292786609538af987ffcbc4c09792e",
+    "sha256:2e857b4d0326ad734283a01e301fb492f3dfe86f3096c234ee062ad4bea25c4f",
+    "sha256:6a2ad493f1f7d52af069068422274c1e809ef35ad5cdd877b43cf81b9bf0344b",
   ];
   for (const ruleId of removedRuleIds) {
     assert.equal(catalog.rules.some((rule) => rule.ruleId === ruleId), false);
@@ -376,32 +378,48 @@ test("applies only the reviewed exact catalog corrections", () => {
     {
       technology: "Onsen UI",
       source: "script_url",
+      locator: null,
       original: "(?:^|/)(?:angular-)?onsenui(?:\\.min)?\\.js(?:[?#]|$)",
     },
     {
       technology: "Lightbox",
       source: "script_url",
+      locator: null,
       original: "(?:^|/)lightbox-plus-jquery(?:\\.min)?\\.js(?:[?#]|$)",
     },
     {
       technology: "Liveinternet",
       source: "html",
+      locator: null,
       original: "//counter\\.yadro\\.ru/hit",
+    },
+    {
+      technology: "Magento",
+      source: "probe",
+      locator: "/magento_version",
+      original: "Magento/2.",
+    },
+    {
+      technology: "TYPO3 CMS",
+      source: "probe",
+      locator: "/typo3/sysext/core/Resources/Public/Images/typo3_orange.svg",
+      original: "M31.7,28.8c-0.6,0.2-1.1,0.2-1.7,0.2c-5.2,0-12.9-18.2-12.9-24.3",
     },
   ] as const;
   for (const replacement of replacements) {
     const rule = catalog.rules.find((candidate) =>
       candidate.technology === replacement.technology
       && candidate.source === replacement.source
+      && candidate.locator === replacement.locator
       && candidate.original === replacement.original);
     assert.notEqual(rule, undefined, replacement.technology);
     assert.equal(rule?.namespace, CUSTOM_RULE_NAMESPACE);
-    assert.equal(rule?.locator, null);
+    assert.equal(rule?.locator, replacement.locator);
     assert.equal(rule?.ruleId, ruleId([
       CUSTOM_RULE_NAMESPACE,
       replacement.technology,
       replacement.source,
-      null,
+      replacement.locator,
       replacement.original,
     ]));
   }

@@ -98,6 +98,19 @@
   sigilat `H1` au overlap canonic zero. Regula baseline-first, pragurile,
   foldurile, salts și cota 38+2 sunt preregistrate în
   `shadow-category-ablation.v1.json`. Tieringul funcțional rămâne `HOLD`.
+- Runul D2 v0.1.8 a produs `NO-GO`: baseline a păstrat 302/388 nume și
+  1.748/2.305 perechi, category 302/388 și 1.757/2.305, iar category a câștigat
+  numai 1/5 folds. `candidate=null`; H1 nu a fost scanat, rămâne sigilat și
+  arhivat, iar ramura sa de evaluare este închisă ca neaplicabilă.
+- Versiunea 0.1.9 remediază bounded exact trei defecte diagnosticate pe D2:
+  regulile probe Magento/TYPO3 devin reguli literale exacte în ledgerul
+  `2026-08-20.2`, detectorul procesează faza exactă T2 înaintea candidaților
+  full-only sub aceleași limite, iar browserul drenează bounded colecția activă
+  înainte să propage failure-ul. Nu mărim limitele și nu schimbăm triggerul.
+- D2 este acum evidence de dezvoltare și nu poate ratifica aceste corecții.
+  Următorul experiment necesită `D3` fresh plus `H2` sigilat, cu preregistrare,
+  source frame, manifeste și autorizare noi; niciunul nu este încă înghețat sau
+  autorizat, iar H1 nu este reciclat drept H2.
 
 ## Structura proiectului
 
@@ -482,6 +495,14 @@ termină preflightul este eliminat, nu relansat într-un spawn loop. Abortul loc
 al domeniului produs de o limită sau eroare proxy închide contextul, dar nu
 consumă replacement-ul procesului; numai disconnectul Chromium ori cleanup-ul
 eșuat marchează slotul nesănătos.
+
+Același watchdog de o secundă limitează drain-ul intern când abortul callerului
+sau al domeniului devansează o colecție de pagină deja pornită. `collectPage()`
+așteaptă ca promisiunea internă să se finalizeze ori ca watchdogul să expire
+înainte să propage failure-ul. Astfel `finish()` poate păstra diagnosticul exact
+proxy/pagină și telemetry raw-free deja în curs de finalizare, fără retry,
+fereastră nelimitată sau transformarea race-ului într-un fals
+`BROWSER_UNAVAILABLE`.
 
 Fiecare domeniu primește un context Chromium nepersistent, reutilizat secvențial
 pentru `p1`–`p3`, cu maximum o pagină activă și exact același origin. Sandboxul
@@ -1086,7 +1107,7 @@ Compilatorul acceptă numai allowlistul upstream exact și fișiere custom regul
 care adaugă nume noi fără redeclarare. Singura excepție de corecție este ledgerul
 fix `fingerprints/custom/corrections.v1.json`, cu schema închisă
 `website-technologies-scraper/catalog-corrections-v1` și revizia
-`2026-08-20.1`. Ledgerul se leagă de source, revision și digestul upstream exact
+`2026-08-20.2`. Ledgerul se leagă de source, revision și digestul upstream exact
 și admite numai `dropTechnologies` cu nume upstream exacte, `dropRules` cu rule
 ID SHA-256 complet și `replaceRules` cu target exact plus un `original`
 declarativ nou. Replacementul păstrează obligatoriu aceeași tehnologie, sursă
@@ -1102,13 +1123,23 @@ upstream înainte să aplice corecțiile; loaderul păstrează aceeași verifica
 Byte-ii upstream și ID-urile regulilor neschimbate rămân intacte, iar byte-ii
 ledgerului intră în digestul catalogului efectiv.
 
+Revizia `2026-08-20.2` conține exact patru `dropTechnologies`, cinci
+`dropRules` și cinci `replaceRules`; SHA-256 al ledgerului brut este
+`sha256:68d702a5496f2d5c304c6608cd31c06c7679b3078b436e3ba3a1d1c4f34a8393`.
+Față de `.1`, regula probe Magento cere literalul `Magento/2.`, iar TYPO3 CMS
+cere un fragment distinctiv bounded din SVG-ul oficial în loc de simpla
+prezență a răspunsului. Fixtures pozitive păstrează semnăturile, iar negativele
+resping 2xx gol, soft-404 și body-ul care reflectă numai pathul. Nu declarăm
+retroactiv toate cele 17 detecții probe-only D2 false, deoarece body-urile brute
+nu au fost persistate.
+
 `dropTechnologies` se aplică înainte de limita `technologiesPerCatalog`, astfel
 încât limita descrie catalogul efectiv. Revizia acceptată produce 7.571
 tehnologii, 109 categorii, 15.481 declarații directe, 15.474 reguli unice și
 2.238 relații. Accountingul are 8.529 surse regex declarate, iar planul
 workerilor 8.525 surse (8.022 value și 503 locatoare cookie), 1.767 selectori
 DOM, 5.570 pathuri JavaScript și trei probe. Digestul efectiv este
-`sha256:614581009dc6ac2986763f8a324c656e629f63c5ecb7e46cf3ac10b121277724`;
+`sha256:5aedde4f83d1ad977d646e1495b9b91d4d3b0f6f3acbd34d54906d099da18870`;
 digestul upstream rămâne
 `sha256:cdcccc905a14bbc7ad35a7ea6de636a2e6e51280c6ebbe5ba14f5e55aac18c8f`.
 
@@ -1140,8 +1171,16 @@ valoarea raw bounded în worker; parentul primește doar spanul și versiunea si
 integral, canonic și sanitizat;
 header/meta publică doar matchul după clasificarea întregii observații, iar
 cookie/HTML/text/robots/probe/DOM/JavaScript/script content rămân redacted.
-Candidații HTTP au prioritate înaintea tierului browser când bugetul admite doar
-un prefix. Confidence și version se calculează din rule ID-uri unice, apoi se
+Ordinea identităților candidat rămâne stabilă și neschimbată. Pentru pass-ul
+`full`, pipeline-ul furnizează separat multisetul exact al observațiilor din
+prefixul T2; detectorul îl identifică după collector, kind, source, key și
+valoarea bounded, fără `pageId`, astfel încât remaparea provizorie `p2`/`p3` nu
+pierde prioritatea. Admiterea bounded și work items rulează întâi faza T2, apoi
+candidații full-only, cu checkpoint explicit la frontieră. Un deadline sau cap
+consumat de remainder nu mai poate elimina matchurile T2 încă neconfirmate.
+Candidate IDs, ordinea rezultatului, limits, views și setul complet în cazul
+fără limită/timeout nu se schimbă. Confidence și version se calculează din rule
+ID-uri unice, apoi se
 aplică fixed point-ul relațiilor și excluderile deterministe deja decise.
 
 ## Ce trebuie măsurat
@@ -1678,6 +1717,66 @@ feature sau prag schimbat. Un eșec transformă `H1` în development evidence ș
 o nouă afirmație cere `H2` sigilat. Documentul și manifestele nu autorizează
 singure trafic public. Tieringul funcțional rămâne `HOLD` până la PASS pe
 holdout și un slice de implementare autorizat separat.
+
+## Verdictul paired D2 v0.1.8 și remedierea bounded v0.1.9
+
+Runul public D2 autorizat a fost construit din commitul curat
+`29ccc4ff3577a5cb80fae86c46e6cd643182b014` cu scanner `0.1.8`, Node
+`24.19.0`, Playwright `1.62.1`, Chromium `1234`, catalog
+`sha256:614581009dc6ac2986763f8a324c656e629f63c5ecb7e46cf3ac10b121277724`
+și config
+`sha256:9bd1d4ab621075abdc669f6caf1393a6fc5d36e69e6a5297eb35f2c57ee79584`.
+A terminat exact 200/200 domenii fără înlocuire a cohortei sau resume: 9
+success, 182 partial și 9 failed, cu 2.305 apariții directe și 234 inferred.
+Summary-ul a fost reconstruit byte-identic. Artefactele locale Git-ignored sunt:
+
+| Artefact | SHA-256 |
+| --- | --- |
+| `output/work/d2-crux-202606.results.jsonl` | `90242459ed4fc7a88601911a057a7951d2562388cd3fbcf1db188407493b40d1` |
+| `output/work/d2-crux-202606.results.summary.json` | `d8ec4532b585a57c4c769ee33e0d0b5a5352371077ae9301a48343e22bc79f3f` |
+| `output/work/d2-crux-202606.results.evaluation.json` | `054b14bf7109823775cb2b3aa422ca1983df8d619584e874d66554293c135bb4` |
+| `output/work/d2-crux-202606.paired.report.json` | `e8f53b9eb75d23254a55e97efb6e6e96dfc5cc8bbf4809b2608cfc1c93ff0a8d` |
+
+Rezultatul preregistrat este:
+
+| Braț | Nume canonice | Perechi domeniu-tehnologie | Costuri `<=30%` | Fold wins category |
+| --- | ---: | ---: | ---: | ---: |
+| baseline v2 | 302/388 = 77,84% | 1.748/2.305 = 75,84% | 2/5 | neaplicabil |
+| baseline + T2 category IDs | 302/388 = 77,84% | 1.757/2.305 = 76,23% | 3/5 | 1/5 |
+
+Baseline are ratios 28,97% pages attempted, 30,37% pages admitted, 31,86%
+requesturi, 28,88% bytes și 31,39% browser milliseconds. Category are 28,57%,
+29,91%, 32,74%, 29,99% și 31,12% în aceeași ordine. Ambele eșuează pragurile
+95%/80%; category câștigă numai foldul 4, nu minimum patru. Raportul fixează
+`selectedFeatureSet=null`, `reason=no-arm-eligible` și `candidate=null`.
+Nu antrenăm și nu înghețăm model. Ramura H1 este închisă ca neaplicabilă;
+Parquetul și manifestul rămân sigilate, arhivate, nefolosite și nescanate.
+
+Diagnosticul D2 a autorizat numai aceste trei remedieri bounded:
+
+1. Cele 17 apariții directe cu probe sunt exclusiv probe: 13 TYPO3 CMS și patru
+   Magento. Body-urile brute nu au fost persistate, deci nu le etichetăm pe toate
+   retrospectiv drept false. Ledgerul `.2` închide mecanismul demonstrat de
+   presence/generic literal prin semnături exacte și fixtures soft-404/path-echo.
+2. 19 perechi T2 lipsesc din `full` pe 11 domenii; fiecare full pass afectat are
+   `REGEX_EXECUTION_LIMIT` sau `REGEX_DOMAIN_BUDGET_EXCEEDED`. Faza T2 primește
+   prioritate și checkpoint înainte de full-only sub plafoanele neschimbate.
+3. Toate cele 24 `BROWSER_UNAVAILABLE` coapar cu
+   `BROWSER_NAVIGATION_FAILED`. 13 au telemetry proxy cauzală
+   (12 `proxy.requestsPerPage`, una `proxy.requestsPerDomain`); una are numai un
+   hit DOM anterior fără cauzalitate demonstrată, iar zece nu au limit hit.
+   Pentru ultimele 11, cauza terminală exactă este istoric nerecuperabilă din
+   artefactul raw-free: abortul a devansat promisiunea colecției, iar `finish()`
+   a emis falsul unavailable. Drain-ul bounded v0.1.9 reproduce local atât
+   cazul cu hit cauzal, cât și proxy failure fără hit și păstrează diagnosticul
+   finalizat.
+
+Nu mărim limite, nu schimbăm triggerul și nu reinterpretăm D2 după fixuri. D2 a
+devenit development evidence. Următorul experiment trebuie să înghețe și să
+autorizeze separat un `D3` fresh și un `H2` sigilat, cu preregistrare și
+manifeste legate de scannerul/catalogul v0.1.9. Nici source frame-ul, cohorturile,
+artefactele și nici traficul nu sunt încă înghețate sau autorizate. H1 nu devine
+H2, iar routingul funcțional rămâne `HOLD`.
 
 ## Probleme posibile
 

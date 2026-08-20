@@ -1,6 +1,6 @@
 {
   "schema": "website-technologies-scraper/catalog-corrections-v1",
-  "revision": "2026-08-20.1",
+  "revision": "2026-08-20.2",
   "appliesTo": {
     "source": "enthec/webappanalyzer",
     "revision": "5e7c47b1d441ded0bd476b252261e87634349f96",
@@ -40,6 +40,20 @@
       "source": "html",
       "locator": null,
       "original": "//counter\\.yadro\\.ru/hit"
+    },
+    {
+      "targetRuleId": "sha256:2e857b4d0326ad734283a01e301fb492f3dfe86f3096c234ee062ad4bea25c4f",
+      "technology": "Magento",
+      "source": "probe",
+      "locator": "/magento_version",
+      "original": "Magento/2."
+    },
+    {
+      "targetRuleId": "sha256:6a2ad493f1f7d52af069068422274c1e809ef35ad5cdd877b43cf81b9bf0344b",
+      "technology": "TYPO3 CMS",
+      "source": "probe",
+      "locator": "/typo3/sysext/core/Resources/Public/Images/typo3_orange.svg",
+      "original": "M31.7,28.8c-0.6,0.2-1.1,0.2-1.7,0.2c-5.2,0-12.9-18.2-12.9-24.3"
     }
   ]
 }

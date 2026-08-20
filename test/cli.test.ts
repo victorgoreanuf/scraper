@@ -80,7 +80,7 @@ const TRAINING_DOMAIN_SET_DIGEST = computeDomainSetDigest(Array.from(
   (_, index) => `training-${String(index).padStart(3, "0")}.vendor.com`,
 ));
 const EVALUATION_CONFIG_DIGEST = computeConfigDigest(createDefaultScanConfig(
-  `WebsiteTechScraper/0.1.8 (${CONTACT})`,
+  `WebsiteTechScraper/0.1.9 (${CONTACT})`,
 ));
 const execFileAsync = promisify(execFile);
 
@@ -244,7 +244,7 @@ function shadowSnapshot(domain: string): ShadowEvaluationSnapshot {
 }
 
 function frozenCandidate(
-  scannerVersion = "0.1.8",
+  scannerVersion = "0.1.9",
   configDigest = EVALUATION_CONFIG_DIGEST,
   domainSetDigest = TRAINING_DOMAIN_SET_DIGEST,
 ): ShadowFrozenCandidate {
@@ -880,7 +880,7 @@ test("prints help, version, and usage failures without initializing the run", as
     stdout: version.stdout,
     stderr: version.stderr,
   }), 0);
-  assert.equal(version.stdout.text(), "0.1.8\n");
+  assert.equal(version.stdout.text(), "0.1.9\n");
   assert.equal(version.stderr.text(), "");
   assert.deepEqual(version.events, []);
 
@@ -904,7 +904,7 @@ test("loads one complete bounded JSON configuration before input preflight", asy
     await writeFile(
       configPath,
       JSON.stringify(createDefaultScanConfig(
-        "WebsiteTechScraper/0.1.8 (https://crawler.veridion.com/contact)",
+        "WebsiteTechScraper/0.1.9 (https://crawler.veridion.com/contact)",
       )),
       { encoding: "utf8", mode: 0o600 },
     );
@@ -947,11 +947,11 @@ test("loads one complete bounded JSON configuration before input preflight", asy
 
     const invalidContactPath = join(directory, "invalid-contact.json");
     const invalidContact = createDefaultScanConfig(
-      "WebsiteTechScraper/0.1.8 (https://crawler.veridion.com/contact)",
+      "WebsiteTechScraper/0.1.9 (https://crawler.veridion.com/contact)",
     );
     await writeFile(
       invalidContactPath,
-      JSON.stringify({ ...invalidContact, userAgent: "WebsiteTechScraper/0.1.8 (https://x)" }),
+      JSON.stringify({ ...invalidContact, userAgent: "WebsiteTechScraper/0.1.9 (https://x)" }),
       { encoding: "utf8", mode: 0o600 },
     );
     const rejectedContact = createHarness();
@@ -1469,7 +1469,7 @@ test("publishes a compatible paired H1 holdout only after cleanup", async (t) =>
     categoryProjectionDigest:
       boundary.preregistration.categoryProjectionDigest,
     model: frozenCandidate(
-      "0.1.8",
+      "0.1.9",
       EVALUATION_CONFIG_DIGEST,
       computeDomainSetDigest(d2Domains),
     ),
@@ -1553,7 +1553,7 @@ test("rejects the exact training domain set before catalog, pools, or writer", a
     (_, index) => `domain-${String(index).padStart(3, "0")}.vendor.com`,
   );
   const candidate = frozenCandidate(
-    "0.1.8",
+    "0.1.9",
     EVALUATION_CONFIG_DIGEST,
     computeDomainSetDigest(trainingDomains),
   );
@@ -2075,7 +2075,7 @@ async function waitForContext(
   const event = harness.events.find((value) => value.startsWith("writer:open:"));
   assert.ok(event);
   return {
-    scannerVersion: "0.1.8",
+    scannerVersion: "0.1.9",
     runtime: {
       node: "24.19.0",
       playwright: "1.62.1",

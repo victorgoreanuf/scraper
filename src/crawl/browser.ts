@@ -2332,15 +2332,15 @@ class BrowserDomainSessionImpl implements BrowserDomainSession {
     return session;
   }
 
-  collectPage(input: BrowserPageInput): Promise<BrowserPageCollection> {
+  async collectPage(input: BrowserPageInput): Promise<BrowserPageCollection> {
     if (
       this.#finished
       || this.#closePromise !== null
       || this.#activeCollectionPromise !== null
     ) {
-      return Promise.reject(new TypeError(
+      throw new TypeError(
         "The browser domain session is already finalized or collecting",
-      ));
+      );
     }
     const collection = this.#collectPageInternal(input);
     this.#activeCollectionPromise = collection;
@@ -2356,7 +2356,15 @@ class BrowserDomainSessionImpl implements BrowserDomainSession {
         }
       },
     );
-    return awaitWithSignal(collection, this.#domainSignal);
+    try {
+      return await awaitWithSignal(collection, this.#domainSignal);
+    } catch (error) {
+      await settleWithin(
+        collection.then(() => undefined, () => undefined),
+        CLEANUP_WATCHDOG_MS,
+      );
+      throw error;
+    }
   }
 
   async #collectPageInternal(

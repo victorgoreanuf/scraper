@@ -147,6 +147,12 @@ port.on("message", (message: DetectorWorkerRequest) => {
   const counter = new Int32Array(message.executionBuffer);
   const skipped = new Set(message.skipRuleOrdinals);
   let pending: WorkerMatch[] = [];
+  const shouldCheckpoint = (nextWorkIndex: number): boolean =>
+    nextWorkIndex < message.work.length
+    && (
+      nextWorkIndex % message.checkpointRules === 0
+      || nextWorkIndex === message.priorityWorkEndIndex
+    );
   Atomics.store(state, PHASE, PHASE_MATCHING);
   Atomics.store(state, CHECKPOINT, message.startWorkIndex);
 
@@ -163,10 +169,7 @@ port.on("message", (message: DetectorWorkerRequest) => {
     const regex = compiled[item.ruleOrdinal];
     if (rule === undefined || regex === undefined || skipped.has(item.ruleOrdinal)) {
       const nextWorkIndex = workIndex + 1;
-      if (
-        nextWorkIndex % message.checkpointRules === 0
-        && nextWorkIndex < message.work.length
-      ) {
+      if (shouldCheckpoint(nextWorkIndex)) {
         Atomics.store(state, CHECKPOINT, nextWorkIndex);
         port.postMessage({
           type: "checkpoint",
@@ -254,10 +257,7 @@ port.on("message", (message: DetectorWorkerRequest) => {
 
     pending.push(...ruleMatches);
     const nextWorkIndex = workIndex + 1;
-    if (
-      nextWorkIndex % message.checkpointRules === 0
-      && nextWorkIndex < message.work.length
-    ) {
+    if (shouldCheckpoint(nextWorkIndex)) {
       Atomics.store(state, CHECKPOINT, nextWorkIndex);
       port.postMessage({
         type: "checkpoint",

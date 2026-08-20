@@ -1199,7 +1199,11 @@ test("reuses a healthy browser after repeated domain-scoped proxy limits", async
         domSelectorOrdinal: null,
       }],
     });
-    await session.close();
+    const result = await session.finish();
+    assert.deepEqual(
+      result.errors.map(({ code }) => code),
+      ["BROWSER_LIMIT_EXCEEDED"],
+    );
     assert.equal(pool.isAvailable(), true);
   }
 
@@ -1207,6 +1211,42 @@ test("reuses a healthy browser after repeated domain-scoped proxy limits", async
   assert.equal(runtime.proxies.length, 1);
   assert.equal(runtime.proxies[0]?.domains, 4);
   assert.equal(runtime.proxies[0]?.finishedDomains, 4);
+});
+
+test("drains a failed proxy collection before retaining its exact diagnosis", async (t) => {
+  const runtime = fakeRuntime();
+  const pool = await createBrowserPool(
+    runtime.transport,
+    browserConfig(),
+    runtime.launcher,
+  );
+  t.after(() => pool.close());
+  const session = await pool.openDomain();
+  runtime.proxies[0]?.failOnNextAttempt(new TransportFailure(
+    "BROWSER_PROXY_FAILED",
+    "browser",
+    true,
+  ));
+
+  await assert.rejects(
+    session.collectPage({
+      pageId: "p1",
+      url: "https://merchant-site.org/",
+      inspectionPlan,
+      allowTopLevelUrl: () => true,
+    }),
+    (error: unknown) =>
+      error instanceof TransportFailure
+      && error.code === "BROWSER_PROXY_FAILED",
+  );
+  assert.deepEqual(session.getFailureLimitTelemetry(), { hits: [] });
+
+  const result = await session.finish();
+  assert.deepEqual(
+    result.errors.map(({ code }) => code),
+    ["BROWSER_PROXY_FAILED"],
+  );
+  assert.equal(pool.isAvailable(), true);
 });
 
 test("replaces a slot aborted during delayed domain-context initialization", async (t) => {

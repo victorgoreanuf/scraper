@@ -54,6 +54,41 @@
     "expected": []
   },
   {
+    "label": "Magento version endpoint response",
+    "source": "probe",
+    "key": "/magento_version",
+    "value": "Magento/2.4 (Community)\n",
+    "expected": ["Magento"]
+  },
+  {
+    "label": "Magento probe path echo is not Magento",
+    "source": "probe",
+    "key": "/magento_version",
+    "value": "<html><body>Page /magento_version was not found</body></html>",
+    "expected": []
+  },
+  {
+    "label": "TYPO3 official orange logo signature",
+    "source": "probe",
+    "key": "/typo3/sysext/core/Resources/Public/Images/typo3_orange.svg",
+    "value": "<svg><path fill=\"#FF8700\" d=\"M31.7,28.8c-0.6,0.2-1.1,0.2-1.7,0.2c-5.2,0-12.9-18.2-12.9-24.3\"/></svg>",
+    "expected": ["TYPO3 CMS"]
+  },
+  {
+    "label": "TYPO3 probe soft 404 is not TYPO3",
+    "source": "probe",
+    "key": "/typo3/sysext/core/Resources/Public/Images/typo3_orange.svg",
+    "value": "<html><body>Not found: /typo3/sysext/core/Resources/Public/Images/typo3_orange.svg</body></html>",
+    "expected": []
+  },
+  {
+    "label": "TYPO3 empty successful response is not TYPO3",
+    "source": "probe",
+    "key": "/typo3/sysext/core/Resources/Public/Images/typo3_orange.svg",
+    "value": "",
+    "expected": []
+  },
+  {
     "label": "Wix generator is not WebsiteBuilder",
     "source": "meta",
     "key": "generator",

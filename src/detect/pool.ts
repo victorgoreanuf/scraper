@@ -16,6 +16,7 @@ const PHASE_MATCHING = 3;
 
 export interface DetectorCandidate {
   readonly id: string;
+  readonly priority: boolean;
   readonly kind: "presence" | "value";
   readonly source: EvidenceSource;
   readonly key: string | null;
@@ -53,6 +54,7 @@ export type DetectorWorkerRequest = {
   readonly executionBuffer: SharedArrayBuffer;
   readonly executionLimit: number;
   readonly checkpointRules: number;
+  readonly priorityWorkEndIndex: number;
 };
 
 export type DetectorWorkerResponse =
@@ -459,10 +461,12 @@ class DetectorPoolImplementation implements DetectorPool {
     readonly work: readonly DetectorWorkItem[];
     readonly candidates: readonly DetectorCandidate[];
     readonly candidateOrdinals: readonly number[];
+    readonly priorityWorkEndIndex: number;
     readonly truncated: boolean;
     readonly truncatedSource: EvidenceSource | null;
   } {
-    const byRule = new Map<number, number[]>();
+    const priorityByRule = new Map<number, number[]>();
+    const remainderByRule = new Map<number, number[]>();
     const dispatchedCandidates: DetectorCandidate[] = [];
     const candidateOrdinals: number[] = [];
     let executions = 0;
@@ -483,7 +487,14 @@ class DetectorPoolImplementation implements DetectorPool {
       Math.floor(matchSentinel / checkpointRules),
     );
 
-    for (let candidateOrdinal = 0; candidateOrdinal < candidates.length; candidateOrdinal += 1) {
+    const orderedCandidateOrdinals = candidates
+      .map((_candidate, candidateOrdinal) => candidateOrdinal)
+      .sort((left, right) =>
+        Number(candidates[right]!.priority)
+        - Number(candidates[left]!.priority)
+        || left - right);
+
+    for (const candidateOrdinal of orderedCandidateOrdinals) {
       const candidate = candidates[candidateOrdinal];
       if (candidate === undefined) {
         continue;
@@ -512,6 +523,7 @@ class DetectorPoolImplementation implements DetectorPool {
       const dispatchedOrdinal = dispatchedCandidates.length;
       dispatchedCandidates.push(candidate);
       candidateOrdinals.push(candidateOrdinal);
+      const byRule = candidate.priority ? priorityByRule : remainderByRule;
       for (const ruleOrdinal of applicable) {
         const list = byRule.get(ruleOrdinal) ?? [];
         list.push(dispatchedOrdinal);
@@ -519,28 +531,34 @@ class DetectorPoolImplementation implements DetectorPool {
       }
     }
 
+    const materializePhase = (
+      byRule: ReadonlyMap<number, readonly number[]>,
+    ): readonly DetectorWorkItem[] => [...byRule]
+      .sort(([left], [right]) => left - right)
+      .flatMap(([ruleOrdinal, candidateOrdinals]) => {
+        const chunks: DetectorWorkItem[] = [];
+        for (
+          let offset = 0;
+          offset < candidateOrdinals.length;
+          offset += candidatesPerWorkItem
+        ) {
+          chunks.push({
+            ruleOrdinal,
+            candidateOrdinals: candidateOrdinals.slice(
+              offset,
+              offset + candidatesPerWorkItem,
+            ),
+          });
+        }
+        return chunks;
+      });
+
+    const priorityWork = materializePhase(priorityByRule);
     return {
-      work: [...byRule]
-        .sort(([left], [right]) => left - right)
-        .flatMap(([ruleOrdinal, candidateOrdinals]) => {
-          const chunks: DetectorWorkItem[] = [];
-          for (
-            let offset = 0;
-            offset < candidateOrdinals.length;
-            offset += candidatesPerWorkItem
-          ) {
-            chunks.push({
-              ruleOrdinal,
-              candidateOrdinals: candidateOrdinals.slice(
-                offset,
-                offset + candidatesPerWorkItem,
-              ),
-            });
-          }
-          return chunks;
-        }),
+      work: [...priorityWork, ...materializePhase(remainderByRule)],
       candidates: dispatchedCandidates,
       candidateOrdinals,
+      priorityWorkEndIndex: priorityWork.length,
       truncated,
       truncatedSource,
     };
@@ -853,6 +871,7 @@ class DetectorPoolImplementation implements DetectorPool {
           executionBuffer,
           executionLimit: this.#config.limits.detector.executionsPerDomain,
           checkpointRules,
+          priorityWorkEndIndex: plan.priorityWorkEndIndex,
         }, signal, detectionStartedAt);
 
         const timedOutRuleOrdinal = attempt.kind === "timeout"
