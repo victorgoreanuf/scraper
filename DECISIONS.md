@@ -1621,6 +1621,33 @@ manifestele sunt create ulterior și conțin digestul preregistrării. Orice
 mismatch, overlap, count greșit, replacement sau artefact nelegat invalidează
 experimentul.
 
+Instanța concretă a fost înghețată pe 2026-08-20 din tabela oficială CrUX
+BigQuery `chrome-ux-report.all.202606`, publicată pe 2026-07-14. Query-ul static
+`LOWER(NET.HOST(origin))` + filtrul ASCII + deduplicarea aplică apoi rankingul
+SHA-256 înghețat și reține un prefix de 5.000. Jobul `DONE` a procesat
+718.235.611 bytes sub capul de 50.000.000.000 bytes. Pin-urile sursei sunt:
+
+- query `sha256:57e00de2a713402e6260ab6960027870c463ca263e0498280803b3c95466f884`;
+- receipt BigQuery `sha256:aae01d5c754c14f7f52918dd0f166a2f7d4464d65d40ba5bc0d55aca609f11e3`;
+- CSV 5.000 rows `sha256:a17f2dc551d8efd7bc070a619aaf6a0814c775159b78dcd61df316fbb6b49201`.
+
+Toate cele 5.000 de domenii sunt canonice și unice, fără transformare sau
+overlap cu `D1`. Nu s-a făcut DNS/HTTP/browser/technology/reachability
+prescreen. Primele 200 sunt `D2`, următoarele 200 sunt `H1`, iar toate cele trei
+seturi au overlap zero. Identitățile înghețate sunt:
+
+- `D2`: Parquet `sha256:2b5b804d933461830d526171552faba4b105487119224d405727bca1ade48f2d`,
+  domain set `sha256:8fa28cd236c0896491714c16df179d36a9d2bde49b75fdbe1917ebfcc545c7b4`,
+  manifest `sha256:1e4c0793f6954988fdaa7c3838e2f1c3db201fedeb0e9642a2d7244b19b4b24e`;
+- `H1`: Parquet `sha256:f0bda7f40af62702dddaa6ae428d5b5f6d8100a884de7bc2751f8b4c6331a418`,
+  domain set `sha256:d69b0d4e73c8ee8300943c1376e51be19e3cc49f20945e1bd0edceeb9c5c54ed`,
+  manifest `sha256:f5115d197216ac819a7a8faed7e5ce09a359cee5abd419af9f04876d3d02487f`.
+
+Ambele Parquet-uri au exact 200 de rânduri și un singur câmp required
+`root_domain`, trec readerul de producție și păstrează ordinea rankului.
+Manifestul `D2` pin-uiește digestul manifestului `H1`; toate artefactele locale
+sunt regular, single-link și `0600`. Freeze-ul nu autorizează trafic public.
+
 Păstrăm exact cinci folds, priorul patru, supportul recurent minimum doi,
 38 trigger plus două controls și pragurile globale 95% nume, 80% perechi și
 30% pentru fiecare dintre cele cinci costuri browser reale. Fiecare fold trebuie

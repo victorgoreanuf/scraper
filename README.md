@@ -2897,6 +2897,38 @@ also pins the frozen candidate digest. A digest mismatch, overlap, wrong count,
 post-freeze replacement, or unbound artifact invalidates the experiment before
 interpretation.
 
+The concrete `D2`/`H1` instance was frozen on 2026-08-20 from the official
+CrUX BigQuery table `chrome-ux-report.all.202606`, published on 2026-07-14.
+The bounded source query lowercases `NET.HOST(origin)`, keeps only ASCII
+hostname candidates, deduplicates before applying the frozen SHA-256 rank, and
+returns the first 5,000 rows. The completed BigQuery job processed 718,235,611
+bytes under a 50,000,000,000-byte billing cap. Its exact query, job receipt,
+and CSV are retained locally with these pins:
+
+| Source artifact | SHA-256 |
+| --- | --- |
+| Query (`output/work/crux-202606-ranked-5000.sql`) | `57e00de2a713402e6260ab6960027870c463ca263e0498280803b3c95466f884` |
+| BigQuery job receipt (`output/work/crux-202606-export-job.json`) | `aae01d5c754c14f7f52918dd0f166a2f7d4464d65d40ba5bc0d55aca609f11e3` |
+| Ranked source CSV (`output/work/crux-202606-ranked-5000.csv`) | `a17f2dc551d8efd7bc070a619aaf6a0814c775159b78dcd61df316fbb6b49201` |
+
+All 5,000 rows pass the scanner's static hostname contract unchanged; there are
+no raw or canonical duplicates and no `D1` overlap. No DNS, HTTP, browser,
+technology, reachability, or scan-success signal influenced eligibility. The
+first 200 rows are the frozen `D2` input and rows 201–400 are the sealed `H1`
+input:
+
+| Cohort artifact | File SHA-256 | Domain-set digest | Manifest digest |
+| --- | --- | --- | --- |
+| `output/work/d2-crux-202606.parquet` | `2b5b804d933461830d526171552faba4b105487119224d405727bca1ade48f2d` | `sha256:8fa28cd236c0896491714c16df179d36a9d2bde49b75fdbe1917ebfcc545c7b4` | `sha256:1e4c0793f6954988fdaa7c3838e2f1c3db201fedeb0e9642a2d7244b19b4b24e` |
+| `output/work/h1-crux-202606.parquet` | `f0bda7f40af62702dddaa6ae428d5b5f6d8100a884de7bc2751f8b4c6331a418` | `sha256:d69b0d4e73c8ee8300943c1376e51be19e3cc49f20945e1bd0edceeb9c5c54ed` | `sha256:f5115d197216ac819a7a8faed7e5ce09a359cee5abd419af9f04876d3d02487f` |
+
+Both Parquet files contain exactly one required UTF-8 `root_domain` column and
+200 rows in frozen rank order. They pass the production two-pass reader; all
+source, input, and manifest files are single-link regular files with mode
+`0600`. The `D2` manifest pins the exact `H1` manifest digest above, and the
+three-way canonical overlap is zero. These local artifacts freeze membership;
+they do not authorize either public scan.
+
 All v0.1.7 calibration constants remain fixed: five folds, smoothing prior
 four, recurring-name support two, 38 trigger domains plus two controls, minimum
 95% canonical direct-name retention, minimum 80% canonical direct pair
@@ -2992,7 +3024,7 @@ Completion and evaluation gates:
 - [x] Preregister the paired `baseline-v2` versus direct-`T2` category-ID
   ablation, its 4/5 fold rule, baseline-first decision, immutable artifact
   chain, and sealed-holdout policy.
-- [ ] Freeze exact-200 `D2` and exact-200 sealed `H1` manifests simultaneously
+- [x] Freeze exact-200 `D2` and exact-200 sealed `H1` manifests simultaneously
   from one named immutable source frame, with zero `D1`/`D2`/`H1` overlap and
   no network prescreen or post-freeze replacement.
 - [ ] Run the two frozen arms once on `D2`; accept category IDs only after all
@@ -3034,10 +3066,11 @@ infrastructure collector, pipeline orchestration, incremental output, resume,
 summary generation, runnable local CLI, exact correction ledger, bounded limit
 telemetry, raw-free shadow evaluator, bounded set-aware trigger, standalone
 candidate boundary, and no-training frozen-holdout evaluator are complete in
-version 0.1.7. The offline development verdict is `NO-GO`, so no candidate
-followed from that build. The v0.1.8 experiment now preregisters exactly one
-raw-free feature family and a new `D2`/sealed-`H1` sequence; the concrete source
-and cohort manifests still must be frozen before traffic. Functional routing
-remains a later slice and has no reserved version. The v0.1.5 and v0.1.7
+versions 0.1.7–0.1.8. The offline development verdict is `NO-GO`, so no
+candidate followed from v0.1.7. The v0.1.8 experiment preregisters exactly one
+raw-free feature family; its concrete CrUX source and disjoint `D2`/sealed-`H1`
+manifests are now frozen as recorded above, but neither cohort has been scanned.
+Functional routing remains a later slice and has no reserved version. The
+v0.1.5 and v0.1.7
 rejections are not authorization to lower the guardrails, ratify a same-cohort
 adjustment, or use documentation as crawl authorization.
