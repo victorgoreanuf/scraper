@@ -270,7 +270,7 @@ comprimat, cât și necomprimat pentru chunkul `root_domain`. Codurile globale
 sunt `INPUT_OPEN_FAILED`, `INPUT_PARQUET_INVALID`, `INPUT_SCHEMA_INVALID`,
 `INPUT_LIMIT_EXCEEDED`, `INPUT_DOMAIN_INVALID` și `INPUT_DOMAIN_DUPLICATE`; ele
 nu intră în `DomainResult.errors`. Contractul implementabil complet este în
-[`Parquet input contract v1`](README.md#parquet-input-contract-v1).
+[`Parquet input contract v1`](docs/TECHNICAL_REFERENCE.md#parquet-input-contract-v1).
 
 Preflightul calculează și un `domainSetDigest` independent de ordinea rândurilor
 pentru setul exact de domenii canonice: SHA-256 peste tagul UTF-8 versionat
@@ -307,7 +307,7 @@ Host, SNI și certificat. HTTP și proxy-ul browserului folosesc aceeași politi
 IPv4 blochează registrul special IANA, multicast și endpointul Azure explicit;
 IPv6 permite numai `2000::/3` minus intervalele speciale fixate. Tabelele
 effective, versiunea și regulile complete sunt contractul unic din
-[`Public-address and connection contract`](README.md#public-address-and-connection-contract),
+[`Public-address and connection contract`](docs/TECHNICAL_REFERENCE.md#public-address-and-connection-contract),
 nu date descărcate la runtime.
 
 ## Decizia transportului HTTP protejat
@@ -595,8 +595,8 @@ rankingul top-20, replacement/cleanup și o pagină reală Chromium care trece
 numai prin proxy-ul protejat. CI nu depinde de website-uri publice.
 
 Bugetele exacte și failure semantics sunt contractul unic din secțiunile
-[`Initial scan policy`](README.md#initial-scan-policy) și
-[`Initial resource budget`](README.md#initial-resource-budget). La scară mare,
+[`Initial scan policy`](docs/TECHNICAL_REFERENCE.md#initial-scan-policy) și
+[`Initial resource budget`](docs/TECHNICAL_REFERENCE.md#initial-resource-budget). La scară mare,
 HTTP rulează pentru toate domeniile, iar probele, paginile interne și browserul
 cu scripturile deja descărcate de el sunt tier-uri selective măsurate împotriva
 baseline-ului `full`.
@@ -795,7 +795,7 @@ cea dedusă are zero evidence/page IDs și minimum un părinte. Codurile de eroa
 respectă `^[A-Z][A-Z0-9_]*$` și un registry TypeScript append-only; un cod nou
 este compatibil cu schema v1, dar eliminarea sau schimbarea sensului nu este.
 Registrul non-regex inițial și toate detaliile implementabile sunt în
-[`Result and evidence contract v1`](README.md#result-and-evidence-contract-v1).
+[`Result and evidence contract v1`](docs/TECHNICAL_REFERENCE.md#result-and-evidence-contract-v1).
 
 Fiecare rezultat persistă `detectionStats` cu exact `rawDirect`, `gatedDirect`,
 `suppressedDirect` și `retainedDirect`. Primul numără candidatele directe cu
@@ -889,7 +889,7 @@ O versiune este publicată numai dintr-o sursă neredactată și dacă trece gra
 sigură fixată. Observațiile brute rămân în memorie doar până la detecție și nu
 intră în rezultate, cache, fixtures sau logs. Contractul complet, ordinea,
 digesturile și cheile de deduplicare sunt în
-[`Result and evidence contract v1`](README.md#result-and-evidence-contract-v1).
+[`Result and evidence contract v1`](docs/TECHNICAL_REFERENCE.md#result-and-evidence-contract-v1).
 
 `ScanConfig` conține numai comportamentul: identity și policy versions,
 concurrency, Parquet, target, robots, HTTP, pages, browser, DNS/TLS,
@@ -929,7 +929,7 @@ inexistente, self-`requires` nominal, self-`excludes` și tagurile de relație
 nesuportate invalidează catalogul înainte de crawl. Un `requiresCategory` egal
 cu propria categorie rămâne valid, dar nu se poate autosatisface. Detaliile
 implementabile sunt în
-[`Relationship resolution`](README.md#relationship-resolution).
+[`Relationship resolution`](docs/TECHNICAL_REFERENCE.md#relationship-resolution).
 
 Closure-ul folosește un priority heap și traversări iterative pentru fixed point,
 SCC și provenance. Astfel limita acceptată de 20.000 tehnologii nu depinde de
@@ -1019,7 +1019,8 @@ care nu poate fi compilat oprește batchul înainte de crawl.
 
 Nu adăugăm `safe-regex`, RE2 sau `re2-wasm`: analiza statică nu poate dovedi
 absența ReDoS, iar RE2 ar schimba compatibilitatea pentru unele reguli. Limitele
-și protocolul complet sunt în [`Regex execution policy`](README.md#regex-execution-policy).
+și protocolul complet sunt în
+[`Regex execution policy`](docs/TECHNICAL_REFERENCE.md#regex-execution-policy).
 
 ## Decizia package managerului și a dependențelor
 

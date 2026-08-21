@@ -6,10 +6,11 @@ This repository builds a batch CLI that detects technologies used by public
 websites and retains verifiable evidence for direct detections. It is not a
 browser extension, public API, vulnerability scanner, or lead-generation tool.
 
-Before changing the repository, read `README.md` for scope, architecture,
-contracts, roadmap, and readiness gates, then read `DECISIONS.md` for accepted
-choices and open questions. Accepted decisions are authoritative; planned
-sections are proposals. Surface conflicts instead of choosing silently.
+Before changing the repository, read `README.md` for the submission overview,
+then `docs/TECHNICAL_REFERENCE.md` for scope, architecture, contracts, roadmap,
+and readiness gates, and finally `DECISIONS.md` for accepted choices and open
+questions. Accepted decisions are authoritative; planned sections are
+proposals. Surface conflicts instead of choosing silently.
 
 Follow the current roadmap slice and readiness gate. Do not implement an open
 policy or advance beyond the work authorized by the current request.

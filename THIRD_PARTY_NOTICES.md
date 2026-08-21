@@ -53,8 +53,10 @@ included with that artifact.
 
 ## Veridion challenge domain list
 
-Status: present locally as `input/domains.parquet`; excluded from Git until
-redistribution permission is confirmed.
+Status: the source Parquet is present locally as `input/domains.parquet` and is
+excluded from Git. The derived per-domain JSONL required by the challenge is
+published separately as the submitted output and necessarily names the domains
+whose results it contains.
 
 - Challenge page:
   <https://veridion.com/company/careers/challenges/internship>
@@ -64,6 +66,6 @@ redistribution permission is confirmed.
 - Local modifications: none
 
 The project `GPL-3.0-only` license does not claim copyright in or relicense this
-input file. Before publishing the repository, confirm that the file may be
-redistributed or keep it excluded and document how applicants obtain it from
-the challenge source.
+input file. A reviewer obtains the original bytes from the challenge source;
+[`input/README.md`](input/README.md) records the expected local path, schema, and
+checksum.
