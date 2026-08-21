@@ -35,7 +35,6 @@
 - Wappalyzer comercial, API-ul său, pachetul npm oficial deprecated și înlocuit
   cu un placeholder, precum și copiile cu proveniență sau licență neclară nu
   vor fi surse pentru proiect.
-- Regulile permanente pentru Codex și alți agenți de coding vor fi ținute în `AGENTS.md` la rădăcina repository-ului.
 - Commiturile vor grupa câte o schimbare logică și vor folosi un mesaj Conventional Commits scurt, cu tip și scope apropiat de sursa modificării.
 - Pentru benchmark folosim modul `full`: maximum trei pagini determinate
   reproductibil, scanate HTTP și în browser dacă sunt eligibile și permise.

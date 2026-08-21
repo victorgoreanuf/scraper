@@ -187,7 +187,7 @@ value:
 ```json
 {
   "domain": "unnames.com",
-  "technology": {
+  "technologies": [{
     "name": "Shopify",
     "confidence": 100,
     "type": "direct",
@@ -200,7 +200,7 @@ value:
       "match": { "kind": "presence", "value": null, "truncated": false },
       "ruleId": "sha256:26f8c710c3d535f9bcfc09e009e7116ef8fac435aed9f7d6c16a7e04565f1ff7"
     }]
-  }
+  }]
 }
 ```
 

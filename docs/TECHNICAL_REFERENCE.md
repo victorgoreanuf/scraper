@@ -187,7 +187,6 @@ fresh accumulator rebuilds the published summary byte-for-byte.
 ├── output/
 │   ├── results.jsonl
 │   └── results.summary.json
-├── AGENTS.md
 ├── DECISIONS.md
 ├── README.md
 ├── LICENSE
@@ -1906,6 +1905,9 @@ included in canonical form.
   policy, mixed and non-public DNS, peer pinning, late-DNS/page cleanup,
   request/byte limits, page-generation socket isolation, and a zero-hit
   loopback canary.
+- Transport TLS tests use OpenSSL to generate a one-day self-signed credential
+  inside the OS temporary directory, then remove it after the suite; no test
+  private key is committed or loaded by production code.
 - `browser.test.ts` covers safe launch/context options, slot preflight,
   FIFO admission and cleanup, ordered per-domain pages, synchronous robots
   gating, dual-stage CDP redirect admission, deterministic top-20 script
