@@ -108,9 +108,19 @@
   full-only sub aceleași limite, iar browserul drenează bounded colecția activă
   înainte să propage failure-ul. Nu mărim limitele și nu schimbăm triggerul.
 - D2 este acum evidence de dezvoltare și nu poate ratifica aceste corecții.
-  Următorul experiment necesită `D3` fresh plus `H2` sigilat, cu preregistrare,
-  source frame, manifeste și autorizare noi; niciunul nu este încă înghețat sau
-  autorizat, iar H1 nu este reciclat drept H2.
+  Dacă cercetarea tiered continuă, următorul experiment necesită `D3` fresh plus
+  `H2` sigilat, cu preregistrare, source frame, manifeste și autorizare noi;
+  niciunul nu este înghețat sau autorizat, iar H1 nu este reciclat drept H2.
+  Acest experiment este opțional și nu mai blochează submitul challenge-ului.
+- Deliverable-ul final folosește pass-ul autoritar `full` v0.1.9 peste exact cele
+  200 de domenii originale: 2.098 detecții directe, 167 inferred și 366 nume
+  distincte. JSONL-ul
+  `sha256:e28b934763e617debc9825aab4c2cc6f27b0b4d9533350068f252ec091dfd6d7`
+  și summary-ul
+  `sha256:53df7d1daa1f0f868ac3e05482a1f103fa6a82c14e861fb6d10d4807608c227b`
+  au setul de input exact, validează semantic integral, iar summary-ul se
+  reconstruiește byte-identic. Cercetarea tiered rămâne `HOLD`, nu este activată
+  în soluția trimisă.
 
 ## Structura proiectului
 

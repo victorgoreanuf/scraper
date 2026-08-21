@@ -1,19 +1,11 @@
 # Website Technologies Scraper
 
-> Project status: the application foundation, protected HTTP/browser transports,
-> fail-closed robots policy, static HTTP collector, fingerprint compiler,
-> isolated detector, protected Playwright/Chromium collector and pool, and
-> bounded catalog-probe and DNS/TLS infrastructure collection plus pipeline
-> orchestration are implemented and tested. Incremental output, resume, summary
-> generation, the runnable local CLI, the exact correction ledger, bounded
-> browser-limit telemetry, and the raw-free shadow evaluator/calibration
-> sidecar are also implemented and tested. The bounded v0.1.7 KISS+ trigger and
-> paired v0.1.8 direct-category ablation both produced development `NO-GO`
-> verdicts; no candidate was published and sealed `H1` was not scanned. Version
-> 0.1.9 contains three bounded remediations from the D2 diagnosis: stronger
-> exact probe rules, `T2`-first detector scheduling under existing limits, and
-> a bounded browser cleanup drain. A future fresh `D3`/`H2` experiment is not
-> yet frozen or authorized. Functional tier routing remains on hold.
+> Project status: the v0.1.9 challenge implementation and final 200-domain
+> result are complete. The runnable CLI, evidence-bearing detector, protected
+> HTTP/browser collectors, bounded resource policies, incremental output,
+> resume, summary, and test suite are implemented. Experimental tier-routing
+> work did not pass its development guardrails and remains optional future work;
+> it is not required by, or enabled for, the submitted challenge solution.
 
 ## Goal
 
@@ -31,6 +23,49 @@ The provided benchmark contains 200 unique domains in a Snappy-compressed Parque
 - Source code and detection logic.
 - A solution explanation and results summary.
 - README discussion of limitations, scaling to millions of domains in one to two months, and discovering new technologies.
+
+## Final challenge result (v0.1.9)
+
+The final run used clean commit
+`05d94594543996a709c3cca5858c24f92d9d1c6e`, Node.js `24.19.0`, Playwright
+`1.62.1`, Chromium revision `1234`, and effective catalog digest
+`sha256:5aedde4f83d1ad977d646e1495b9b91d4d3b0f6f3acbd34d54906d099da18870`.
+It scanned the exact 200-domain challenge input once in `full` mode, without
+resume or replacement.
+
+| Metric | Final result |
+| --- | ---: |
+| Processed domains | 200/200 |
+| Domains with at least one detection | 165 |
+| Status | 3 success, 190 partial, 7 failed |
+| Technology occurrences | 2,098 direct + 167 inferred = 2,265 |
+| Distinct technology names | 366 total; 351 direct |
+| Reference headline | 366/477 = 76.73% |
+| Average / maximum technologies per domain | 11.325 / 37 |
+| HTTP / browser requests | 1,028 / 14,601 |
+| Average / p50 / p95 duration | 9,282.67 / 9,040 / 23,500 ms |
+
+The 477 figure is a reference headline rather than a supplied labeled truth
+set, so 76.73% is a simple breadth comparison, not a precision or recall claim.
+The result deliberately favors attributable detections over inflating the count:
+every direct technology includes bounded evidence, while inferred technologies
+name their direct parent. A `partial` status preserves useful earlier evidence;
+it usually means a later bounded browser, network, or detector stage reached a
+limit, not that the record is unusable.
+
+Final deliverables:
+
+- [`output/results.jsonl`](output/results.jsonl): one canonical result per input
+  domain, 4,699,475 bytes,
+  `sha256:e28b934763e617debc9825aab4c2cc6f27b0b4d9533350068f252ec091dfd6d7`;
+- [`output/results.summary.json`](output/results.summary.json): aggregate
+  metrics and exact run context, 7,173 bytes,
+  `sha256:53df7d1daa1f0f868ac3e05482a1f103fa6a82c14e861fb6d10d4807608c227b`.
+
+Both files are strict UTF-8 with final LF, mode `0600`, and one filesystem link.
+All 200 JSONL records pass the production semantic validator under the embedded
+configuration; their unique domain set equals the Parquet input exactly, and a
+fresh accumulator rebuilds the published summary byte-for-byte.
 
 ## Scope
 
@@ -1935,6 +1970,60 @@ observed p95 cost with at least 2x throughput headroom. Robots, opt-out,
 retention, terms-of-service review, and an operational contact remain release
 gates for a production-scale crawl.
 
+## Debate topics
+
+### What are the main issues, and how would I tackle them?
+
+The largest accuracy constraint is the fingerprint catalog itself. Upstream
+rules can be stale, overly generic, duplicated, or expensive to evaluate, while
+the challenge does not provide a per-domain labeled truth set. I would keep the
+current exact correction ledger, require positive and negative fixtures for
+every changed rule, and build a small manually reviewed benchmark that records
+both false positives and misses. Catalog releases would stay digest-pinned and
+reproducible rather than changing silently.
+
+Collection is also imperfect: websites disappear, block automation, return
+soft-404 pages, exceed conservative budgets, or behave differently between
+static HTTP and Chromium. The result model therefore preserves partial evidence
+instead of converting a late failure into a total miss. The next improvements
+would be driven by aggregate limit telemetry and controlled fixtures, not by
+globally increasing time, body, request, or selector limits. Browser work is the
+dominant cost and source of long-tail failures; the experimental routing model
+did not meet its quality guardrails, so this submission correctly keeps the
+reliable `full` scan instead of deploying an underperforming optimization.
+
+### How would I scale to millions of domains in one or two months?
+
+I would retain `scanDomain()` as the idempotent unit and place canonical domains
+on a durable queue consumed by stateless workers. Results would go to object
+storage and an analytical database under a stable `(run, domain)` key. Leases,
+bounded retries, dead-letter queues, per-host rate limits, partitioned output,
+metrics, and explicit recrawl scheduling would replace the local writer and
+in-process scheduler without changing collection or evidence semantics.
+
+Capacity should be derived from measured stage cost rather than domain count
+alone. This run averaged 9.28 seconds per full domain, while browser traffic
+accounted for 14,601 of 15,629 requests. I would size HTTP and Chromium pools
+separately from p95 latency and transfer, add at least 2x headroom, and enforce
+global plus per-origin concurrency. A staged static-first/browser-later design
+could reduce cost substantially, but it should be enabled only after a frozen
+router demonstrates acceptable recall on an untouched cohort. Until then,
+horizontal full-scan workers are less efficient but methodologically safer.
+
+### How would I discover new technologies?
+
+Discovery should be a reviewed catalog pipeline, not automatic promotion from
+one website. From a bounded, policy-approved sample I would aggregate unknown
+public signals such as script host/path shapes, generator metadata, headers,
+DOM attributes, and JavaScript globals; cluster signals that recur across
+unrelated domains; and compare them with vendor documentation and release
+artifacts. An analyst would then write a declarative fingerprint, validate it
+on multiple positive sites and representative negative fixtures, and publish it
+only in a new digest-pinned catalog revision. Version extraction, aliases,
+relationships, license provenance, runtime cost, and redaction would be reviewed
+at the same boundary. Raw page content would remain outside normal results and
+would require a separate retention and privacy policy.
+
 ## Runtime baseline
 
 The project runtime is **Node.js 24.19.0 LTS (Krypton)**. The exact version is
@@ -3135,13 +3224,17 @@ Completion and evaluation gates:
 - [x] Implement the bounded D2 remediations in v0.1.9: exact Magento/TYPO3
   probe literals with fixtures, T2-first detector work under unchanged limits,
   and bounded draining of the browser collection cleanup race.
+- [x] Produce and validate the final v0.1.9 result for all 200 challenge domains
+  and answer the three debate topics.
+
+Optional post-challenge research, not submission completion gates:
+
 - [ ] Preregister, freeze, and separately authorize a fresh `D3` development
   cohort and sealed `H2` holdout. No source frame, manifest, or traffic for
   these cohorts is currently approved.
 - [ ] Implement functional tiered orchestration only after a frozen deployable
   trigger passes a new representative cohort; this slice is on hold and has no
   reserved version.
-- [ ] Produce final results and complete the debate topics.
 
 ## Readiness gate for the coding stage
 
