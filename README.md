@@ -79,6 +79,8 @@ The canonical deliverables are:
 
 - Node.js `24.19.0` and npm `11.17.0` (pinned in `.node-version` and
   `package.json`);
+- OpenSSL 1.1.1 or newer, available as `openssl` on `PATH`, when running the
+  TLS tests; the built scanner does not invoke it;
 - the official challenge Parquet file saved as `input/domains.parquet`;
 - a real public contact URL or email for the crawler User-Agent.
 

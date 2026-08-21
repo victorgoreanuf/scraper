@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { once } from "node:events";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { createServer as createHttpServer } from "node:http";
 import { createServer as createHttpsServer } from "node:https";
 import {
@@ -9,14 +9,15 @@ import {
   type Server,
   type Socket,
 } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   setImmediate as waitForImmediate,
   setTimeout as delay,
 } from "node:timers/promises";
-import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { gzipSync } from "node:zlib";
-import { test, type TestContext } from "node:test";
+import { after, test, type TestContext } from "node:test";
 
 import {
   createDefaultScanConfig,
@@ -44,15 +45,48 @@ const userAgent =
 const execFileAsync = promisify(execFile);
 const primaryPublicAddress = "8.8.8.8";
 const secondaryPublicAddress = "1.1.1.1";
-const tlsKey = readFileSync(
-  new URL("./fixtures/transport/key.pem", import.meta.url),
+const tlsFixtureDirectory = mkdtempSync(
+  join(tmpdir(), "website-technologies-tls-"),
 );
-const tlsCertificate = readFileSync(
-  new URL("./fixtures/transport/cert.pem", import.meta.url),
-);
-const tlsCertificatePath = fileURLToPath(
-  new URL("./fixtures/transport/cert.pem", import.meta.url),
-);
+const tlsKeyPath = join(tlsFixtureDirectory, "key.pem");
+const tlsCertificatePath = join(tlsFixtureDirectory, "cert.pem");
+
+try {
+  execFileSync("openssl", [
+    "req",
+    "-x509",
+    "-newkey",
+    "rsa:2048",
+    "-sha256",
+    "-nodes",
+    "-keyout",
+    tlsKeyPath,
+    "-out",
+    tlsCertificatePath,
+    "-days",
+    "1",
+    "-set_serial",
+    "1",
+    "-subj",
+    "/CN=shop.vendor.tld",
+    "-addext",
+    "basicConstraints=critical,CA:TRUE",
+    "-addext",
+    "subjectAltName=DNS:shop.vendor.tld",
+  ], { stdio: "pipe" });
+} catch (error) {
+  rmSync(tlsFixtureDirectory, { recursive: true, force: true });
+  throw new Error("OpenSSL is required to generate the local TLS test fixture", {
+    cause: error,
+  });
+}
+
+const tlsKey = readFileSync(tlsKeyPath);
+const tlsCertificate = readFileSync(tlsCertificatePath);
+
+after(() => {
+  rmSync(tlsFixtureDirectory, { recursive: true, force: true });
+});
 
 function setConfigValue(
   value: JsonRecord,
