@@ -1,13 +1,12 @@
+import { open, type FileHandle } from "../platform/files.ts";
 import { createHash, randomUUID } from "node:crypto";
 import { constants, type Stats } from "node:fs";
 import {
   link,
   lstat,
-  open,
   realpath,
   stat,
   unlink,
-  type FileHandle,
 } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";

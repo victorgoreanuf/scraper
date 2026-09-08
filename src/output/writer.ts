@@ -1,3 +1,4 @@
+import { open, protectPrivate, type FileHandle } from "../platform/files.ts";
 import { randomUUID } from "node:crypto";
 import {
   constants,
@@ -6,11 +7,9 @@ import {
 import {
   link,
   lstat,
-  open,
   realpath,
   stat,
   unlink,
-  type FileHandle,
 } from "node:fs/promises";
 import {
   basename,
@@ -37,6 +36,8 @@ import {
 const READ_BUFFER_BYTES = 64 * 1_024;
 const FILE_MODE = 0o600;
 const NO_FOLLOW = constants.O_NOFOLLOW ?? 0;
+// Windows append handles cannot be truncated; result writes use explicit offsets.
+const RESULT_APPEND_FLAG = process.platform === "win32" ? 0 : constants.O_APPEND;
 const activeOutputDirectories = new Set<string>();
 
 export type ResultWriterMode = "create" | "resume" | "force";
@@ -114,6 +115,7 @@ type SummaryAccumulator = ReturnType<typeof createRunSummaryAccumulator>;
 
 interface ResumeState {
   readonly runId: string;
+  readonly resultBytes: number;
   readonly completedDomains: Set<string>;
   readonly accumulator: SummaryAccumulator;
 }
@@ -334,7 +336,7 @@ async function openExistingResult(
   try {
     handle = await open(
       path,
-      constants.O_RDWR | constants.O_APPEND | NO_FOLLOW,
+      constants.O_RDWR | RESULT_APPEND_FLAG | NO_FOLLOW,
     );
     const descriptorStats = await handle.stat();
     if (
@@ -372,7 +374,7 @@ async function createResult(path: string): Promise<CreatedResult> {
       constants.O_WRONLY
         | constants.O_CREAT
         | constants.O_EXCL
-        | constants.O_APPEND
+        | RESULT_APPEND_FLAG
         | NO_FOLLOW,
       FILE_MODE,
     );
@@ -591,6 +593,7 @@ async function scanResumeFile(
     readOffset += bytesRead;
   }
 
+  protectPrivate(handle);
   if (fragmentBytes > 0) {
     await handle.truncate(lastCompleteOffset);
   }
@@ -603,12 +606,17 @@ async function scanResumeFile(
   });
   return {
     runId: resumedRunId,
+    resultBytes: lastCompleteOffset,
     completedDomains,
     accumulator: resumedAccumulator,
   };
 }
 
-async function writeAll(handle: FileHandle, bytes: Buffer): Promise<void> {
+async function writeAll(
+  handle: FileHandle,
+  bytes: Buffer,
+  position: number | null = null,
+): Promise<void> {
   let offset = 0;
   while (offset < bytes.length) {
     let bytesWritten: number;
@@ -617,7 +625,7 @@ async function writeAll(handle: FileHandle, bytes: Buffer): Promise<void> {
         bytes,
         offset,
         bytes.length - offset,
-        null,
+        position === null ? null : position + offset,
       ));
     } catch (error) {
       throw writerError(
@@ -728,6 +736,7 @@ class NodeResultWriter implements ResultWriter {
   readonly #config: ScanConfig;
   readonly #provenance: Provenance;
   readonly #handle: FileHandle;
+  #writePosition: number | null;
   readonly #resultStats: Stats;
   readonly #completedDomains: Set<string>;
   readonly #accumulator: SummaryAccumulator;
@@ -743,6 +752,7 @@ class NodeResultWriter implements ResultWriter {
     readonly config: ScanConfig;
     readonly provenance: Provenance;
     readonly handle: FileHandle;
+    readonly resultBytes: number;
     readonly resultStats: Stats;
     readonly completedDomains: Set<string>;
     readonly accumulator: SummaryAccumulator;
@@ -753,6 +763,7 @@ class NodeResultWriter implements ResultWriter {
     this.#config = options.config;
     this.#provenance = options.provenance;
     this.#handle = options.handle;
+    this.#writePosition = process.platform === "win32" ? options.resultBytes : null;
     this.#resultStats = options.resultStats;
     this.#completedDomains = options.completedDomains;
     this.#accumulator = options.accumulator;
@@ -831,7 +842,10 @@ class NodeResultWriter implements ResultWriter {
         );
       }
 
-      await writeAll(this.#handle, bytes);
+      await writeAll(this.#handle, bytes, this.#writePosition);
+      if (this.#writePosition !== null) {
+        this.#writePosition += bytes.length;
+      }
       this.#accumulator.add(persisted);
       this.#completedDomains.add(persisted.domain);
     });
@@ -1021,6 +1035,7 @@ export async function openResultWriter(
         config,
         provenance,
         handle,
+        resultBytes: 0,
         resultStats: createdResultStats,
         completedDomains: new Set<string>(),
         releasePath,
@@ -1065,6 +1080,7 @@ export async function openResultWriter(
 
     if (resultInspection.exists) {
       handle = await openExistingResult(paths.resultPath, resultInspection.stats!);
+      protectPrivate(handle);
     } else {
       ({ handle, stats: createdResultStats } = await createResult(paths.resultPath));
     }
@@ -1084,6 +1100,7 @@ export async function openResultWriter(
       config,
       provenance,
       handle,
+      resultBytes: 0,
       resultStats: resultInspection.stats ?? createdResultStats!,
       completedDomains: new Set<string>(),
       releasePath,

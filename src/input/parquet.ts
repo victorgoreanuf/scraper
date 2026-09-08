@@ -1,5 +1,6 @@
 import { constants as fsConstants } from "node:fs";
-import { open, realpath, type FileHandle } from "node:fs/promises";
+import { realpath } from "node:fs/promises";
+import { open, type FileHandle } from "../platform/files.ts";
 
 import {
   parquetMetadata,

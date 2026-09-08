@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { constants } from "node:fs";
+import { open, type FileHandle, isPrivateFile } from "../src/platform/files.ts";
 import {
   appendFile,
   chmod,
@@ -12,6 +14,7 @@ import {
   symlink,
   writeFile,
 } from "node:fs/promises";
+import { registerHooks } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -36,6 +39,24 @@ import {
 const USER_AGENT =
   "WebsiteTechScraper/0.1.0 (https://contact.website-tech-scraper.dev/crawler)";
 const SCANNED_AT = "2026-08-18T10:11:12.345Z";
+
+// Match the scanner's result ownership even when the test runner is elevated.
+// Plain writeFile may give a new Windows file to the Administrators group.
+async function writeOwnedResultFixture(path: string, value: string | Buffer): Promise<void> {
+  const handle = await open(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
+  const bytes = Buffer.isBuffer(value) ? value : Buffer.from(value);
+  try {
+    let offset = 0;
+    while (offset < bytes.length) {
+      const { bytesWritten } = await handle.write(bytes, offset, bytes.length - offset, offset);
+      assert.ok(bytesWritten > 0, "Fixture write must make progress");
+      offset += bytesWritten;
+    }
+  } finally {
+    await handle.close();
+  }
+  assert.equal(await isPrivateFile(path), true, "Fixture must belong to the current user");
+}
 
 function configWithRecordLimit(limit?: number, rows?: number): ScanConfig {
   const value = structuredClone(
@@ -192,8 +213,8 @@ test("creates exclusively, serializes concurrent appends, and finalizes atomical
     JSON.parse(await readFile(summaryPath, "utf8")),
     summary,
   );
-  assert.equal((await lstat(resultPath)).mode & 0o777, 0o600);
-  assert.equal((await lstat(summaryPath)).mode & 0o777, 0o600);
+  assert.equal(await isPrivateFile(resultPath), true);
+  assert.equal(await isPrivateFile(summaryPath), true);
   assert.equal(
     (await readdir(directory)).some((name) => name.endsWith(".tmp")),
     false,
@@ -293,6 +314,70 @@ test("resume reuses the run, removes one final fragment, and seeds its summary",
   assert.equal(summary.statusCounts.failed, 3);
 });
 
+test("resume preserves complete prefixes across short concurrent writes", async (t) => {
+  const directory = await temporaryDirectory(t);
+  const config = configWithRecordLimit();
+  const provenance = provenanceFor(config);
+  const runId = "11111111-1111-4111-8111-111111111111";
+  const probe = await open(join(directory, "handle-probe"), constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
+  const prototype = Object.getPrototypeOf(probe) as {
+    write: (
+      this: FileHandle,
+      buffer: Buffer,
+      offset: number,
+      length: number,
+      position: number | null,
+    ) => Promise<{ bytesWritten: number; buffer: Buffer }>;
+  };
+  await probe.close();
+  const originalWrite = prototype.write;
+  const shortWrite = t.mock.method(prototype, "write", function (
+    this: FileHandle,
+    buffer: Buffer,
+    offset: number,
+    length: number,
+    position: number | null,
+  ) {
+    return originalWrite.call(this, buffer, offset, Math.min(length, 37), position);
+  });
+
+  for (const incomplete of [false, true]) {
+    const resultPath = join(directory, incomplete ? "partial.jsonl" : "complete.jsonl");
+    const original = failedResult(runId, "original.vendor.com", provenance);
+    const prefix = Buffer.from(JSON.stringify({
+      ...original,
+      errors: [{ ...original.errors[0], message: "Răspuns indisponibil." }],
+    }) + "\n");
+    await writeOwnedResultFixture(resultPath, Buffer.concat([
+      prefix,
+      incomplete ? Buffer.from('{"incomplete":"î') : Buffer.alloc(0),
+    ]));
+    const before = await lstat(resultPath);
+    const resumed = await openResultWriter({
+      resultPath,
+      mode: "resume",
+      config,
+      provenance,
+    });
+    t.after(() => closeQuietly(resumed));
+    const next = [
+      failedResult(runId, "next.vendor.com", provenance),
+      failedResult(runId, "last.vendor.com", provenance),
+    ];
+    await Promise.all(next.map((result) => resumed.append(result)));
+    const summary = await resumed.finalize(3);
+    assert.equal(summary.processedDomains, 3);
+    assert.deepEqual(await readFile(resultPath), Buffer.concat([
+      prefix,
+      ...next.map((result) => Buffer.from(JSON.stringify(result) + "\n")),
+    ]));
+    const after = await lstat(resultPath);
+    assert.equal(after.dev, before.dev);
+    assert.equal(after.ino, before.ino);
+  }
+  assert.ok(shortWrite.mock.callCount() > 20);
+});
+
 test("resume gives an empty or fragment-only file a new run id", async (t) => {
   const directory = await temporaryDirectory(t);
   const config = configWithRecordLimit();
@@ -303,7 +388,7 @@ test("resume gives an empty or fragment-only file a new run id", async (t) => {
     ["fragment.jsonl", Buffer.from("{\"completeJsonButNoNewline\":true}")],
   ] as const) {
     const resultPath = join(directory, name);
-    await writeFile(resultPath, bytes, { mode: 0o600 });
+    await writeOwnedResultFixture(resultPath, bytes);
     const writer = await openResultWriter({
       resultPath,
       mode: "resume",
@@ -491,6 +576,24 @@ test("append and resume enforce persisted semantic and configuration invariants"
     "OUTPUT_INVALID_RECORD",
   );
   assert.deepEqual(await readFile(configPath), originalLine);
+});
+
+test("force writes from byte zero and preserves the validated file identity", async (t) => {
+  const directory = await temporaryDirectory(t);
+  const resultPath = join(directory, "results.jsonl");
+  const config = configWithRecordLimit();
+  const provenance = provenanceFor(config);
+  await writeOwnedResultFixture(resultPath, "old result bytes".repeat(1_000));
+  const before = await lstat(resultPath);
+  const writer = await openResultWriter({ resultPath, mode: "force", config, provenance });
+  t.after(() => closeQuietly(writer));
+  const result = failedResult(writer.runId, "new.vendor.com", provenance);
+  await writer.append(result);
+  await writer.finalize(1);
+  assert.equal(await readFile(resultPath, "utf8"), JSON.stringify(result) + "\n");
+  const after = await lstat(resultPath);
+  assert.equal(after.dev, before.dev);
+  assert.equal(after.ino, before.ino);
 });
 
 test("force validates both targets before truncating and starts a new run", async (t) => {
@@ -716,7 +819,7 @@ test("rejects hard-linked results and safely unlinks paired summary aliases", as
   const forceSummarySource = join(directory, "force-summary-source");
   const forceSummaryPath = join(directory, "force.summary.json");
   const forceSummaryBytes = Buffer.from("force summary victim");
-  await writeFile(forceResultPath, "force result sentinel", { mode: 0o600 });
+  await writeOwnedResultFixture(forceResultPath, "force result sentinel");
   await writeFile(forceSummarySource, forceSummaryBytes, { mode: 0o600 });
   await link(forceSummarySource, forceSummaryPath);
   let opened: ResultWriter | undefined;
@@ -739,10 +842,9 @@ test("rejects hard-linked results and safely unlinks paired summary aliases", as
   const resumeSummaryPath = join(directory, "resume-hardlink.summary.json");
   const resumeSummaryBytes = Buffer.from("resume summary victim");
   const runId = "37937a78-f39d-49ed-a51d-6d398ae45a20";
-  await writeFile(
+  await writeOwnedResultFixture(
     resumeResultPath,
     `${JSON.stringify(failedResult(runId, "resume.vendor.com", provenance))}\n`,
-    { mode: 0o600 },
   );
   await writeFile(resumeSummarySource, resumeSummaryBytes, { mode: 0o600 });
   await link(resumeSummarySource, resumeSummaryPath);
@@ -961,4 +1063,33 @@ test("snapshots config and provenance before caller-owned context mutates", asyn
   const summary = await writer.finalize(1);
   assert.deepEqual(summary.config, expectedConfig);
   assert.deepEqual(summary.provenance, expectedProvenance);
+});
+
+test("force preserves both files when descriptor privacy validation fails", async (t) => {
+  const directory = await temporaryDirectory(t);
+  const resultPath = join(directory, "results.jsonl");
+  const summaryPath = join(directory, "results.summary.json");
+  const resultBytes = Buffer.from("result must remain intact");
+  const summaryBytes = Buffer.from("summary must remain intact");
+  await writeOwnedResultFixture(resultPath, resultBytes);
+  await writeFile(summaryPath, summaryBytes);
+  const config = configWithRecordLimit();
+  const writerUrl = new URL("../src/output/writer.ts?privacy-rejection", import.meta.url).href;
+  const filesUrl = new URL("../src/platform/files.ts", import.meta.url).href;
+  const shim = 'export { open } from ' + JSON.stringify(filesUrl) + '; export function protectPrivate() { throw Object.assign(new Error("Injected owner refusal"), { code: "EACCES" }); }';
+  const hook = registerHooks({
+    resolve(specifier, context, nextResolve) {
+      if (context.parentURL === writerUrl && specifier === "../platform/files.ts") {
+        return { url: "data:text/javascript;base64," + Buffer.from(shim).toString("base64"), shortCircuit: true };
+      }
+      return nextResolve(specifier, context);
+    },
+  });
+  try {
+    const isolated = await import(writerUrl) as typeof import("../src/output/writer.ts");
+    await assert.rejects(isolated.openResultWriter({ resultPath, mode: "force", config, provenance: provenanceFor(config) }),
+      (error: unknown) => error instanceof isolated.OutputWriterError && error.code === "OUTPUT_IO_FAILED");
+    assert.deepEqual(await readFile(resultPath), resultBytes);
+    assert.deepEqual(await readFile(summaryPath), summaryBytes);
+  } finally { hook.deregister(); }
 });

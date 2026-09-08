@@ -29,6 +29,8 @@ import {
   setupTransportRuntime as runtimeHarness,
 } from "./support/transport-runtime.ts";
 
+import { resolveOpenSslExecutable } from "./support/openssl.ts";
+
 installTransportRuntimeHook();
 
 const transportModule = await import("../src/crawl/transport.ts");
@@ -45,6 +47,7 @@ const userAgent =
 const execFileAsync = promisify(execFile);
 const primaryPublicAddress = "8.8.8.8";
 const secondaryPublicAddress = "1.1.1.1";
+const opensslExecutable = resolveOpenSslExecutable();
 const tlsFixtureDirectory = mkdtempSync(
   join(tmpdir(), "website-technologies-tls-"),
 );
@@ -52,7 +55,7 @@ const tlsKeyPath = join(tlsFixtureDirectory, "key.pem");
 const tlsCertificatePath = join(tlsFixtureDirectory, "cert.pem");
 
 try {
-  execFileSync("openssl", [
+  execFileSync(opensslExecutable, [
     "req",
     "-x509",
     "-newkey",
@@ -73,10 +76,10 @@ try {
     "basicConstraints=critical,CA:TRUE",
     "-addext",
     "subjectAltName=DNS:shop.vendor.tld",
-  ], { stdio: "pipe" });
+  ], { stdio: "pipe", windowsHide: true, timeout: 15_000 });
 } catch (error) {
   rmSync(tlsFixtureDirectory, { recursive: true, force: true });
-  throw new Error("OpenSSL is required to generate the local TLS test fixture", {
+  throw new Error("OpenSSL could not generate the local TLS test fixture", {
     cause: error,
   });
 }

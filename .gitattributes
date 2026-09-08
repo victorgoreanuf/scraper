@@ -1,0 +1,13 @@
+* text=auto eol=lf
+
+# Keep reviewed fingerprints and published baseline artifacts byte-for-byte.
+fingerprints/** -text
+shadow-*.json -text
+output/*.json -text
+output/*.jsonl -text
+test/fixtures/** -text
+*.parquet -text
+
+# Native Windows launchers.
+*.cmd text eol=crlf
+*.bat text eol=crlf

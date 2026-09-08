@@ -7,6 +7,8 @@
 node_modules/
 dist/
 coverage/
+/.runtime/
+/terminal-proiect.cmd
 *.log
 
 # Local configuration and secrets

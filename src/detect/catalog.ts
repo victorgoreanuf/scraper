@@ -1,10 +1,10 @@
+import { openSync } from "../platform/files.ts";
 import { createHash } from "node:crypto";
 import {
   closeSync,
   constants,
   fstatSync,
   lstatSync,
-  openSync,
   opendirSync,
   readFileSync,
   readSync,

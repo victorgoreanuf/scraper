@@ -1,6 +1,6 @@
 {
   "name": "website-technologies-scraper",
-  "version": "0.1.9",
+  "version": "0.1.11",
   "description": "Batch CLI that detects website technologies with verifiable evidence.",
   "private": true,
   "type": "module",
@@ -31,7 +31,12 @@
     "start": "node dist/cli.js",
     "typecheck": "tsc --project tsconfig.json --noEmit",
     "test": "node --test \"test/**/*.test.ts\"",
-    "check": "npm run typecheck && npm test"
+    "check": "npm run typecheck && npm test",
+    "prepare:windows": "node scripts/build-windows-files.mjs",
+    "prebuild": "npm run prepare:windows",
+    "pretest": "npm run prepare:windows",
+    "doctor": "node scripts/doctor.mjs",
+    "verify:local": "node scripts/verify-local.mjs"
   },
   "dependencies": {
     "ajv": "8.20.0",

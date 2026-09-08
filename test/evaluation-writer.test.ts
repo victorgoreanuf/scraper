@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { isPrivateFile } from "../src/platform/files.ts";
 import { createHash } from "node:crypto";
 import {
   link,
@@ -522,7 +523,7 @@ test("derives the canonical sidecar name and publishes compact JSON atomically",
   await writeShadowEvaluationArtifact(prepared, artifact);
   const bytes = await readFile(prepared.evaluationPath);
   assert.equal(bytes.toString("utf8"), `${JSON.stringify(publishedArtifact)}\n`);
-  assert.equal((await lstat(prepared.evaluationPath)).mode & 0o777, 0o600);
+  assert.equal(await isPrivateFile(prepared.evaluationPath), true);
   assert.deepEqual(
     (await readdir(directory)).sort(),
     ["cohort.evaluation.json"],
@@ -815,7 +816,7 @@ test("runs the paired development evaluator only from pinned frozen inputs", asy
   await writeShadowPairedDevelopmentReport(reportOutput, loaded.report);
   const reportWire = await readFile(reportOutput.reportPath, "utf8");
   assert.equal(reportWire.endsWith("\n"), true);
-  assert.equal((await lstat(reportOutput.reportPath)).mode & 0o777, 0o600);
+  assert.equal(await isPrivateFile(reportOutput.reportPath), true);
 
   const candidateOutput = await preflightShadowCandidateOutput({
     candidatePath: join(directory, "paired.candidate.json"),
@@ -921,7 +922,7 @@ test("publishes and reloads only a canonical GO candidate with its exact digest"
   assert.equal(wire, canonicalizeShadowFrozenCandidate(candidate));
   assert.equal(candidateDigest, digestShadowFrozenCandidate(candidate));
   assert.equal(digest(wire), candidateDigest);
-  assert.equal((await lstat(prepared.candidatePath)).mode & 0o777, 0o600);
+  assert.equal(await isPrivateFile(prepared.candidatePath), true);
 
   const loaded = await readPinnedShadowFrozenCandidate(
     prepared.candidatePath,

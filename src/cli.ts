@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 
 import { constants as fsConstants, readFileSync, realpathSync } from "node:fs";
-import { open, realpath, stat } from "node:fs/promises";
+import { realpath, stat } from "node:fs/promises";
+import { open } from "./platform/files.ts";
 import { isIP } from "node:net";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
