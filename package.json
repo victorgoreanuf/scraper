@@ -30,7 +30,7 @@
     "postbuild": "node --input-type=module --eval \"import { chmodSync } from 'node:fs'; chmodSync('dist/cli.js', 0o755);\"",
     "start": "node dist/cli.js",
     "typecheck": "tsc --project tsconfig.json --noEmit",
-    "test": "node --test \"test/**/*.test.ts\"",
+    "test": "node --test --test-reporter=tap --test-concurrency=2 \"test/**/*.test.ts\"",
     "check": "npm run typecheck && npm test",
     "prepare:windows": "node scripts/build-windows-files.mjs",
     "prebuild": "npm run prepare:windows",

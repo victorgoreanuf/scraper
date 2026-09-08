@@ -73,9 +73,9 @@ The canonical deliverables are:
 | Stay safe | All-address SSRF checks, socket pinning, TLS verification, robots enforcement, a validating browser proxy, redaction, and hard resource caps |
 | Stay reproducible | Exact runtime, configuration digest, catalog revision/digest, run ID, canonical ordering, JSON Schemas, and semantic validation |
 
-## Windows setup and local verification
+## Platform setup and local verification
 
-Version 0.1.11 adds Windows compatibility changes and local verification commands. See [Windows setup and local verification](docs/WINDOWS.md) for native file protection, prerequisites, and local reports. The v0.1.9 results below remain the original submission baseline; this compatibility work has not been verified on macOS or Linux yet.
+Version 0.1.11 adds Windows compatibility changes and local verification commands. Follow [local verification on macOS, Linux and Windows](docs/LOCAL_VERIFICATION.md), including the [Windows native file prerequisites](docs/WINDOWS.md). Each verification report applies to its recorded source contents, OS and architecture. The v0.1.9 results remain the original submission baseline.
 
 ## Quick start
 

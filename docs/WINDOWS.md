@@ -57,4 +57,6 @@ The supported scope is fixed local volumes and trusted canonical parent director
 
 The original POSIX FIFO test is not applicable on Windows; Windows-specific regular-file/reparse cases cover its relevant file types separately. Symbolic-link fixture permissions must be available for a complete test run.
 
-On macOS, obtain the same source revision and locked manifest, then install dependencies locally; do not copy Windows `node_modules`, `.runtime` or `.cache` binaries. Run the same doctor/verify commands and retain a separate report. Linux remains a separate validation step.
+On macOS/Linux, the Windows descriptor lifecycle test is not applicable because those systems use Node FileHandle. The verifier recognizes exactly that omission there and exactly the POSIX FIFO omission on Windows. It blocks unexpected omissions, TODO tests and incomplete test summaries. Test output uses the explicit Node TAP reporter on every platform.
+
+Use the [cross-platform verification procedure](LOCAL_VERIFICATION.md) with the same source revision and locked manifest. Install dependencies locally; do not copy `node_modules`, `.runtime` or `.cache` binaries between systems. Keep a separate report for each OS and architecture.

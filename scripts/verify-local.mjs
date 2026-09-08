@@ -1,7 +1,41 @@
 import { spawn, execFileSync } from 'node:child_process';
 import { createWriteStream, lstatSync, mkdirSync, readFileSync } from 'node:fs';
 import { join, relative, resolve, sep } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { childEnvironment, overallStatus, printChecks, projectRoot, runDoctor, sha256, writeReport } from './doctor.mjs';
+
+export function parseTestOutput(output) {
+  const counts = {};
+  for (const match of output.matchAll(/^# (tests|pass|fail|cancelled|skipped|todo) (\d+)\r?$/gm)) {
+    counts[match[1]] = Number(match[2]);
+  }
+  const skippedTests = [...output.matchAll(/^[ \t]*ok \d+ - .* # SKIP\b[^\r\n]*/gm)].map(match => match[0]);
+  return { counts, skippedTests };
+}
+
+export function testChecks({ counts, skippedTests }, platform = process.platform) {
+  const keys = ['tests', 'pass', 'fail', 'cancelled', 'skipped', 'todo'];
+  if (!keys.every(key => Number.isSafeInteger(counts[key]) && counts[key] >= 0)
+      || counts.tests < 1
+      || counts.tests !== counts.pass + counts.fail + counts.cancelled + counts.skipped + counts.todo
+      || counts.skipped !== skippedTests.length) {
+    return [{ id: 'test-summary', status: 'BLOCKED', detail: 'Missing or inconsistent TAP test results. Inspect test.log.' }];
+  }
+  const checks = [{ id: 'test-summary', status: counts.fail || counts.cancelled ? 'FAIL' : 'PASS',
+    detail: counts.tests + ' tests; ' + counts.pass + ' passed; ' + counts.fail + ' failed; ' + counts.cancelled + ' cancelled.' }];
+  if (counts.todo) checks.push({ id: 'todo-tests', status: 'BLOCKED', detail: counts.todo + ' tests are TODO. Complete them before claiming full verification.' });
+  if (counts.skipped) {
+    const expectedName = platform === 'win32' ? 'rejects non-regular config and input files without blocking'
+      : ['darwin', 'linux'].includes(platform) ? 'Windows close waits for admitted operations and closes once after success or failure' : null;
+    const name = /^ok \d+ - (.+) # SKIP(?: .*|$)/.exec(skippedTests[0])?.[1];
+    const applicable = counts.skipped === 1 && expectedName !== null && name === expectedName;
+    checks.push({ id: 'omitted-tests', status: applicable ? 'NOT_APPLICABLE' : 'BLOCKED',
+      detail: applicable ? expectedName + ': ' + (platform === 'win32'
+        ? 'POSIX mkfifo does not apply to Windows.' : 'The Windows descriptor adapter does not apply to ' + platform + '; Node FileHandle is used.')
+        : counts.skipped + ' unexpected tests were omitted. Review their reasons in test.log.' });
+  }
+  return checks;
+}
 
 function sourceIdentity(reportRoot) {
   const names = execFileSync('git', ['ls-files', '--cached', '--others', '--exclude-standard', '-z'],
@@ -44,9 +78,6 @@ function runStep(name, npmCli, environment, outputDirectory) {
   return new Promise(resolveStep => {
     const startedAt = Date.now();
     const log = createWriteStream(logPath, { flags: 'wx', mode: 0o600 });
-    let tail = '';
-    let partialLine = '';
-    const skippedTests = [];
     let launchError;
     let timedOut = false;
     const child = spawn(process.execPath, [npmCli, 'run', name], {
@@ -54,11 +85,6 @@ function runStep(name, npmCli, environment, outputDirectory) {
     });
     const receive = chunk => {
       log.write(chunk);
-      const text = chunk.toString();
-      tail = (tail + text).slice(-128 * 1024);
-      const lines = (partialLine + text).split(/\r?\n/);
-      partialLine = lines.pop();
-      for (const line of lines) if (/# SKIP\b/i.test(line)) skippedTests.push(line);
     };
     child.stdout.on('data', receive);
     child.stderr.on('data', receive);
@@ -70,21 +96,21 @@ function runStep(name, npmCli, environment, outputDirectory) {
       clearTimeout(timer);
       clearInterval(progress);
       log.end(() => {
-        const counts = {};
-        for (const key of ['tests', 'pass', 'fail', 'cancelled', 'skipped', 'todo']) {
-          const pattern = new RegExp('(?:^|\\n)(?:#|ℹ)\\s+' + key + '\\s+(\\d+)\\s*(?:\\n|$)', 'g');
-          for (const match of tail.matchAll(pattern)) counts[key] = Number(match[1]);
+        let tests;
+        if (name === 'test') {
+          try { tests = parseTestOutput(readFileSync(logPath, 'utf8')); }
+          catch (error) { launchError = 'Could not read test log: ' + error.message; }
         }
         resolveStep({ id: name, status: code === 0 && !launchError && !timedOut ? 'PASS' : 'FAIL',
           detail: launchError ?? (timedOut ? 'Exceeded the 10-minute local step limit.' : 'Exit code ' + code + (signal ? '; signal ' + signal : '')),
           command: [process.execPath, npmCli, 'run', name], logPath, exitCode: code, elapsedMs: Date.now() - startedAt,
-          ...(name === 'test' ? { counts, skippedTests } : {}) });
+          ...(name === 'test' ? tests ?? { counts: {}, skippedTests: [] } : {}) });
       });
     });
   });
 }
 
-try {
+async function main() {
   const args = process.argv.slice(2);
   if (args.includes('--help')) console.log('Usage: npm run verify:local -- [--output-dir <directory>] [--dry-run]\nRuns doctor, build, typecheck and the full test suite locally, saving logs and JSON. No CI, downloads or system changes. --dry-run only checks prerequisites and records planned steps.');
   else {
@@ -112,16 +138,7 @@ try {
     else {
       for (const name of ['build', 'typecheck', 'test']) steps.push(await runStep(name, doctor.tools.npmCli, childEnvironment(doctor), outputDirectory));
       const tests = steps.find(step => step.id === 'test');
-      if (!Number.isInteger(tests?.counts.tests) || tests.counts.tests < 1) {
-        checks.push({ id: 'test-summary', status: 'BLOCKED', detail: 'No complete test count could be read. Inspect test.log.' });
-      }
-      if (tests?.counts.skipped) {
-        const knownFifo = process.platform === 'win32' && tests.counts.skipped === 1 && tests.skippedTests.length === 1
-          && tests.skippedTests[0].includes('rejects non-regular config and input files without blocking');
-        checks.push({ id: 'omitted-tests', status: knownFifo ? 'NOT_APPLICABLE' : 'BLOCKED',
-          detail: knownFifo ? 'The single omitted test uses POSIX mkfifo, which does not apply to Windows.'
-            : tests.counts.skipped + ' tests were omitted. Review individual reasons in test.log before claiming complete verification.' });
-      }
+      checks.push(...testChecks(tests));
       if (sources) {
         try {
           const after = sourceIdentity(reportRoot);
@@ -139,4 +156,9 @@ try {
     console.log((dryRun ? 'DRY RUN' : report.status) + ': ' + reportPath);
     process.exitCode = dryRun || report.status === 'PASS' ? 0 : 1;
   }
-} catch (error) { console.error(error.message); process.exitCode = 1; }
+}
+
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  try { await main(); }
+  catch (error) { console.error(error.message); process.exitCode = 1; }
+}
